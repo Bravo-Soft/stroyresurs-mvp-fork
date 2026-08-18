@@ -638,7 +638,14 @@ def extract_product_markdown(html: str, base_url: str = '') -> Optional[str]:
     try:
         _dom = _T._normalize_domain(base_url) if base_url else ''
         _ad = _T._get_adapters().get(_dom)
-        if _ad is not None and getattr(_ad, 'CLEAN_IN_UNIVERSAL', False) and callable(getattr(_ad, 'clean', None)):
+        _clean_in_universal = _ad is not None and getattr(_ad, 'CLEAN_IN_UNIVERSAL', False)
+        # Профиль сайта (mvp/profiles) может задать адаптер и флаг clean_in_universal явно.
+        _prof = _T._resolve_profile(base_url)
+        if _prof is not None:
+            if _prof.extract.custom_module:
+                _ad = _T._get_adapter_by_module(_prof.extract.custom_module) or _ad
+            _clean_in_universal = _clean_in_universal or _prof.extract.clean_in_universal
+        if _ad is not None and _clean_in_universal and callable(getattr(_ad, 'clean', None)):
             _ad.clean(soup)
     except Exception as e:
         logging.debug(f"universal_extractor: adapter.clean: {e}")

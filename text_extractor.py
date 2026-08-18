@@ -356,9 +356,45 @@ def _normalize_domain(url: str) -> str:
     if netloc.startswith('www.'):
         netloc = netloc[4:]
     # Для hms.ru обрабатываем поддомены
-    if netloc.endswith('.hms.ru'):
+    if netloc.endswith('.hms.ru'):  # -> профиль hms.ru.yaml (crawl.subdomain_collapse)
         return 'hms.ru'
     return netloc
+
+
+# ==================== РОУТЕР ИЗВЛЕЧЕНИЯ ПО ПРОФИЛЮ САЙТА ====================
+#
+# Декларативные профили mvp/profiles/<домен>.yaml (пакет site_profiles) решают,
+# как извлекать markdown: tier=custom -> адаптер Profile_Markdown по имени модуля;
+# jsonld/cms — объявлены, но в фазе 0 не включены (работает generic); llm = generic.
+# Профиля нет (или он «пустой», или site_profiles не импортируется) -> прежнее
+# поведение: адаптер по домену из _get_adapters(). Ошибки резолвера никогда не
+# роняют конвертацию (fail-open).
+
+def _resolve_profile(url: str):
+    """Профиль сайта для URL; None = профиля нет -> старое generic-поведение."""
+    if not url:
+        return None
+    try:
+        from site_profiles import get_resolver
+        profile = get_resolver().resolve(url)
+        return None if profile.is_default() else profile
+    except Exception:
+        return None
+
+
+def _get_adapter_by_module(module_name):
+    """Адаптер Profile_Markdown по имени модуля (extract.custom_module профиля)."""
+    if not module_name:
+        return None
+    for module in _get_adapters().values():
+        if module.__name__.split('.')[-1] == module_name:
+            return module
+    # Модуль есть, но не попал в реестр доменов (нестандартный DOMAIN) — импорт напрямую.
+    try:
+        return importlib.import_module(f'Profile_Markdown.{module_name}')
+    except Exception:
+        logging.warning(f'Профиль сайта: модуль Profile_Markdown/{module_name}.py не найден')
+        return None
 
 
 # ============== УНИВЕРСАЛЬНЫЙ ЭКСТРАКТОР КОНТАКТОВ/ДИСТРИБЬЮТОРОВ ==============
@@ -511,12 +547,21 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
                 parsed = urlparse(base['href'])
                 base_url = f"{parsed.scheme}://{parsed.netloc}"
 
-    # Поиск адаптера по домену (ДО универсальной очистки — адаптер может попросить
-    # сохранить скрытые вкладки через KEEP_HIDDEN_TABS).
+    # Выбор адаптера (ДО универсальной очистки — адаптер может попросить сохранить
+    # скрытые вкладки через KEEP_HIDDEN_TABS). Сначала профиль сайта; профиля нет ->
+    # прежний путь: адаптер по домену из Profile_Markdown.
     adapter = None
-    domain = ''
-    if url:
-        domain = _normalize_domain(url)
+    domain = _normalize_domain(url) if url else ''
+    profile = _resolve_profile(url)
+    if profile is not None:
+        tier = profile.extract.tier
+        if tier == 'custom':
+            adapter = _get_adapter_by_module(profile.extract.custom_module)
+        elif tier in ('jsonld', 'cms'):
+            # Фаза 0: ярусы объявлены переписью, но не включены — generic-путь.
+            logging.debug(f'Профиль {profile.domain}: tier={tier} объявлен, '
+                          f'в фазе 0 применяется generic')
+    elif domain:
         adapters = _get_adapters()
         if domain in adapters:
             adapter = adapters[domain]
@@ -524,8 +569,36 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
     # Универсальная очистка (всегда). Для адаптеров с KEEP_HIDDEN_TABS не трогаем
     # display:none — на таких сайтах это неактивные вкладки с полезным контентом
     # (а не шум); адаптер сам заберёт нужные вкладки и уберёт лишнее.
-    soup = clean_noise(soup, url or base_url,
-                       strip_hidden=not getattr(adapter, 'KEEP_HIDDEN_TABS', False))
+    keep_hidden_tabs = getattr(adapter, 'KEEP_HIDDEN_TABS', False)
+    if profile is not None:
+        keep_hidden_tabs = keep_hidden_tabs or profile.extract.keep_hidden_tabs
+    soup = clean_noise(soup, url or base_url, strip_hidden=not keep_hidden_tabs)
+
+    # Пер-сайтовый дополнительный шум из профиля (extract.markdown.remove_selectors).
+    if profile is not None:
+        for _sel in profile.extract.markdown.remove_selectors:
+            for _tag in soup.select(_sel):
+                try:
+                    _tag.decompose()
+                except Exception:
+                    pass
+
+    # Настройки markdown-профиля: порог «пустого» markdown, жёсткий лимит длины,
+    # пер-типовый CSS-контейнер (product/company/distributor).
+    md_profile = profile.extract.markdown if profile is not None else None
+    md_min_len = md_profile.min_len if md_profile and md_profile.min_len is not None else 200
+    profile_container = None
+    if md_profile is not None:
+        profile_container = {'company': md_profile.company_container,
+                            'distributor': md_profile.distributor_container
+                            }.get(page_type, md_profile.product_container)
+
+    def _finish(md):
+        """Постобработка + жёсткий лимит длины markdown из профиля (max_len)."""
+        result = _postprocess_markdown(md, soup, base_url)
+        if md_profile and md_profile.max_len:
+            result = result[:md_profile.max_len]
+        return result
 
     # Спец-обработка страниц компании/дистрибьюторов: выделенные методы адаптера
     # extract_company / extract_distributor. Товарный путь (page_type='') не затрагивается.
@@ -539,12 +612,12 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
                 logging.debug(f"Ошибка в adapter.{special_attr} для {url}: {e}")
                 special_result = None
             if special_result is not None:
-                return _postprocess_markdown(special_result, soup, base_url)
+                return _finish(special_result)
         # Нет спец-метода адаптера (или он вернул None) → универсальный доменно-независимый
         # экстрактор контактов/дистрибьюторов. Товарный extract НЕ вызываем.
         universal_result = _extract_contacts_universal(soup, base_url)
         if universal_result is not None:
-            return _postprocess_markdown(universal_result, soup, base_url)
+            return _finish(universal_result)
         # Если и он ничего не дал — общий конвертер ниже.
     else:
         # Применяем специфичную очистку адаптера (если есть)
@@ -561,7 +634,10 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
             # данные лежат в <script> (Tilda `var product` с вариантами товара),
             # который вырезается универсальной очисткой. Такие адаптеры объявляют
             # NEEDS_RAW_HTML=True. Прочие получают очищенный DOM, как прежде.
-            extract_input = html if getattr(adapter, 'NEEDS_RAW_HTML', False) else str(soup)
+            needs_raw_html = getattr(adapter, 'NEEDS_RAW_HTML', False)
+            if profile is not None:
+                needs_raw_html = needs_raw_html or profile.extract.needs_raw_html
+            extract_input = html if needs_raw_html else str(soup)
             try:
                 adapter_result = adapter.extract(extract_input, base_url)
             except Exception as e:
@@ -569,7 +645,7 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
                 raise
             if adapter_result is not None:
                 # Успешно обработано адаптером
-                return _postprocess_markdown(adapter_result, soup, base_url)
+                return _finish(adapter_result)
 
     # --- ОБЩИЙ МЕТОД (если адаптер не справился или его нет) ---
     converter = MarkdownConverter(
@@ -579,8 +655,12 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
     )
 
     def _build_markdown(root_soup):
-        """Выбирает контейнер карточки и конвертирует его в markdown."""
-        main = (root_soup.select_one('[itemtype*="Product"]') or
+        """Выбирает контейнер карточки и конвертирует его в markdown.
+        Контейнер из профиля сайта (extract.markdown.*_container) — первым в цепочке;
+        нет матча — прежняя generic-цепочка."""
+        main = root_soup.select_one(profile_container) if profile_container else None
+        main = (main or
+                root_soup.select_one('[itemtype*="Product"]') or
                 root_soup.select_one('article') or
                 root_soup.select_one('main') or
                 root_soup.select_one('.content') or
@@ -615,7 +695,7 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
         # или <200 символов при непустом базовом.
         base_len = len(baseline_markdown.strip())
         clean_len = len(cleaned_markdown.strip())
-        if base_len and (clean_len < 200 or clean_len < base_len * 0.3):
+        if base_len and (clean_len < md_min_len or clean_len < base_len * 0.3):
             logging.debug(
                 f"clean_noise_product откат для {url}: {base_len}->{clean_len} символов"
             )
@@ -643,14 +723,14 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
             cur_len = len(markdown.strip())
             if universal_markdown is not None:
                 uni_len = len(universal_markdown.strip())
-                if cur_len and (uni_len < 200 or uni_len < cur_len * 0.5):
+                if cur_len and (uni_len < md_min_len or uni_len < cur_len * 0.5):
                     logging.debug(
                         f"universal_extractor короче — откат для {url}: {cur_len}->{uni_len} символов"
                     )
                 else:
                     markdown = universal_markdown
 
-    return _postprocess_markdown(markdown, soup, base_url)
+    return _finish(markdown)
 
 
 # Юникод-дроби → обычная запись N/M (применяется в _postprocess_markdown ко всему markdown).
