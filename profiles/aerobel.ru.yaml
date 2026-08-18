@@ -5,7 +5,8 @@ source: manual
 confidence: 1.0
 notes:
 - 'Адаптер markdown: Profile_Markdown/aerobel_ru.py'
-- 'D98: товары в /catalog/, дилеры /cooperation/ (~700 записей), контакты /contacts/ /company/ /about/'
+- 'D98: товары в /catalog/, дилеры /cooperation/ (~700 записей), контакты /contacts/ /company/ (раздел
+  /about/ намеренно не добавлен в contacts_urls: его поддерево жгло бюджет краула, см. D98)'
 extract:
   tier: custom
   custom_module: aerobel_ru
@@ -26,4 +27,3 @@ sections:
   contacts_urls:
   - /contacts/
   - /company/
-  - /about/

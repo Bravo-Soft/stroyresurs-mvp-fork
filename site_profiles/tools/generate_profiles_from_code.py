@@ -41,10 +41,11 @@ MANUAL = {
         'sections': {
             'catalog_roots': ['/catalog/'],
             'distributor_urls': ['/cooperation/'],
-            'contacts_urls': ['/contacts/', '/company/', '/about/'],
+            'contacts_urls': ['/contacts/', '/company/'],
         },
         'notes': ['D98: товары в /catalog/, дилеры /cooperation/ (~700 записей), '
-                  'контакты /contacts/ /company/ /about/'],
+                  'контакты /contacts/ /company/ (раздел /about/ намеренно не добавлен '
+                  'в contacts_urls: его поддерево жгло бюджет краула, см. D98)'],
     },
     'tizol.com': {
         'crawl': {'tab_panel_selector': '.product-page__section-content'},

@@ -36,6 +36,15 @@ from temp_storage_manager import TempStorageManager
 from domain_equivalency import DomainEquivalencyManager
 from data_island import needs_javascript, has_product_island, is_unrendered_store_listing
 
+# Профили сайтов (mvp/profiles/*.yaml): пер-сайтовые стратегии краулинга.
+# Импорт защищён (fail-open): без пакета/зависимостей краулер работает как раньше.
+try:
+    from site_profiles import get_resolver as _get_profile_resolver
+    from site_profiles.host_throttle import HostThrottle
+except Exception:
+    _get_profile_resolver = None
+    HostThrottle = None
+
 log = logging.getLogger("crawler")
 
 PERMANENT_ERRORS = [
@@ -160,9 +169,12 @@ class DynamicContentExtractor:
     Автоматически определяет тип элементов и извлекает HTML после кликов.
     """
 
-    def __init__(self, browser_pool: BrowserPool, config: Config):
+    def __init__(self, browser_pool: BrowserPool, config: Config, extra_tab_panel_selector: str = None):
         self.browser_pool = browser_pool
         self.config = config
+        # Пер-сайтовый селектор панели вкладки из профиля (crawl.tab_panel_selector) —
+        # добавляется к глобальному списку config.dynamic_tab_panel_selectors.
+        self.extra_tab_panel_selector = extra_tab_panel_selector
 
     async def extract(self, url: str) -> Union[List[str], str]:
         """
@@ -287,9 +299,11 @@ class DynamicContentExtractor:
             if not tabs:
                 return base_html
 
-            panel_selectors = ", ".join(
-                getattr(self.config, 'dynamic_tab_panel_selectors',
-                        ["[role='tabpanel']", ".tab-content", ".tab-pane"]))
+            _panel_list = list(getattr(self.config, 'dynamic_tab_panel_selectors',
+                                       ["[role='tabpanel']", ".tab-content", ".tab-pane"]))
+            if self.extra_tab_panel_selector and self.extra_tab_panel_selector not in _panel_list:
+                _panel_list.append(self.extra_tab_panel_selector)
+            panel_selectors = ", ".join(_panel_list)
 
             async def visible_panel_html() -> str:
                 try:
@@ -703,6 +717,38 @@ class URLCategorizer:
             log.warning(f"Ошибка проверки языка для {url}: {e}")
             return False
                     
+    def set_profile(self, profile) -> None:
+        """Профиль сайта (site_profiles.SiteProfile) текущей компании: пер-сайтовая
+        карта разделов (sections) и exclude_paths. None = без профиля (как раньше)."""
+        self.profile = profile
+        self._profile_product_res = []
+        self._profile_antipattern_res = []
+        if profile is None:
+            return
+        for pattern in profile.sections.product_url_patterns:
+            try:
+                self._profile_product_res.append(re.compile(pattern, re.I))
+            except re.error as e:
+                log.warning(f"Профиль {profile.domain}: битый regex product_url_patterns "
+                            f"{pattern!r}: {e}")
+        for pattern in profile.sections.product_url_antipatterns:
+            try:
+                self._profile_antipattern_res.append(re.compile(pattern, re.I))
+            except re.error as e:
+                log.warning(f"Профиль {profile.domain}: битый regex product_url_antipatterns "
+                            f"{pattern!r}: {e}")
+
+    @staticmethod
+    def _path_prefix_match(path: str, prefixes) -> bool:
+        """Матч пути по списку префиксов ('/contacts/' матчит /contacts/ и подстраницы)."""
+        for prefix in prefixes:
+            p = prefix.lower()
+            if not p.startswith('/'):
+                p = '/' + p
+            if path == p or path == p.rstrip('/') or path.startswith(p if p.endswith('/') else p + '/'):
+                return True
+        return False
+
     def categorize_url(self, url: str, link_text: str = "") -> Tuple[str, int]:
         """Категоризация URL с возвратом категории и приоритета"""
         # Проверяем на языковые префиксы
@@ -744,6 +790,37 @@ class URLCategorizer:
                     log.debug(f"D69: исключаем пер-доменный раздел {url}")
                     return 'excluded', 0
 
+        # Профиль сайта: пер-доменные exclude_paths и карта разделов (sections).
+        # Профиля нет — блок не выполняется вообще (нулевой регресс). Прямые матчи
+        # секций сильнее глобальных exclude-паттернов: их назначение — дотянуться до
+        # страниц реквизитов/документов, которые общие эвристики исключают или не видят.
+        profile_not_product = False
+        _prof = getattr(self, 'profile', None)
+        if _prof is not None:
+            _p_path = parsed.path.lower()
+            if any(p in _p_path for p in (s.lower() for s in _prof.crawl.exclude_paths)):
+                log.debug(f"Профиль {_prof.domain}: исключаем раздел {url}")
+                return 'excluded', 0
+            profile_not_product = any(r.search(url_lower) for r in self._profile_antipattern_res)
+            if not profile_not_product and any(r.search(url_lower) for r in self._profile_product_res):
+                return 'product', self.priority_levels['product']
+            _sec = _prof.sections
+            if self._path_prefix_match(_p_path, _sec.contacts_urls):
+                return 'contacts', self.priority_levels['contacts']
+            if self._path_prefix_match(_p_path, _sec.distributor_urls):
+                return 'distributor', self.priority_levels['distributor']
+            if self._path_prefix_match(_p_path, _sec.price_list_urls):
+                return 'price_list', self.priority_levels['price_list']
+            if self._path_prefix_match(_p_path, _sec.documents_urls):
+                # Страницы общих документов (сертификаты/каталоги/документация):
+                # отдельной категории нет — краулим как 'other' с приоритетом контактов.
+                return 'other', self.priority_levels['contacts']
+            # catalog_roots: только сам корень каталога (точный путь) — подстраницы
+            # идут обычной классификацией (иначе товарные URL стали бы категориями)
+            _roots = [r.rstrip('/') for r in (s.lower() for s in _sec.catalog_roots)]
+            if _p_path.rstrip('/') in [r if r.startswith('/') else '/' + r for r in _roots if r]:
+                return 'category', self.priority_levels['category']
+
         # Проверка на исключаемые паттерны (D58: по границам слова, не подстрокой)
         if self._exclude_patterns_re.search(url_lower):
             # D37: разделы дилеров часто живут под исключаемыми сегментами
@@ -770,8 +847,8 @@ class URLCategorizer:
         if any(keyword in url_lower or keyword in text_lower for keyword in self.price_list_keywords):
             return 'price_list', self.priority_levels['price_list']
         
-        # Проверка на товары
-        if self._is_product_url(url):
+        # Проверка на товары (антипаттерн профиля запрещает классификацию «товар»)
+        if not profile_not_product and self._is_product_url(url):
             return 'product', self.priority_levels['product']
         
         # Проверка на категории
@@ -1557,15 +1634,32 @@ class FileDownloadManager:
         
         return False
     
+    async def _file_throttle(self, url: str) -> None:
+        """Пер-хостовый интервал между скачиваниями файлов из профиля сайта
+        (crawl.load.file_delay_ms); без профиля/при 0 — no-op."""
+        prof = getattr(self.crawler, 'profile', None)
+        throttle = getattr(self.crawler, 'host_throttle', None)
+        if prof is not None and throttle is not None:
+            await throttle.acquire(urlparse(url).netloc.lower(),
+                                   prof.crawl.load.file_delay_ms, 'files')
+
+    def _file_timeout(self, default_s: int) -> int:
+        """Таймаут скачивания файла: профиль сайта (crawl.load.file_timeout_s) -> прежний дефолт."""
+        prof = getattr(self.crawler, 'profile', None)
+        if prof is not None and prof.crawl.load.file_timeout_s:
+            return prof.crawl.load.file_timeout_s
+        return default_s
+
     async def get_image_size(self, image_url: str) -> Optional[int]:
         """Получение размера изображения в байтах по URL (под общим лимитом скачиваний)"""
         async with self.download_semaphore:
+            await self._file_throttle(image_url)
             return await self._get_image_size_unlimited(image_url)
 
     async def _get_image_size_unlimited(self, image_url: str) -> Optional[int]:
         """Получение размера изображения в байтах по URL"""
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=self._file_timeout(10))
             connector = aiohttp.TCPConnector(ssl=False)
             
             async with aiohttp.ClientSession(
@@ -1943,13 +2037,14 @@ class FileDownloadManager:
     async def _download_aiohttp(self, file_url: str, save_dir: str, page_category: str = None) -> Optional[str]:
         """Универсальное скачивание файлов через aiohttp (под общим лимитом скачиваний)"""
         async with self.download_semaphore:
+            await self._file_throttle(file_url)
             return await self._download_aiohttp_unlimited(file_url, save_dir, page_category)
 
     async def _download_aiohttp_unlimited(self, file_url: str, save_dir: str, page_category: str = None) -> Optional[str]:
         """Универсальное скачивание файлов через aiohttp (из Fallback)"""
         try:
             _ptt_t0 = time.perf_counter()
-            timeout = aiohttp.ClientTimeout(total=30)
+            timeout = aiohttp.ClientTimeout(total=self._file_timeout(30))
             connector = aiohttp.TCPConnector(limit=5, ssl=False)
             
             async with aiohttp.ClientSession(
@@ -2075,6 +2170,11 @@ class WebCrawler:
         # пробуем aiohttp-фолбэк (Bitrix-категории/страницы часто отдают каркас Playwright, но полный HTML — GET).
         self.playwright_min_content = getattr(self.config, 'playwright_min_content', 1500)
         self.aiohttp_semaphore = Semaphore(config.max_concurrent_pages)
+        # Профиль сайта текущей компании (site_profiles); None = generic-поведение.
+        # Применяется в crawl_site -> _apply_site_profile.
+        self.profile = None
+        self.host_throttle = HostThrottle() if HostThrottle is not None else None
+        self._effective_max_concurrent_pages = config.max_concurrent_pages
         # Потоковая обработка: опциональная asyncio.Queue; если задана, каждая сохранённая
         # страница дополнительно кладётся в неё сразу после записи в хранилище
         self.page_sink = None
@@ -2311,6 +2411,14 @@ class WebCrawler:
         # Сохраняем базовый URL для проверки поддоменов
         self.current_base_url = working_url
 
+        # Профиль сайта: пер-сайтовые лимиты/стратегии (mvp/profiles/<домен>.yaml).
+        self._apply_site_profile(working_url)
+        if self.profile is not None and self.profile.crawl.antibot == 'blocked':
+            log.warning(f"Профиль {self.profile.domain}: antibot=blocked — сайт не "
+                        f"обрабатывается (ждёт решения в REVIEW)")
+            return {'error': 'antibot=blocked (профиль сайта)', 'stored_pages': [],
+                    'original_url': site_url, 'working_url': working_url}
+
         # Сбрасываем статистику для нового сайта
         await self._reset_stats()
         
@@ -2337,6 +2445,50 @@ class WebCrawler:
             self.stats['failed_pages'] += 1
             return {'error': str(e), 'stored_pages': stored_pages, 'original_url': site_url, 'working_url': working_url}
     
+    def _apply_site_profile(self, working_url: str) -> None:
+        """Резолвит профиль сайта и применяет пер-сайтовые лимиты/настройки.
+        Профиля нет (или он «пустой», или site_profiles недоступен) — все значения
+        возвращаются к глобальным из config (профиль прошлой компании не протекает)."""
+        self.profile = None
+        self.max_depth = self.config.max_depth
+        self.max_pages_per_site = self.config.max_pages_per_site
+        self.max_product_pages_per_site = self.config.max_product_pages_per_site
+        self.page_retry_max_attempts = getattr(self.config, 'page_retry_max_attempts', 1)
+        self._effective_max_concurrent_pages = self.config.max_concurrent_pages
+        self.aiohttp_semaphore = Semaphore(self.config.max_concurrent_pages)
+        self.file_download_manager.download_semaphore = asyncio.Semaphore(
+            getattr(self.config, 'max_concurrent_file_downloads', 5))
+        self.url_categorizer.set_profile(None)
+        if _get_profile_resolver is None:
+            return
+        try:
+            profile = _get_profile_resolver().resolve(working_url)
+        except Exception as e:
+            log.warning(f"Профиль сайта не разрезолвлен для {working_url}: {e}")
+            return
+        if profile.is_default():
+            return
+        self.profile = profile
+        self.url_categorizer.set_profile(profile)
+        limits, load = profile.crawl.limits, profile.crawl.load
+        if limits.pages:
+            self.max_pages_per_site = limits.pages
+        if limits.product_pages:
+            self.max_product_pages_per_site = limits.product_pages
+        if limits.depth:
+            self.max_depth = limits.depth
+        if load.page_retry_attempts is not None:
+            self.page_retry_max_attempts = load.page_retry_attempts
+        if load.max_concurrent_pages:
+            self._effective_max_concurrent_pages = load.max_concurrent_pages
+            self.aiohttp_semaphore = Semaphore(load.max_concurrent_pages)
+        if load.max_concurrent_files:
+            self.file_download_manager.download_semaphore = asyncio.Semaphore(
+                load.max_concurrent_files)
+        log.info(f"Применён профиль сайта {profile.domain} v{profile.profile_version} "
+                 f"(source={profile.source}, tier={profile.extract.tier}, "
+                 f"render={profile.crawl.render or 'auto'}, antibot={profile.crawl.antibot})")
+
     async def _get_working_url(self, url: str) -> str:
         """Получение рабочего URL с проверкой доступности и учетом эквивалентности доменов"""
         if not self.config.domain_equivalency_enabled or not self.config.treat_http_https_as_same:
@@ -2424,7 +2576,7 @@ class WebCrawler:
             
             # Создаем задачи для параллельной обработки
             async with self._queue_lock:
-                batch_size = min(self.config.max_concurrent_pages - len(active_tasks), len(queue))
+                batch_size = min(self._effective_max_concurrent_pages - len(active_tasks), len(queue))
                 if batch_size > 0:
                     for _ in range(batch_size):
                         if queue:
@@ -2533,8 +2685,11 @@ class WebCrawler:
                 elif priority >= 7:  # Высокоприоритетные страницы
                     filtered_urls.append((url, category, priority))
             
-            # Ограничиваем общее количество
-            filtered_urls = filtered_urls[:self.config.sitemap_max_urls]
+            # Ограничиваем общее количество (профиль сайта может задать свой лимит)
+            _sitemap_cap = self.config.sitemap_max_urls
+            if self.profile is not None and self.profile.crawl.limits.sitemap_urls:
+                _sitemap_cap = self.profile.crawl.limits.sitemap_urls
+            filtered_urls = filtered_urls[:_sitemap_cap]
             
             log.info(f"Отфильтровано {len(filtered_urls)} URL из карты сайта")
             return filtered_urls
@@ -2686,7 +2841,7 @@ class WebCrawler:
             if category == 'documentation':
                 log.info(f"Обработка страницы документации (скачивание файлов): {url}")
                 try:
-                    extractor = DynamicContentExtractor(self.browser_pool, self.config)
+                    extractor = self._make_dynamic_extractor()
                     result = await extractor.extract(url)
                     if result:
                         await self._download_files_from_documentation_page(url, result, domain_dirs, company_name)
@@ -3120,7 +3275,16 @@ class WebCrawler:
             f"{base_url}/price",       # Прайс-листы
             f"{base_url}/tseny"       # Прайс-листы
         ]
-        
+
+        # Доп. стартовые точки из профиля сайта (карта разделов sections).
+        if self.profile is not None:
+            sec = self.profile.sections
+            for path in (sec.start_urls + sec.catalog_roots + sec.contacts_urls +
+                         sec.distributor_urls + sec.documents_urls + sec.price_list_urls):
+                full = path if path.startswith('http') else urljoin(base_url + '/', path.lstrip('/'))
+                if full not in start_urls:
+                    start_urls.append(full)
+
         return [url for url in start_urls if self._is_valid_url(url)]
 
     async def _should_skip_url(self, url: str, depth: int, company_name: str) -> bool:
@@ -3277,10 +3441,25 @@ class WebCrawler:
                 if normalized_url in self.permanent_errors_cache:
                     log.debug(f"URL в кэше перманентных ошибок, пропускаем: {url}")
                     return None
-            
+
+            # Пер-хостовый троттлинг из профиля (crawl.load.page_delay_ms); 0 = no-op.
+            if self.profile is not None and self.host_throttle is not None:
+                await self.host_throttle.acquire(urlparse(url).netloc.lower(),
+                                                 self.profile.crawl.load.page_delay_ms)
+            # Профиль: render=browser -> сразу Playwright (SPA); antibot=impersonate/warmup ->
+            # HTTP-first (curl_cffi) пробуется первым и для contacts/distributor.
+            force_browser = self.profile is not None and self.profile.crawl.render == 'browser'
+            profile_antibot = self.profile.crawl.antibot if self.profile is not None else 'none'
+
             if category in ('contacts', 'distributor') and self.config.dynamic_content_enabled:
+                if profile_antibot in ('impersonate', 'warmup') and not force_browser:
+                    http_html = await self._http_first_get(url)
+                    if http_html:
+                        log.info(f"Профиль (antibot={profile_antibot}): {category}-страница "
+                                 f"получена HTTP-first без браузера: {url}")
+                        return await self._parse_content(http_html, url)
                 log.info(f"Обработка динамического контента для {category}: {url}")
-                extractor = DynamicContentExtractor(self.browser_pool, self.config)
+                extractor = self._make_dynamic_extractor()
                 result = await extractor.extract(url)
 
                 if isinstance(result, list):
@@ -3322,8 +3501,9 @@ class WebCrawler:
                 # не содержит контента вкладок)
                 ajax_domains = getattr(self.config, 'ajax_product_tabs_domains', []) or []
                 page_host = urlparse(url).netloc.lower()
-                if any(page_host == d or page_host.endswith('.' + d) for d in ajax_domains):
-                    extractor = DynamicContentExtractor(self.browser_pool, self.config)
+                profile_ajax = self.profile is not None and self.profile.crawl.ajax_tabs
+                if profile_ajax or any(page_host == d or page_host.endswith('.' + d) for d in ajax_domains):
+                    extractor = self._make_dynamic_extractor()
                     merged_html = await extractor.extract_product_tabs_merged(url)
                     if merged_html:
                         log.info(f"Товарная страница с AJAX-вкладками склеена ({len(merged_html)} симв): {url}")
@@ -3333,13 +3513,16 @@ class WebCrawler:
                 # HTTP-first: curl_cffi impersonate + cookie-warmup при antibot-челлендже.
                 # Если статический HTML достаточен и JS не нужен (или есть товарный остров) —
                 # берём без браузера; иначе (None) идём по старой лестнице aiohttp→Playwright.
-                http_html = await self._http_first_get(url)
-                if http_html:
-                    log.info(f"HTTP-first отдал товарную страницу без браузера ({len(http_html)} симв): {url}")
-                    return await self._parse_content(http_html, url)
-
+                # Профиль render=browser: HTTP-слой пропускается — сразу Playwright.
                 aiohttp_parsed = None
-                aiohttp_content = await self._fetch_with_aiohttp(url)
+                aiohttp_content = None
+                if not force_browser:
+                    http_html = await self._http_first_get(url)
+                    if http_html:
+                        log.info(f"HTTP-first отдал товарную страницу без браузера ({len(http_html)} симв): {url}")
+                        return await self._parse_content(http_html, url)
+
+                    aiohttp_content = await self._fetch_with_aiohttp(url)
                 if aiohttp_content:
                     aiohttp_parsed = await self._parse_content(aiohttp_content, url)
                     if any(cat == 'product' for _, cat, _ in aiohttp_parsed.additional_links):
@@ -3390,7 +3573,8 @@ class WebCrawler:
             else:
                 # HTTP-impersonate первым (сильнее голого aiohttp). Не гейтим по needs_javascript:
                 # для не-товарных страниц важны ссылки для BFS, они есть и в «тонком» HTML.
-                if getattr(self.config, 'http_first_enabled', True) and _CURL_CFFI_AVAILABLE:
+                # Профиль render=browser: HTTP-слой пропускается — сразу Playwright.
+                if not force_browser and getattr(self.config, 'http_first_enabled', True) and _CURL_CFFI_AVAILABLE:
                     res = await self._fetch_with_http_impersonate(url)
                     if res and not res.from_cache_error and res.status == 200 and res.html:
                         ok_domain = True
@@ -3399,7 +3583,7 @@ class WebCrawler:
                         if ok_domain:
                             return await self._parse_content(res.html, url)
 
-                content = await self._fetch_with_aiohttp(url)
+                content = None if force_browser else await self._fetch_with_aiohttp(url)
                 if content:
                     return await self._parse_content(content, url)
                 result = await self._fetch_with_playwright(url)
@@ -3689,7 +3873,7 @@ class WebCrawler:
 
         impersonate = getattr(self.config, 'impersonate_profile', 'chrome')
         verify = getattr(self.config, 'http_verify_tls', True)
-        timeout = getattr(self.config, 'http_timeout', 30)
+        timeout = self._effective_http_timeout()
         own_session = session is None
 
         async with self.aiohttp_semaphore:
@@ -3718,6 +3902,17 @@ class WebCrawler:
             except Exception as e:
                 log.debug(f"curl_cffi не смог получить {url}: {e}")
                 return None
+
+    def _make_dynamic_extractor(self):
+        """DynamicContentExtractor с пер-сайтовым селектором панели вкладки из профиля."""
+        extra = self.profile.crawl.tab_panel_selector if self.profile is not None else None
+        return DynamicContentExtractor(self.browser_pool, self.config, extra_tab_panel_selector=extra)
+
+    def _effective_http_timeout(self) -> int:
+        """Таймаут HTTP-фетча: профиль сайта (crawl.load.fetch_timeout_s) -> config."""
+        if self.profile is not None and self.profile.crawl.load.fetch_timeout_s:
+            return self.profile.crawl.load.fetch_timeout_s
+        return getattr(self.config, 'http_timeout', 30)
 
     @staticmethod
     def _is_challenge(res: Optional[HttpFetchResult]) -> bool:
@@ -3749,7 +3944,7 @@ class WebCrawler:
             return None
         impersonate = getattr(self.config, 'impersonate_profile', 'chrome')
         verify = getattr(self.config, 'http_verify_tls', True)
-        timeout = getattr(self.config, 'http_timeout', 30)
+        timeout = self._effective_http_timeout()
         delay = getattr(self.config, 'warmup_delay_seconds', 1.0)
         home = base_url or url
         async with self.aiohttp_semaphore:
@@ -3785,8 +3980,11 @@ class WebCrawler:
         res = await self._fetch_with_http_impersonate(url)
         if res is None or res.from_cache_error:
             return None
-        # Антибот-челлендж -> прогрев и повтор
-        if getattr(self.config, 'antibot_in_fetch_enabled', True) and self._is_challenge(res):
+        # Антибот-челлендж -> прогрев и повтор. Профиль antibot=warmup: прогреваем
+        # агрессивнее — при любом не-200 (не только по маркерам челленджа).
+        _profile_warmup = (self.profile is not None
+                           and self.profile.crawl.antibot == 'warmup' and res.status != 200)
+        if _profile_warmup or (getattr(self.config, 'antibot_in_fetch_enabled', True) and self._is_challenge(res)):
             warm = await self._cookie_warmup_and_retry(url, self.current_base_url)
             if warm is not None and warm.status == 200:
                 res = warm
@@ -3828,7 +4026,7 @@ class WebCrawler:
                 # КОННЕКТОР С ОТКЛЮЧЕННОЙ ПРОВЕРКОЙ SSL (удалить connector=connector из aiohttp.ClientSession(connector=connector) as session)
                 connector = aiohttp.TCPConnector(ssl=False)
                 async with aiohttp.ClientSession(connector=connector) as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=self._effective_http_timeout())) as response:
                         if response.status == 200:
                             content = await response.text()
                             log.debug(f"Успешно получен контент через aiohttp: {url}")
@@ -3892,10 +4090,11 @@ class WebCrawler:
         config.bitrix_offers_domains или на странице нет тега product-container."""
         try:
             domains = getattr(self.config, 'bitrix_offers_domains', []) or []
-            if not domains or 'product-container' not in html:
+            profile_bitrix = self.profile is not None and self.profile.crawl.bitrix_offers
+            if (not domains and not profile_bitrix) or 'product-container' not in html:
                 return html
             host = urlparse(url).netloc.lower()
-            if not any(host == d or host.endswith('.' + d) for d in domains):
+            if not profile_bitrix and not any(host == d or host.endswith('.' + d) for d in domains):
                 return html
             m = re.search(r'<product-container[^>]*\bproduct-container="(\d+)"', html)
             if not m:
