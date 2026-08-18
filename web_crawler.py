@@ -739,15 +739,17 @@ class URLCategorizer:
                             f"{pattern!r}: {e}")
 
     @staticmethod
-    def _path_prefix_match(path: str, prefixes) -> bool:
-        """Матч пути по списку префиксов ('/contacts/' матчит /contacts/ и подстраницы)."""
+    def _longest_prefix(path: str, prefixes) -> int:
+        """Длина самого длинного префикса из списка, матчащего путь ('/contacts/'
+        матчит /contacts/ и подстраницы), или -1 если ни один не матчит."""
+        best = -1
         for prefix in prefixes:
             p = prefix.lower()
             if not p.startswith('/'):
                 p = '/' + p
             if path == p or path == p.rstrip('/') or path.startswith(p if p.endswith('/') else p + '/'):
-                return True
-        return False
+                best = max(best, len(p.rstrip('/')))
+        return best
 
     def categorize_url(self, url: str, link_text: str = "") -> Tuple[str, int]:
         """Категоризация URL с возвратом категории и приоритета"""
@@ -805,16 +807,21 @@ class URLCategorizer:
             if not profile_not_product and any(r.search(url_lower) for r in self._profile_product_res):
                 return 'product', self.priority_levels['product']
             _sec = _prof.sections
-            if self._path_prefix_match(_p_path, _sec.contacts_urls):
-                return 'contacts', self.priority_levels['contacts']
-            if self._path_prefix_match(_p_path, _sec.distributor_urls):
-                return 'distributor', self.priority_levels['distributor']
-            if self._path_prefix_match(_p_path, _sec.price_list_urls):
-                return 'price_list', self.priority_levels['price_list']
-            if self._path_prefix_match(_p_path, _sec.documents_urls):
-                # Страницы общих документов (сертификаты/каталоги/документация):
-                # отдельной категории нет — краулим как 'other' с приоритетом контактов.
-                return 'other', self.priority_levels['contacts']
+            # Прямые матчи секций; при пересечении префиксов побеждает САМЫЙ ДЛИННЫЙ
+            # (пример belcolor: contacts_urls=['/contacts/'], distributor_urls=
+            # ['/contacts/branches/'] -> /contacts/branches/x = distributor).
+            # Документы: отдельной категории нет — краулим как 'other' с приоритетом контактов.
+            _best_len, _best_result = -1, None
+            for _prefixes, _sec_cat, _sec_prio in (
+                    (_sec.contacts_urls, 'contacts', self.priority_levels['contacts']),
+                    (_sec.distributor_urls, 'distributor', self.priority_levels['distributor']),
+                    (_sec.price_list_urls, 'price_list', self.priority_levels['price_list']),
+                    (_sec.documents_urls, 'other', self.priority_levels['contacts'])):
+                _match_len = self._longest_prefix(_p_path, _prefixes)
+                if _match_len > _best_len:
+                    _best_len, _best_result = _match_len, (_sec_cat, _sec_prio)
+            if _best_len >= 0:
+                return _best_result
             # catalog_roots: только сам корень каталога (точный путь) — подстраницы
             # идут обычной классификацией (иначе товарные URL стали бы категориями)
             _roots = [r.rstrip('/') for r in (s.lower() for s in _sec.catalog_roots)]

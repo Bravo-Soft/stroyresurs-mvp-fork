@@ -86,6 +86,48 @@ def test_profile_sections_beat_global_exclude(categorizer):
     assert categorizer.categorize_url('https://a.ru/media/sertifikaty/')[0] == 'excluded2'
 
 
+def test_overlapping_prefixes_longest_wins(categorizer):
+    """/contacts/branches/ = дилеры, хотя /contacts/ объявлен контактами."""
+    categorizer.set_profile(_profile(sections={
+        'contacts_urls': ['/contacts/'],
+        'distributor_urls': ['/contacts/branches/'],
+    }))
+    assert categorizer.categorize_url('https://a.ru/contacts/')[0] == 'contacts'
+    assert categorizer.categorize_url('https://a.ru/contacts/requisites/')[0] == 'contacts'
+    assert categorizer.categorize_url('https://a.ru/contacts/branches/')[0] == 'distributor'
+    assert categorizer.categorize_url('https://a.ru/contacts/branches/moskva/')[0] == 'distributor'
+
+
+def test_belcolor_repo_profile(categorizer):
+    """Функциональная проверка принятого профиля belcolor.ru (правки оператора)."""
+    from site_profiles import ProfileResolver
+    from site_profiles.resolver import DEFAULT_PROFILES_DIR
+    profile = ProfileResolver(DEFAULT_PROFILES_DIR).resolve('https://www.belcolor.ru/')
+    assert not profile.is_default()
+    categorizer.set_profile(profile)
+    cat = lambda u: categorizer.categorize_url(u)[0]
+    # дилеры: филиалы/представительства
+    assert cat('https://www.belcolor.ru/contacts/branches/') == 'distributor'
+    # контакты: реквизиты, контакты, index_area.php
+    assert cat('https://www.belcolor.ru/company/requisites/') == 'contacts'
+    assert cat('https://www.belcolor.ru/contacts/') == 'contacts'
+    assert cat('http://belcolor.ru/company/index_area.php') == 'contacts'
+    # лишние страницы исключены из обхода
+    for path in ('/company/partners/postavshchiki-materialov/basf.html',
+                 '/company/history/2002.html', '/company/clients',
+                 '/company/o-nas', '/company/o-nas/index_area.php', '/company/managment'):
+        assert cat(f'http://belcolor.ru{path}') == 'excluded', path
+    # документация: /services/ и комплекты документов (категория other, приоритет >= 7)
+    for path in ('/services/', '/services/pasporta-bezopasnosti/',
+                 '/services/deklaratsii-sootvetstviya/',
+                 '/services/svidetelstva-o-gosregistratsii/',
+                 '/services/informatsiya-o-sout/'):
+        category, priority = categorizer.categorize_url(f'https://www.belcolor.ru{path}')
+        assert category == 'other' and priority >= 7, path
+    # товары не задеты
+    assert cat('http://belcolor.ru/catalog/khv-16/16sn50.html') == 'product'
+
+
 # ==================== HostThrottle ====================
 
 def test_host_throttle_delczero_noop():

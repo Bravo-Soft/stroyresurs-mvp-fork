@@ -1,0 +1,55 @@
+domain: belcolor.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+confidence: 0.81
+source: mixed
+notes:
+- 'Черновик переписи 2026-08-18 исправлен оператором: дилеры — /contacts/branches/
+  (к дилерам относятся филиалы, представительства, «где купить» и т.п.); из contacts
+  убраны partners/history/clients/o-nas/managment (исключены из обхода как нецелевые);
+  contacts = реквизиты + контакты + index_area.php; добавлен раздел документации
+  /services/ (паспорта безопасности, декларации соответствия, свидетельства о
+  госрегистрации, информация о СОУТ)'
+- 'Страницы documents_urls краулятся и попадают в корпус, но файлы с них пайплайн
+  пока НЕ скачивает (пути скачивания общих документов в коде нет) — доработка фазы 1/2'
+crawl:
+  render: html
+  exclude_paths:
+  - /company/partners
+  - /company/history
+  - /company/clients
+  - /company/o-nas
+  - /company/managment
+sections:
+  contacts_urls:
+  - /company/requisites/
+  - /contacts/
+  - /company/index_area.php
+  distributor_urls:
+  - /contacts/branches/
+  documents_urls:
+  - /services/
+  - /services/pasporta-bezopasnosti/
+  - /services/deklaratsii-sootvetstviya/
+  - /services/svidetelstva-o-gosregistratsii/
+  - /services/informatsiya-o-sout/
+baseline:
+  structure_hash: 96b5d58b1a485d01f9a0e25e062b154966e5b0ec
+  selector_hit_rate: 1.0
+  pages_crawled: 425
+  product_pages: 350
+  product_cards: 197
+  jsonld_share: 0.0
+  cms_detected: generic-content
+  fetch_fail_rate: 0.0
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.8174
+  sitemap_url_count: 500
+  extraction_path_share:
+    universal: 0.7028
+    contacts_universal: 0.2972
+  section_counts:
+    main_page: 2
+    product: 350
+    contacts: 73
