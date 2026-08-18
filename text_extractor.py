@@ -382,6 +382,27 @@ def _resolve_profile(url: str):
         return None
 
 
+
+# Колбэк телеметрии профилирования (census/метрики): sink(event, **data).
+# None = выключено (прод по умолчанию). Ошибки sink никогда не роняют конвертацию.
+_census_sink = None
+
+
+def set_census_sink(sink) -> None:
+    """Устанавливает (или сбрасывает, None) колбэк телеметрии извлечения."""
+    global _census_sink
+    _census_sink = sink
+
+
+def _emit_census(event, **data):
+    if _census_sink is None:
+        return
+    try:
+        _census_sink(event, **data)
+    except Exception as e:
+        logging.debug(f'census sink: {e}')
+
+
 def _get_adapter_by_module(module_name):
     """Адаптер Profile_Markdown по имени модуля (extract.custom_module профиля)."""
     if not module_name:
@@ -593,11 +614,22 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
                             'distributor': md_profile.distributor_container
                             }.get(page_type, md_profile.product_container)
 
-    def _finish(md):
-        """Постобработка + жёсткий лимит длины markdown из профиля (max_len)."""
+    def _finish(md, extraction_path):
+        """Постобработка + лимит длины markdown из профиля + телеметрия извлечения."""
         result = _postprocess_markdown(md, soup, base_url)
         if md_profile and md_profile.max_len:
             result = result[:md_profile.max_len]
+        if _census_sink is not None:
+            data = {'url': url, 'page_type': page_type, 'path': extraction_path,
+                    'md_len': len(result)}
+            if page_type == '':
+                # Скелет DOM товарной страницы — опора детекта дрейфа вёрстки.
+                try:
+                    from site_profiles.census_collector import dom_skeleton_hash
+                    data['structure_hash'] = dom_skeleton_hash(soup)
+                except Exception:
+                    pass
+            _emit_census('extraction', **data)
         return result
 
     # Спец-обработка страниц компании/дистрибьюторов: выделенные методы адаптера
@@ -612,12 +644,12 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
                 logging.debug(f"Ошибка в adapter.{special_attr} для {url}: {e}")
                 special_result = None
             if special_result is not None:
-                return _finish(special_result)
+                return _finish(special_result, 'adapter_special')
         # Нет спец-метода адаптера (или он вернул None) → универсальный доменно-независимый
         # экстрактор контактов/дистрибьюторов. Товарный extract НЕ вызываем.
         universal_result = _extract_contacts_universal(soup, base_url)
         if universal_result is not None:
-            return _finish(universal_result)
+            return _finish(universal_result, 'contacts_universal')
         # Если и он ничего не дал — общий конвертер ниже.
     else:
         # Применяем специфичную очистку адаптера (если есть)
@@ -645,7 +677,7 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
                 raise
             if adapter_result is not None:
                 # Успешно обработано адаптером
-                return _finish(adapter_result)
+                return _finish(adapter_result, 'adapter')
 
     # --- ОБЩИЙ МЕТОД (если адаптер не справился или его нет) ---
     converter = MarkdownConverter(
@@ -683,6 +715,7 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
     # Чистку шума применяем ТОЛЬКО для товарных страниц (page_type='') и на копии soup,
     # чтобы исходный (нужный для _postprocess_markdown: title/h1) не пострадал.
     markdown = baseline_markdown
+    used_universal = False
     if page_type not in ('company', 'distributor'):
         try:
             cleaned_soup = BeautifulSoup(str(soup), 'lxml')
@@ -729,8 +762,9 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
                     )
                 else:
                     markdown = universal_markdown
+                    used_universal = True
 
-    return _finish(markdown)
+    return _finish(markdown, 'universal' if used_universal else 'generic')
 
 
 # Юникод-дроби → обычная запись N/M (применяется в _postprocess_markdown ко всему markdown).

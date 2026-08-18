@@ -2175,6 +2175,9 @@ class WebCrawler:
         self.profile = None
         self.host_throttle = HostThrottle() if HostThrottle is not None else None
         self._effective_max_concurrent_pages = config.max_concurrent_pages
+        # Коллектор метрик профилирования (site_profiles.profile_metrics);
+        # устанавливается main.py на компанию. None = телеметрия выключена.
+        self.metrics_collector = None
         # Потоковая обработка: опциональная asyncio.Queue; если задана, каждая сохранённая
         # страница дополнительно кладётся в неё сразу после записи в хранилище
         self.page_sink = None
@@ -2690,8 +2693,10 @@ class WebCrawler:
             if self.profile is not None and self.profile.crawl.limits.sitemap_urls:
                 _sitemap_cap = self.profile.crawl.limits.sitemap_urls
             filtered_urls = filtered_urls[:_sitemap_cap]
-            
+
             log.info(f"Отфильтровано {len(filtered_urls)} URL из карты сайта")
+            if self.metrics_collector is not None:
+                self.metrics_collector.record_sitemap(len(filtered_urls))
             return filtered_urls
             
         except asyncio.TimeoutError:
@@ -3457,6 +3462,7 @@ class WebCrawler:
                     if http_html:
                         log.info(f"Профиль (antibot={profile_antibot}): {category}-страница "
                                  f"получена HTTP-first без браузера: {url}")
+                        self._census_fetch(url, category, 'http_first')
                         return await self._parse_content(http_html, url)
                 log.info(f"Обработка динамического контента для {category}: {url}")
                 extractor = self._make_dynamic_extractor()
@@ -3470,11 +3476,13 @@ class WebCrawler:
                         if parsed:
                             parsed_list.append(parsed)
                     if parsed_list:
+                        self._census_fetch(url, category, 'dynamic')
                         return parsed_list
                 elif isinstance(result, str):
                     # Один HTML (аккордеоны) -> один ParseResult
                     parsed = await self._parse_content(result, url)
                     if parsed:
+                        self._census_fetch(url, category, 'dynamic')
                         return parsed
 
                 # D79: браузер не отдал контент (частая причина — Page.goto Timeout на медленных
@@ -3488,7 +3496,10 @@ class WebCrawler:
                     http_html = await self._fetch_with_aiohttp(url)
                 if http_html:
                     log.info(f"HTTP-fallback отдал {category}-страницу без браузера ({len(http_html)} симв): {url}")
+                    self._census_fetch(url, category, 'http_first')
                     return await self._parse_content(http_html, url)
+                if self.metrics_collector is not None:
+                    self.metrics_collector.record_fetch_fail(url, category)
                 return None
                 
             # Для продуктовых/каталожных страниц сначала пробуем aiohttp: статические каталоги
@@ -3507,6 +3518,7 @@ class WebCrawler:
                     merged_html = await extractor.extract_product_tabs_merged(url)
                     if merged_html:
                         log.info(f"Товарная страница с AJAX-вкладками склеена ({len(merged_html)} симв): {url}")
+                        self._census_fetch(url, category, 'ajax_tabs')
                         return await self._parse_content(merged_html, url)
                     # если браузер не отдал страницу — падаем на обычную лестницу ниже
 
@@ -3520,12 +3532,14 @@ class WebCrawler:
                     http_html = await self._http_first_get(url)
                     if http_html:
                         log.info(f"HTTP-first отдал товарную страницу без браузера ({len(http_html)} симв): {url}")
+                        self._census_fetch(url, category, 'http_first')
                         return await self._parse_content(http_html, url)
 
                     aiohttp_content = await self._fetch_with_aiohttp(url)
                 if aiohttp_content:
                     aiohttp_parsed = await self._parse_content(aiohttp_content, url)
                     if any(cat == 'product' for _, cat, _ in aiohttp_parsed.additional_links):
+                        self._census_fetch(url, category, 'aiohttp')
                         return aiohttp_parsed
                     # Гейт data-island: если полный контент товарной страницы уже пришёл
                     # обычным GET (достаточно SSR-текста либо в HTML есть товарный остров
@@ -3534,6 +3548,7 @@ class WebCrawler:
                     # временный soup и не мутирует aiohttp_parsed.
                     if not needs_javascript(aiohttp_content) and not is_unrendered_store_listing(aiohttp_content):
                         log.debug(f"data-island: контент товара уже в HTML, пропускаем Playwright: {url}")
+                        self._census_fetch(url, category, 'aiohttp')
                         return aiohttp_parsed
 
                 # Товарных ссылок в обычном GET нет — пробуем Playwright (динамический рендеринг)
@@ -3568,7 +3583,12 @@ class WebCrawler:
                     if parse_result and final_url and final_url != url:
                         # Сохраним исходный URL в дополнительном поле parse_result (можно через атрибут)
                         parse_result.redirected_from = url
+                    self._census_fetch(url, category, 'playwright')
                     return parse_result
+                if aiohttp_parsed is not None:
+                    self._census_fetch(url, category, 'aiohttp')
+                elif self.metrics_collector is not None:
+                    self.metrics_collector.record_fetch_fail(url, category)
                 return aiohttp_parsed
             else:
                 # HTTP-impersonate первым (сильнее голого aiohttp). Не гейтим по needs_javascript:
@@ -3581,16 +3601,21 @@ class WebCrawler:
                         if res.final_url and res.final_url != url:
                             ok_domain = self.url_categorizer.is_main_domain(res.final_url, self.current_base_url)
                         if ok_domain:
+                            self._census_fetch(url, category, 'http_first')
                             return await self._parse_content(res.html, url)
 
                 content = None if force_browser else await self._fetch_with_aiohttp(url)
                 if content:
+                    self._census_fetch(url, category, 'aiohttp')
                     return await self._parse_content(content, url)
                 result = await self._fetch_with_playwright(url)
                 if result is not None:
                     content, _, final_url = result
                     if content:
+                        self._census_fetch(url, category, 'playwright')
                         return await self._parse_content(content, final_url or url)
+                if self.metrics_collector is not None:
+                    self.metrics_collector.record_fetch_fail(url, category)
                 return None
 
         except Exception as e:
@@ -3903,6 +3928,11 @@ class WebCrawler:
                 log.debug(f"curl_cffi не смог получить {url}: {e}")
                 return None
 
+    def _census_fetch(self, url: str, category, method: str) -> None:
+        """Телеметрия профилирования: каким методом лестницы получена страница."""
+        if self.metrics_collector is not None:
+            self.metrics_collector.record_fetch(url, category, method)
+
     def _make_dynamic_extractor(self):
         """DynamicContentExtractor с пер-сайтовым селектором панели вкладки из профиля."""
         extra = self.profile.crawl.tab_panel_selector if self.profile is not None else None
@@ -3984,8 +4014,14 @@ class WebCrawler:
         # агрессивнее — при любом не-200 (не только по маркерам челленджа).
         _profile_warmup = (self.profile is not None
                            and self.profile.crawl.antibot == 'warmup' and res.status != 200)
-        if _profile_warmup or (getattr(self.config, 'antibot_in_fetch_enabled', True) and self._is_challenge(res)):
+        _challenged = (getattr(self.config, 'antibot_in_fetch_enabled', True)
+                       and self._is_challenge(res))
+        if _challenged and self.metrics_collector is not None:
+            self.metrics_collector.record_challenge(url)
+        if _profile_warmup or _challenged:
             warm = await self._cookie_warmup_and_retry(url, self.current_base_url)
+            if self.metrics_collector is not None:
+                self.metrics_collector.record_warmup(warm is not None and warm.status == 200)
             if warm is not None and warm.status == 200:
                 res = warm
         if res.status != 200 or not res.html:

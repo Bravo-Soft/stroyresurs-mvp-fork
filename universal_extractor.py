@@ -656,6 +656,11 @@ def extract_product_markdown(html: str, base_url: str = '') -> Optional[str]:
     except Exception as e:
         logging.debug(f"universal_extractor: select_content_container: {e}")
         container = soup.body or soup
+        _how = 'error'
+
+    # Телеметрия профилирования (census): JSON-LD/microdata и способ выбора контейнера.
+    _T._emit_census('universal_detail', url=base_url,
+                    jsonld=bool(structured), cms_how=_how)
 
     # Конвертация тем же конвертером (степени/таблицы как в основном модуле).
     conv = _T.MarkdownConverter(heading_style='ATX', bullets='-', strip=['script', 'style'])
