@@ -41,8 +41,11 @@ class Config:
     ollama_api_key: str = field(default_factory=lambda: os.getenv('OLLAMA_API_KEY', ''))
     # 2026-07-27: прод переведён на gemma4:31b (полный офлайн-прогон 1142 стр. 42 комп. + A/B промпта:
     #   полнота ТХ медиана 1.00 vs deepseek, перевод ключей 0, дисциплина полей 0 нарушений;
-    #   отчёт: mvp/Анализ системы/_gemma4_test/REPORT.md). deepseek-v4-flash — откат через env OLLAMA_MODEL.
-    ollama_model: str = 'gemma4:31b'
+    #   отчёт: mvp/Анализ системы/_gemma4_test/REPORT.md).
+    # 2026-08-18: по решению заказчика прод переведён на deepseek-v4-flash:0731 (закреплённый тег 0731,
+    #   https://ollama.com/library/deepseek-v4-flash). Идёт 2-вызовной SGR (single_1call у v4-flash
+    #   ломается — см. _SINGLE_CALL_MODELS). Откат на gemma4:31b — через env OLLAMA_MODEL.
+    ollama_model: str = 'deepseek-v4-flash:0731'
 
     # Параметры для фильтрации изображений
     min_image_size_kb = 9  # Минимальный размер изображений в КБ

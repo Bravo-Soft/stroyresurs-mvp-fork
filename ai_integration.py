@@ -211,6 +211,9 @@ _MODEL_TUNING = {
     "glm-5.2":                {"effort": "none", "thinking_off": False, "num_ctx": None,  "robust": True},
     "deepseek-v3.2":          {"effort": "none", "thinking_off": False, "num_ctx": None,  "robust": True},
     "deepseek-v4-flash":      {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": False},
+    # прод с 2026-08-18 (решение заказчика): тот же тюнинг, что у deepseek-v4-flash,
+    # закреплённый тег 0731; архитектура — 2-вызовная SGR (в _SINGLE_CALL_MODELS не входит)
+    "deepseek-v4-flash:0731": {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": False},
     # gemma4 — прод с 2026-07-27 (полный прогон 1142 стр. + A/B: Анализ системы/_gemma4_test/REPORT.md).
     # effort=None (не-reasoning модель, reasoning_effort не слать), robust=True (оборачивает в ```json).
     "gemma4:31b":             {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": True},
