@@ -10,7 +10,11 @@ notes:
   contacts = реквизиты + контакты + index_area.php; добавлен раздел документации
   /services/ (паспорта безопасности, декларации соответствия, свидетельства о
   госрегистрации, информация о СОУТ)'
-- 'Страницы documents_urls краулятся и попадают в корпус, но файлы с них пайплайн
+- 'Общие документы разложены по 4 блокам (certificates/documents/instructions/price_list):
+  certificates = декларации соответствия + свидетельства о госрегистрации;
+  documents = корень /services/ + паспорта безопасности + информация о СОУТ;
+  instructions и price_list на сайте не найдены — блоки пустые'
+- 'Страницы блоков документов краулятся и попадают в корпус, но файлы с них пайплайн
   пока НЕ скачивает (пути скачивания общих документов в коде нет) — доработка фазы 1/2'
 crawl:
   render: html
@@ -27,12 +31,15 @@ sections:
   - /company/index_area.php
   distributor_urls:
   - /contacts/branches/
+  certificates_urls:
+  - /services/deklaratsii-sootvetstviya/
+  - /services/svidetelstva-o-gosregistratsii/
   documents_urls:
   - /services/
   - /services/pasporta-bezopasnosti/
-  - /services/deklaratsii-sootvetstviya/
-  - /services/svidetelstva-o-gosregistratsii/
   - /services/informatsiya-o-sout/
+  instructions_urls: []
+  price_list_urls: []
 baseline:
   structure_hash: 96b5d58b1a485d01f9a0e25e062b154966e5b0ec
   selector_hit_rate: 1.0

@@ -58,9 +58,13 @@ class SectionsProfile:
     product_url_patterns: list = field(default_factory=list)      # regex: URL = карточка товара
     product_url_antipatterns: list = field(default_factory=list)  # regex: точно НЕ товар (сильнее patterns)
     contacts_urls: list = field(default_factory=list)    # контакты/реквизиты
-    distributor_urls: list = field(default_factory=list) # дилеры/где купить
-    documents_urls: list = field(default_factory=list)   # сертификаты/каталоги/документация
-    price_list_urls: list = field(default_factory=list)  # прайс-листы
+    distributor_urls: list = field(default_factory=list) # дилеры/где купить/представительства
+    # Общие документы компании — 4 блока, зеркалят папки компании
+    # Certificates/Documents/Instructions/Price_lists:
+    certificates_urls: list = field(default_factory=list)  # сертификаты/декларации/свидетельства
+    documents_urls: list = field(default_factory=list)     # прочая общая документация
+    instructions_urls: list = field(default_factory=list)  # инструкции/руководства
+    price_list_urls: list = field(default_factory=list)    # прайс-листы
 
 
 @dataclass

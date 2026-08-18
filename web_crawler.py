@@ -816,7 +816,9 @@ class URLCategorizer:
                     (_sec.contacts_urls, 'contacts', self.priority_levels['contacts']),
                     (_sec.distributor_urls, 'distributor', self.priority_levels['distributor']),
                     (_sec.price_list_urls, 'price_list', self.priority_levels['price_list']),
-                    (_sec.documents_urls, 'other', self.priority_levels['contacts'])):
+                    (_sec.certificates_urls, 'other', self.priority_levels['contacts']),
+                    (_sec.documents_urls, 'other', self.priority_levels['contacts']),
+                    (_sec.instructions_urls, 'other', self.priority_levels['contacts'])):
                 _match_len = self._longest_prefix(_p_path, _prefixes)
                 if _match_len > _best_len:
                     _best_len, _best_result = _match_len, (_sec_cat, _sec_prio)
@@ -3292,7 +3294,8 @@ class WebCrawler:
         if self.profile is not None:
             sec = self.profile.sections
             for path in (sec.start_urls + sec.catalog_roots + sec.contacts_urls +
-                         sec.distributor_urls + sec.documents_urls + sec.price_list_urls):
+                         sec.distributor_urls + sec.certificates_urls + sec.documents_urls +
+                         sec.instructions_urls + sec.price_list_urls):
                 full = path if path.startswith('http') else urljoin(base_url + '/', path.lstrip('/'))
                 if full not in start_urls:
                     start_urls.append(full)

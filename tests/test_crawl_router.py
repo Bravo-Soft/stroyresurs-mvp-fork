@@ -63,14 +63,18 @@ def test_profile_section_urls(categorizer):
     categorizer.set_profile(_profile(sections={
         'contacts_urls': ['/o-firme/rekvizity/'],
         'distributor_urls': ['/set-prodazh/'],
-        'documents_urls': ['/sertifikaty/'],
+        'certificates_urls': ['/sertifikaty/'],
+        'documents_urls': ['/dokumentacija/'],
+        'instructions_urls': ['/instrukcii/'],
         'price_list_urls': ['/stoimost-produkcii/'],
         'catalog_roots': ['/produkcija/'],
     }))
     assert categorizer.categorize_url('https://a.ru/o-firme/rekvizity/')[0] == 'contacts'
     assert categorizer.categorize_url('https://a.ru/set-prodazh/moskva/')[0] == 'distributor'
-    assert categorizer.categorize_url('https://a.ru/sertifikaty/')[0] == 'other'  # документы
-    assert categorizer.categorize_url('https://a.ru/sertifikaty/')[1] >= 7        # с приоритетом
+    # 4 блока общих документов: certificates/documents/instructions -> other с приоритетом
+    for doc_path in ('/sertifikaty/', '/dokumentacija/', '/instrukcii/'):
+        category, priority = categorizer.categorize_url(f'https://a.ru{doc_path}')
+        assert category == 'other' and priority >= 7, doc_path
     assert categorizer.categorize_url('https://a.ru/stoimost-produkcii/')[0] == 'price_list'
     # корень каталога — category; подстраницы корня идут обычной классификацией
     assert categorizer.categorize_url('https://a.ru/produkcija/')[0] == 'category'
