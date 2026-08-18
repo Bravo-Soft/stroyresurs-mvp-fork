@@ -49,6 +49,7 @@ class RunMetricsCollector:
         self.universal_detail_pages = 0
         self.cms_hits = Counter()               # как выбрался контейнер universal-пути
         self.structure_hashes = Counter()       # skeleton-hash товарных страниц
+        self.document_files = Counter()         # общие документы по блокам профиля
         self.output = {}                        # срез CompanyStatistics
 
     # ---------- хуки краулера ----------
@@ -77,6 +78,12 @@ class RunMetricsCollector:
     @_safe
     def record_sitemap(self, url_count):
         self.sitemap_url_count = int(url_count)
+
+    @_safe
+    def record_document_files(self, section, count):
+        """Скачанные общие документы компании по блокам профиля
+        (certificates/documents/instructions/price_list)."""
+        self.document_files[section] += int(count)
 
     @_safe
     def record_pages(self, stored_pages):
@@ -161,6 +168,7 @@ class RunMetricsCollector:
             'warmup': {'success': self.warmup_success, 'fail': self.warmup_fail},
             # Drift
             'structure_hash': dominant_structure,
+            'company_document_files': dict(self.document_files),
             'output': dict(self.output),
         }
         metrics['alerts'] = self._alerts(metrics)

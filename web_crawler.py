@@ -751,6 +751,25 @@ class URLCategorizer:
                 best = max(best, len(p.rstrip('/')))
         return best
 
+    def profile_document_section(self, url: str) -> Optional[str]:
+        """Блок общих документов компании из профиля для URL:
+        'certificates' | 'documents' | 'instructions' | 'price_list' (по самому
+        длинному префиксу из 4 списков sections) или None (страница не документная
+        либо профиля нет)."""
+        prof = getattr(self, 'profile', None)
+        if prof is None:
+            return None
+        path = urlparse(url).path.lower()
+        best_len, best_section = -1, None
+        for prefixes, section in ((prof.sections.certificates_urls, 'certificates'),
+                                  (prof.sections.documents_urls, 'documents'),
+                                  (prof.sections.instructions_urls, 'instructions'),
+                                  (prof.sections.price_list_urls, 'price_list')):
+            match_len = self._longest_prefix(path, prefixes)
+            if match_len > best_len:
+                best_len, best_section = match_len, section
+        return best_section if best_len >= 0 else None
+
     def categorize_url(self, url: str, link_text: str = "") -> Tuple[str, int]:
         """Категоризация URL с возвратом категории и приоритета"""
         # Проверяем на языковые префиксы
@@ -2043,6 +2062,42 @@ class FileDownloadManager:
             log.debug(f"Ошибка проверки расширения {url}: {e}")
             return False
         
+    def extract_document_links(self, html: str, page_url: str) -> List[str]:
+        """Ссылки на файлы документов со страницы: только строгое расширение
+        (.pdf/.doc/.docx/.xls/.xlsx/.rtf) в пути URL, относительные ссылки
+        абсолютизируются, дубли отбрасываются."""
+        try:
+            soup = BeautifulSoup(html, 'lxml')
+        except Exception:
+            soup = BeautifulSoup(html, 'html.parser')
+        links, seen = [], set()
+        for a in soup.find_all('a', href=True):
+            full_url = urljoin(page_url, a['href'].strip()).split('#', 1)[0]
+            if not full_url or full_url in seen:
+                continue
+            seen.add(full_url)
+            path = urlparse(full_url).path.lower()
+            if any(path.endswith(ext) for ext in self.supported_extensions):
+                links.append(full_url)
+        return links
+
+    async def download_document_files(self, html: str, page_url: str, save_dir: str) -> List[str]:
+        """Скачивает файлы документов со страницы в папку компании
+        (Certificates/Documents/Instructions/Price_lists). Возвращает пути скачанных."""
+        saved = []
+        links = self.extract_document_links(html, page_url)
+        if not links:
+            return saved
+        os.makedirs(save_dir, exist_ok=True)
+        for file_url in links:
+            if file_url in self.downloaded_files_cache:
+                continue
+            file_path = await self._download_aiohttp(file_url, save_dir)
+            if file_path:
+                self.downloaded_files_cache.add(file_url)
+                saved.append(file_path)
+        return saved
+
     async def _download_aiohttp(self, file_url: str, save_dir: str, page_category: str = None) -> Optional[str]:
         """Универсальное скачивание файлов через aiohttp (под общим лимитом скачиваний)"""
         async with self.download_semaphore:
@@ -2850,6 +2905,13 @@ class WebCrawler:
 
             # 2. ИЗВЛЕЧЕНИЕ ССЫЛОК (ВСЕГДА, независимо от категории и is_processed)
             await self._process_links_from_parse_result(url, parse_result, depth, queue)
+
+            # 2а. ОБЩИЕ ДОКУМЕНТЫ КОМПАНИИ: если страница принадлежит одному из
+            # 4 блоков профиля (certificates/documents/instructions/price_list) —
+            # скачиваем файлы с неё в соответствующую папку компании
+            doc_section = self.url_categorizer.profile_document_section(url)
+            if doc_section:
+                await self._download_company_documents(url, parse_result.html, doc_section, domain_dirs)
 
             # 3. СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ ДОКУМЕНТАЦИИ (скачивание файлов)
             if category == 'documentation':
@@ -3937,6 +3999,28 @@ class WebCrawler:
             except Exception as e:
                 log.debug(f"curl_cffi не смог получить {url}: {e}")
                 return None
+
+    # Блок общих документов профиля -> ключ папки компании в domain_dirs
+    _DOC_SECTION_DIRS = {'certificates': 'certificates_dir', 'documents': 'documents_dir',
+                         'instructions': 'instructions_dir', 'price_list': 'price_lists_dir'}
+
+    async def _download_company_documents(self, url: str, html: str, doc_section: str,
+                                          domain_dirs: Dict[str, str]) -> None:
+        """Скачивание общих документов компании со страницы блока профиля в папку
+        Certificates/Documents/Instructions/Price_lists. Fail-open: ошибка скачивания
+        не прерывает обработку страницы."""
+        try:
+            target_dir = (domain_dirs or {}).get(self._DOC_SECTION_DIRS[doc_section])
+            if not target_dir:
+                return
+            saved = await self.file_download_manager.download_document_files(html, url, target_dir)
+            if saved:
+                log.info(f"Общие документы компании ({doc_section}): скачано {len(saved)} "
+                         f"файлов со страницы {url} -> {target_dir}")
+                if self.metrics_collector is not None:
+                    self.metrics_collector.record_document_files(doc_section, len(saved))
+        except Exception as e:
+            log.error(f"Ошибка скачивания общих документов ({doc_section}) со страницы {url}: {e}")
 
     def _census_fetch(self, url: str, category, method: str) -> None:
         """Телеметрия профилирования: каким методом лестницы получена страница."""
