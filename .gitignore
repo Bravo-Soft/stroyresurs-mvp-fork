@@ -1,0 +1,46 @@
+
+.env
+venv/
+ENV/
+env/
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+logs/
+*.log
+report_archive.log
+
+_regen_test/
+temp_storage_manager.py
+
+.DS_Store
+Thumbs.db
+
+_*.py
+
+# Dockerfile
+Dockerfile.*
+Dockerfile
+
+# requirements
+requirements*.txt
+
+Site_list/
+Base/
+Reports/
+VectorDB/
+Documents/
+GraphDB_JSON/
+GraphDB_Arch/
+logs/
+Bot/
+ArchiveTemp/
+GraphDB_Pending/
+
+Анализ системы/
+Краулер/
+
