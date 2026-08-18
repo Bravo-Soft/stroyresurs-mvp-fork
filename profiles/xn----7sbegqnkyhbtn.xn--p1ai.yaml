@@ -1,0 +1,8 @@
+domain: xn----7sbegqnkyhbtn.xn--p1ai
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- Адаптер Profile_Markdown/agroskon.py существует, но в старом диспетчере не матчился (DOMAIN='//xn----7sbegqnkyhbtn.xn--p1ai/')
+  — фактическое поведение generic; включение tier=custom — осознанное решение фазы 2

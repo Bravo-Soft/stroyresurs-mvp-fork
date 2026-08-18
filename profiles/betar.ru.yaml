@@ -1,0 +1,9 @@
+domain: betar.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'D82: Bitrix product_offers.php — таблица исполнений дотягивается AJAX-запросом и вклеивается до markdown'
+crawl:
+  bitrix_offers: true

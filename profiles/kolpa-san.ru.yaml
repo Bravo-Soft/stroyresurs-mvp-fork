@@ -1,0 +1,11 @@
+domain: kolpa-san.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'Адаптер markdown: Profile_Markdown/kolpa_san_ru.py'
+extract:
+  tier: custom
+  custom_module: kolpa_san_ru
+  needs_raw_html: true

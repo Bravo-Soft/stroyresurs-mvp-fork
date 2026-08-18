@@ -1,0 +1,29 @@
+domain: aerobel.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'Адаптер markdown: Profile_Markdown/aerobel_ru.py'
+- 'D98: товары в /catalog/, дилеры /cooperation/ (~700 записей), контакты /contacts/ /company/ /about/'
+extract:
+  tier: custom
+  custom_module: aerobel_ru
+crawl:
+  exclude_paths:
+  - /manufacturing/
+  - /news/
+  - /our_objects/
+  - /our_projects/
+  - /personal/
+  - /policy/
+  - /services/
+sections:
+  catalog_roots:
+  - /catalog/
+  distributor_urls:
+  - /cooperation/
+  contacts_urls:
+  - /contacts/
+  - /company/
+  - /about/

@@ -1,0 +1,14 @@
+domain: tizol.com
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'Адаптер markdown: Profile_Markdown/tizol_com.py'
+- 'D01: характеристики в AJAX-вкладках, склейка в один HTML; панель вкладки (Vue) — .product-page__section-content'
+extract:
+  tier: custom
+  custom_module: tizol_com
+crawl:
+  ajax_tabs: true
+  tab_panel_selector: .product-page__section-content

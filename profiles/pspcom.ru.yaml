@@ -1,0 +1,10 @@
+domain: pspcom.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'D69: /catalog/build/ — девелоперское направление, не товары'
+crawl:
+  exclude_paths:
+  - /catalog/build/

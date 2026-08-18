@@ -1,0 +1,14 @@
+domain: hms.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'Адаптер markdown: Profile_Markdown/hms_ru.py'
+- Поддомены *.hms.ru схлопываются в hms.ru (перенос хардкода text_extractor._normalize_domain)
+extract:
+  tier: custom
+  custom_module: hms_ru
+crawl:
+  subdomain_collapse:
+  - '*.hms.ru'

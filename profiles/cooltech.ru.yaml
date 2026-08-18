@@ -1,0 +1,11 @@
+domain: cooltech.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'Адаптер markdown: Profile_Markdown/cooltech_ru.py'
+extract:
+  tier: custom
+  custom_module: cooltech_ru
+  keep_hidden_tabs: true

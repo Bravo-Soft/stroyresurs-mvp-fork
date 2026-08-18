@@ -1,0 +1,14 @@
+domain: chelaz.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'Адаптер markdown: Profile_Markdown/chelaz_ru.py'
+- 'D85: типоразмеры/URL-алиасы схлопываются ПОСЛЕ полного краула (main.py collapse_chelaz_size_variants)
+  — стриминг выключен'
+extract:
+  tier: custom
+  custom_module: chelaz_ru
+  clean_in_universal: true
+  streaming: false

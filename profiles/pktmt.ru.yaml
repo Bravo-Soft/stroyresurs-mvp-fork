@@ -1,0 +1,17 @@
+domain: pktmt.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'Адаптер markdown: Profile_Markdown/pktmt_ru.py'
+- 'D89: /practice/ — статьи «Применение», не товары; товары в /produktsiya/'
+- Контент только на www (non-www 301->404) — канонизация К www
+extract:
+  tier: custom
+  custom_module: pktmt_ru
+  clean_in_universal: true
+crawl:
+  exclude_paths:
+  - /practice/
+  strict_www: true

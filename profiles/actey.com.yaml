@@ -1,0 +1,7 @@
+domain: actey.com
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- Спец-обработка относительных путей assets/, files/, download/ (web_crawler.py, поиск файлов)

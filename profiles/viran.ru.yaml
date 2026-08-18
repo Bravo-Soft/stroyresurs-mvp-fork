@@ -1,0 +1,8 @@
+domain: viran.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'Домен зашит в глобальный exclude_url_patterns (web_crawler.py): ссылки на него не краулятся ни с одного
+  сайта'

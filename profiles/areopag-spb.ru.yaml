@@ -1,0 +1,10 @@
+domain: areopag-spb.ru
+profile_version: 1
+profiled_at: '2026-08-18'
+source: manual
+confidence: 1.0
+notes:
+- 'Адаптер markdown: Profile_Markdown/areopag_spb_ru.py'
+extract:
+  tier: custom
+  custom_module: areopag_spb_ru

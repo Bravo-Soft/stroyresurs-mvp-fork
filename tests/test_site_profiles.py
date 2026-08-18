@@ -16,6 +16,7 @@ from site_profiles.resolver import DEFAULT_PROFILES_DIR
     ('www.hms.ru', 'hms.ru'),
     ('nasos.hms.ru', 'nasos.hms.ru'),          # поддомен НЕ схлопывается без профиля
     ('example.ru:8080/path', 'example.ru'),
+    ('//xn----7sbegqnkyhbtn.xn--p1ai/', 'xn----7sbegqnkyhbtn.xn--p1ai'),
     ('', ''),
 ])
 def test_normalize_domain(raw, expected):

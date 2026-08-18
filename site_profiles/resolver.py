@@ -27,8 +27,8 @@ def normalize_domain(url_or_host: str) -> str:
     if '://' in s:
         s = urlparse(s).netloc
     else:
-        # голый хост или host/path без схемы
-        s = s.split('/', 1)[0]
+        # протокол-относительная форма //host/... либо голый хост / host/path без схемы
+        s = s.lstrip('/').split('/', 1)[0]
     if s.startswith('www.'):
         s = s[4:]
     return s.split(':', 1)[0]
