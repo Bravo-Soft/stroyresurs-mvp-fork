@@ -864,6 +864,62 @@ class MonitoringSystem:
         except Exception as e:
             log.warning(f"Не удалось сохранить кэш actual_name для {company_data.get('original_name')}: {e}")
 
+    def _setup_profiling(self, company_data: Dict[str, str]) -> None:
+        """Профилирование: резолв профиля сайта + телеметрия прогона (метрики, census).
+        Fail-open: любая ошибка телеметрии логируется и не влияет на пайплайн."""
+        self._profile_metrics = None
+        self._company_profile = None
+        try:
+            from site_profiles import get_resolver
+            from site_profiles.profile_metrics import RunMetricsCollector
+            from text_extractor import set_census_sink
+            # В контейнере config.profiles_dir существует; вне его (dev) резолвер
+            # возьмёт свой дефолт — mvp/profiles рядом с пакетом site_profiles.
+            profiles_dir = (self.config.profiles_dir
+                            if os.path.isdir(self.config.profiles_dir) else None)
+            profile = get_resolver(profiles_dir).resolve(company_data['website'])
+            domain = profile.domain
+            if profile.is_default():
+                log.info(f"Профиль сайта для {domain}: отсутствует — generic-поведение")
+            else:
+                self._company_profile = profile
+                log.info(f"Профиль сайта: {domain} v{profile.profile_version} "
+                         f"(source={profile.source}, tier={profile.extract.tier})")
+            metrics = RunMetricsCollector(
+                domain, company_data.get('original_name', ''),
+                baseline=(profile.baseline if self._company_profile is not None else {}))
+            if (self._company_profile is not None
+                    and profile.extract.markdown.min_len is not None):
+                metrics.min_len = profile.extract.markdown.min_len
+            self._profile_metrics = metrics
+            self.crawler.metrics_collector = metrics
+            set_census_sink(metrics.sink)
+        except Exception as e:
+            log.warning(f"Профилирование: телеметрия не инициализирована: {e}")
+
+    def _finalize_profiling(self, crawl_result, company_stats: 'CompanyStatistics') -> None:
+        """Финализация телеметрии компании: JSON метрик (Base/profile_metrics/) и,
+        в режиме переписи (config.census_enabled), черновик профиля в profiles_drafts/."""
+        metrics = getattr(self, '_profile_metrics', None)
+        if metrics is None:
+            return
+        try:
+            from text_extractor import set_census_sink
+            set_census_sink(None)
+            self.crawler.metrics_collector = None
+            if isinstance(crawl_result, dict):
+                metrics.record_pages(crawl_result.get('stored_pages'))
+            metrics.record_output(vars(company_stats))
+            metrics.write(self.config.profile_metrics_dir)
+            if getattr(self.config, 'census_enabled', False):
+                from site_profiles.census_collector import CensusCollector
+                CensusCollector(metrics, self._company_profile).write_draft(
+                    self.config.profiles_drafts_dir)
+        except Exception as e:
+            log.warning(f"Профилирование: финализация телеметрии не удалась: {e}")
+        finally:
+            self._profile_metrics = None
+
     def _resolve_streaming_mode(self, company_data: Dict[str, str]) -> Tuple[bool, Optional[str]]:
         """Гейт потоковой обработки: (use_streaming, cached_actual_name).
         Стриминг включается только при известном из прошлого прогона actual_name
@@ -872,6 +928,12 @@ class MonitoringSystem:
         if not self.config.pipeline_streaming_enabled:
             return False, None
         cached_actual_name = self._load_cached_actual_name(company_data)
+        # Профиль сайта: extract.streaming=false — принудительный батч
+        # (декларативная замена хардкода chelaz.ru; хардкод ниже остаётся fallback'ом)
+        profile = getattr(self, '_company_profile', None)
+        if profile is not None and profile.extract.streaming is False:
+            log.info(f"Потоковая обработка отключена профилем сайта {profile.domain}, батч-режим")
+            return False, cached_actual_name
         site_domain = urlparse(company_data['website']).netloc.lower()
         if 'chelaz.ru' in site_domain:
             log.info("Потоковая обработка отключена для chelaz.ru (D85), батч-режим")
@@ -1827,6 +1889,9 @@ class MonitoringSystem:
 
         company_stats = CompanyStatistics(company_data)
         self.processing_tracker.set_current_company(company_data.get('company_id'))
+
+        # Профилирование: профиль сайта + телеметрия прогона (метрики/census)
+        self._setup_profiling(company_data)
         
         if is_update:
             log.info(f"Режим ОБНОВЛЕНИЯ для компании: {company_data['original_name']}")
@@ -2316,9 +2381,12 @@ class MonitoringSystem:
                         w.cancel()
                 await asyncio.gather(*stream_workers, return_exceptions=True)
 
+        # Профилирование: метрики прогона + черновик переписи (fail-open)
+        self._finalize_profiling(result.get('crawling_result'), company_stats)
+
         company_stats.finish()
         result['company_statistics'] = company_stats.to_dict()
-        
+
         self.statistics.companies_processed += 1
         if result['status'] == 'success':
             self.statistics.companies_success += 1

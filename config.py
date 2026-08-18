@@ -273,6 +273,17 @@ class Config:
     # без www. Скоуплено ПО ДОМЕНУ; пусто для прочих → нулевой регресс.
     strict_www_domains: list = field(default_factory=lambda: ["pktmt.ru"])
 
+    # Профилирование сайтов (декларативные YAML-профили + перепись/метрики).
+    # Пер-доменные словари выше (ajax_product_tabs_domains, bitrix_offers_domains,
+    # exclude_url_patterns_by_domain, strict_www_domains, equivalent_domains) —
+    # DEPRECATED-fallback: их содержимое перенесено в profiles/<домен>.yaml,
+    # словари остаются на переходный период (выпиливание — фаза 2).
+    profiles_dir: str = '/home/user/stroy-resurs/mvp/profiles'
+    profiles_drafts_dir: str = '/home/user/stroy-resurs/mvp/profiles_drafts'
+    profile_metrics_dir: str = '/home/user/stroy-resurs/mvp/Base/profile_metrics'
+    census_enabled: bool = False          # режим переписи: писать черновики профилей
+    profile_accept_confidence: float = 0.8  # порог автопринятия черновика (пост-обработка)
+
     # Настройки Kafka
     kafka_bootstrap_servers: str = "192.168.0.15:9092"
     kafka_topic_regular_tasks: str = "regular_tasks"
@@ -336,5 +347,8 @@ class Config:
         config.pipeline_streaming_enabled = os.getenv('PIPELINE_STREAMING_ENABLED', str(config.pipeline_streaming_enabled)).lower() == 'true'
         config.pipeline_page_workers = int(os.getenv('PIPELINE_PAGE_WORKERS', config.pipeline_page_workers))
         config.max_concurrent_file_downloads = int(os.getenv('MAX_CONCURRENT_FILE_DOWNLOADS', config.max_concurrent_file_downloads))
+
+        # Профилирование сайтов
+        config.census_enabled = os.getenv('CENSUS_ENABLED', str(config.census_enabled)).lower() == 'true'
 
         return config
