@@ -1,0 +1,85 @@
+# Схема профиля сайта (документ-эталон; программная валидация — site_profiles/models.py,
+# enum-значения там же: RENDER_VALUES/ANTIBOT_VALUES/TIER_VALUES/SOURCE_VALUES).
+# Принцип: null / пустой список / false = текущее глобальное поведение пайплайна;
+# профиль из одних дефолтов байт-в-байт эквивалентен отсутствию профиля.
+# Файлы профилей: <домен>.yaml (канонический домен, без www). Файлы _*.yaml — служебные.
+
+domain: example.ru            # ОБЯЗАТЕЛЬНОЕ. Канонический домен = ключ резолюции.
+profile_version: 1            # инкремент при каждом изменении профиля
+profiled_at: "2026-08-18"     # когда перепись/человек мерил сайт
+confidence: null              # 0..1, уверенность переписи; < 0.8 -> REVIEW queue
+source: manual                # census | manual | mixed
+notes: []                     # человеческие пометки: D-номера дефектов, решения заказчика
+
+crawl:
+  render: null                # null = текущая лестница фетча | html = HTTP-first обязателен |
+                              # browser = сразу Playwright (SPA/JS-сайты)
+  antibot: none               # none | impersonate (curl_cffi первым для всех категорий) |
+                              # warmup (cookie-прогрев до первого запроса) | blocked (не обрабатывать)
+  ajax_tabs: false            # товарные вкладки грузятся AJAX-ом: рендер с кликами + склейка (D01)
+  bitrix_offers: false        # Bitrix product_offers.php: дотянуть таблицу исполнений (D82)
+  tab_panel_selector: null    # пер-сайтовый селектор панели активной вкладки (доп. к глобальным)
+  equivalent_domains: []      # зеркала/бренд-домены, ведущие в этот же профиль
+  strict_www: false           # контент только на www — канонизировать К www (D: pktmt.ru)
+  subdomain_collapse: []      # шаблоны '*.example.ru': поддомены схлопывать в канонический домен
+  exclude_paths: []           # подстроки пути, не краулить для ЭТОГО домена (D69/D89/D98)
+  limits:
+    pages: null               # null -> config.max_pages_per_site
+    product_pages: null       # null -> config.max_product_pages_per_site
+    depth: null               # null -> config.max_depth
+    sitemap_urls: null        # null -> config.sitemap_max_urls
+  load:                       # пер-хостовая нагрузка/таймауты (защита от блокировки)
+    page_delay_ms: 0          # мин. интервал между запросами страниц; 0 = без задержки
+    file_delay_ms: 0          # интервал между скачиваниями файлов/картинок
+    max_concurrent_pages: null
+    max_concurrent_files: null
+    fetch_timeout_s: null     # null -> config.http_timeout
+    file_timeout_s: null
+    page_retry_attempts: null # null -> page_retry_max_attempts (D40)
+
+sections:                     # карта разделов сайта
+  start_urls: []              # доп. стартовые точки обхода
+  catalog_roots: []           # корни каталога товаров (приоритет обхода)
+  product_url_patterns: []    # regex: URL точно карточка товара (перекрывает балльную эвристику)
+  product_url_antipatterns: []# regex: точно НЕ товар (подкаталог/статья) — сильнее patterns
+  contacts_urls: []           # контакты/реквизиты компании (реквизиты бывают отдельной страницей)
+  distributor_urls: []        # дилеры / где купить / партнёры
+  documents_urls: []          # ОБЩИЕ документы: сертификаты, каталоги продукции, документация
+  price_list_urls: []         # прайс-листы
+
+extract:
+  tier: llm                   # custom (адаптер Profile_Markdown) | jsonld | cms | llm (generic).
+                              # В фазе 0 применяются только custom и llm; jsonld/cms — объявление
+                              # для фазы 2 (роутер логирует и работает как llm).
+  cluster: null               # ссылка в _clusters.yaml (фаза 2)
+  custom_module: null         # имя модуля в Profile_Markdown/ (обязателен при tier=custom)
+  keep_hidden_tabs: false     # не вырезать display:none (неактивные вкладки = контент)
+  needs_raw_html: false       # адаптеру нужен СЫРОЙ HTML (данные в <script>, Tilda)
+  clean_in_universal: false   # применить clean() адаптера и на universal-пути (D86)
+  llm_program: null           # именованная LLM-программа (фаза 2)
+  streaming: null             # null = глобальная настройка; false = принудительно батч (D85)
+  markdown:                   # точный профиль markdown per page_type
+    product_container: null   # CSS-контейнер карточки (первым в цепочке generic-выбора)
+    remove_selectors: []      # пер-сайтовый шум ДОПОЛНИТЕЛЬНО к универсальной чистке
+    min_len: null             # null -> 200: порог «пустого» markdown / отката universal
+    max_len: null             # null -> без обрезки; иначе жёсткий лимит символов markdown
+    company_container: null
+    distributor_container: null
+
+baseline:                     # метрики последней переписи/успешного прогона (пишет census;
+                              # свободный словарь — программной схемы нет, состав ниже)
+  structure_hash: null        # sha1 скелета DOM контейнера товара (теги+классы, глубина <=3)
+  selector_hit_rate: null     # доля товарных страниц, где сработал путь яруса
+  pages_crawled: null
+  product_pages: null
+  product_cards: null
+  avg_specs_per_card: null
+  jsonld_share: null
+  cms_detected: null          # имя CMS по _CMS_SELECTORS universal_extractor
+  fetch_fail_rate: null
+  challenge_rate: null        # доля запросов с антибот-челленджем
+  empty_markdown_rate: null   # доля страниц с markdown короче min_len
+  gate3_pass_rate: null       # доля товаров, прошедших гейт >=3 числовых ТХ
+  sitemap_url_count: null
+  extraction_path_share: {}   # {adapter: .., universal: .., generic: ..}
+  section_counts: {}          # {product: .., category: .., contacts: .., distributor: .., documents: ..}

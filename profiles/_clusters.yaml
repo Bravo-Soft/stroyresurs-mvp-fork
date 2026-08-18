@@ -1,0 +1,12 @@
+# Реестр кластеров сайтов (фаза 2 — заполняется пост-обработкой переписи 2082).
+# Кластер = группа сайтов с общей структурой (bitrix-classic, wp-woocommerce, tilda,
+# nextjs-spa, ...). Хранит: определяющие селекторы (вынос из universal_extractor
+# _CMS_SELECTORS), дефолтную llm_program, типовые exclude-паттерны.
+#
+# Формат (пример, пока НЕ используется кодом):
+# bitrix-classic:
+#   detect_selectors: ['.bx-catalog-element', '[data-entity="item"]']
+#   product_container: '.bx-catalog-element'
+#   llm_program: default.v1
+#   notes: []
+{}
