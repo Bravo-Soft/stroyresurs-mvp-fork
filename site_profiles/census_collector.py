@@ -46,13 +46,16 @@ def dom_skeleton_hash(soup, max_depth: int = 3) -> str:
 
 
 def _common_prefixes(paths, min_count=3, max_prefixes=5):
-    """Частотные корневые префиксы путей: '/catalog/x/y' -> '/catalog/'."""
+    """Частотные корневые префиксы путей: '/catalog/x/y' -> '/catalog/'.
+    Порядок детерминирован (частота, затем алфавит) — черновики разных прогонов
+    сравнимы диффом."""
     counter = Counter()
     for path in paths:
         segments = [s for s in path.split('/') if s]
         if segments:
             counter['/' + segments[0] + '/'] += 1
-    return [prefix for prefix, n in counter.most_common(max_prefixes) if n >= min_count]
+    ranked = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [prefix for prefix, n in ranked[:max_prefixes] if n >= min_count]
 
 
 def _product_templates(paths, min_count=3, max_templates=3):
@@ -68,7 +71,8 @@ def _product_templates(paths, min_count=3, max_templates=3):
             segments[-1] = segments[-1].rsplit('.', 1)[0]
         template = '/' + '/'.join([re.escape(segments[0])] + ['[^/]+'] * (len(segments) - 1))
         counter[template + tail_ext + '/?$'] += 1
-    return [t for t, n in counter.most_common(max_templates) if n >= min_count]
+    ranked = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [t for t, n in ranked[:max_templates] if n >= min_count]
 
 
 class CensusCollector:
