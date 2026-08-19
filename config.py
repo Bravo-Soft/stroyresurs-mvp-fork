@@ -91,8 +91,8 @@ class Config:
     exclude_product_cards_rtf = True
         
     # Настройки краулера
-    max_pages_per_site: int = 500  # общий лимит страниц/сайт для диагностического прогона (Анализ системы/Краулер.md §7)
-    max_product_pages_per_site: int = 350  # верхняя граница продуктовых страниц/сайт; лимит учитывается при постановке URL в очередь (Краулер.md §4,§7)
+    max_pages_per_site: int = 250  # общий лимит страниц/сайт для диагностического прогона (Анализ системы/Краулер.md §7)
+    max_product_pages_per_site: int = 50  # верхняя граница продуктовых страниц/сайт; лимит учитывается при постановке URL в очередь (Краулер.md §4,§7)
     max_depth: int = 6  
     request_delay: float = 0.3  
     max_pagination_depth: int = 40  
