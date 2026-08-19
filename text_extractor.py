@@ -856,6 +856,13 @@ def _postprocess_markdown(markdown: str, soup: BeautifulSoup, base_url: str = ''
     # Любой оставшийся × (напр. габариты «390×90×188») → русская х; неравенства → ASCII >= <=.
     # (синхронно с docx_generator._clean_text).
     result = result.replace('×', 'х').replace('≥', '>=').replace('≤', '<=')
+    # Санация провокаторов зацикливания LLM (прогон 2026-08-18: deepseek уходил в
+    # дегенеративный луп на длинных последовательностях '\_'/'_' и base64-блобах):
+    # 1) встроенные data:-URI (base64-картинки) в ссылках/изображениях — усечь;
+    result = re.sub(r'\(data:[^)\s]{100,}\)', '(data:...)', result)
+    # 2) прогоны подчёркиваний (линии форм/разделители, в т.ч. экранированные '\_') — схлопнуть.
+    result = re.sub(r'(?:\\_){8,}', r'\\_' * 5, result)
+    result = re.sub(r'_{8,}', '_' * 5, result)
     return result
 
 

@@ -212,8 +212,14 @@ _MODEL_TUNING = {
     "deepseek-v3.2":          {"effort": "none", "thinking_off": False, "num_ctx": None,  "robust": True},
     "deepseek-v4-flash":      {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": False},
     # прод с 2026-08-18 (решение заказчика): тот же тюнинг, что у deepseek-v4-flash,
-    # закреплённый тег 0731; архитектура — 2-вызовная SGR (в _SINGLE_CALL_MODELS не входит)
-    "deepseek-v4-flash:0731": {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": False},
+    # закреплённый тег 0731; архитектура — 2-вызовная SGR (в _SINGLE_CALL_MODELS не входит).
+    # max_tokens=16384 — защита от «убегающего reasoning»: модель стохастически зацикливается
+    # в размышлении, выжигает серверный бюджет 65536 ток. (~5 мин) и отдаёт ПУСТОЙ content
+    # (прогон 2026-08-18: 119 пустых ответов). Успешные ответы укладываются в ~5k ток.,
+    # кап 16384 обрывает зацикленную попытку в ~4 раза быстрее — её добивает ретрай.
+    # thinking:{disabled} и reasoning_effort модель на Ollama ИГНОРИРУЕТ (проверено зондом).
+    "deepseek-v4-flash:0731": {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": False,
+                               "max_tokens": 16384},
     # gemma4 — прод с 2026-07-27 (полный прогон 1142 стр. + A/B: Анализ системы/_gemma4_test/REPORT.md).
     # effort=None (не-reasoning модель, reasoning_effort не слать), robust=True (оборачивает в ```json).
     "gemma4:31b":             {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": True},
@@ -243,6 +249,8 @@ def _payload_tuning(model: str) -> dict:
         extra["thinking"] = {"type": "disabled"}
     if t["num_ctx"]:
         extra["num_ctx"] = t["num_ctx"]
+    if t.get("max_tokens"):
+        extra["max_tokens"] = t["max_tokens"]
     return extra
 
 
@@ -1129,14 +1137,18 @@ class AITunnelClient:
         """Первый промпт: извлечение сырых данных и классификация из Markdown."""
         prompt = self._reasoning_user_prompt(text, manufacturer, base_domain)
         system = self._reasoning_system_prompt()
-        for attempt in range(2):
+        # Температуры попыток: 0.2 -> 0.1 -> 0.7. Третья, «горячая», ломает
+        # дегенеративное зацикливание reasoning-модели (пустой content/повторы):
+        # низкая температура луп воспроизводит, повышение сбивает его.
+        _attempt_temps = (0.2, 0.1, 0.7)
+        for attempt, _temp in enumerate(_attempt_temps):
             data = {
                 "model": self.model,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.2 if attempt == 0 else 0.1,
+                "temperature": _temp,
                 "timeout": 80,
                 "response_format": {"type": "json_object"}
             }
@@ -1181,7 +1193,7 @@ class AITunnelClient:
             except Exception as e:
                 log.error(f"SGR reasoning validation error (attempt {attempt+1}): {e}")
                 self._save_sgr_error_response("reasoning", content, attempt)
-                if attempt == 0:
+                if attempt < len(_attempt_temps) - 1:
                     continue
                 else:
                     return None, token_usage, False
@@ -1703,44 +1715,51 @@ class AITunnelClient:
     {reasoning_json}
     """
 
-        data = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.2,
-            "timeout": 80,
-            "response_format": {"type": "json_object"}
-        }
-        data.update(_payload_tuning(self.model))
-        result, token_usage = await self._make_request_with_retry(data)
-        if not result:
-            return None, token_usage, False
-        content = result['choices'][0]['message']['content']
-        try:
-            if _tuning_for(self.model)["robust"]:
-                final_dict = _robust_json_extract(content)
-                if final_dict is None:
-                    raise ValueError("robust parse failed")
-            else:
-                cleaned = self._clean_json_response(content)
-                try:
-                    final_dict = json.loads(cleaned)
-                except Exception:
-                    # D35: локальный ремонт перед отказом (см. _sgr_reasoning)
+        # Две попытки: 0.2, затем «горячая» 0.7 — сбивает дегенеративное зацикливание
+        # reasoning-модели (пустой content, см. комментарий в _MODEL_TUNING).
+        _attempt_temps = (0.2, 0.7)
+        token_usage = {'input_tokens': 0, 'output_tokens': 0}
+        for attempt, _temp in enumerate(_attempt_temps):
+            data = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "temperature": _temp,
+                "timeout": 80,
+                "response_format": {"type": "json_object"}
+            }
+            data.update(_payload_tuning(self.model))
+            result, _usage = await self._make_request_with_retry(data)
+            for _k in ('input_tokens', 'output_tokens'):
+                token_usage[_k] += (_usage or {}).get(_k, 0)
+            if not result:
+                continue
+            content = result['choices'][0]['message']['content']
+            try:
+                if _tuning_for(self.model)["robust"]:
                     final_dict = _robust_json_extract(content)
                     if final_dict is None:
-                        raise
-            if "product" not in final_dict:
-                final_dict = {"product": final_dict}
-            # Опциональная валидация через Pydantic (можно включить позже)
-            # ProductOutput(**final_dict["product"])
-            return final_dict, token_usage, True
-        except Exception as e:
-            log.error(f"SGR formatter JSON error: {e}")
-            self._save_sgr_error_response("formatter", content, 0)
-            return None, token_usage, False
+                        raise ValueError("robust parse failed")
+                else:
+                    cleaned = self._clean_json_response(content)
+                    try:
+                        final_dict = json.loads(cleaned)
+                    except Exception:
+                        # D35: локальный ремонт перед отказом (см. _sgr_reasoning)
+                        final_dict = _robust_json_extract(content)
+                        if final_dict is None:
+                            raise
+                if "product" not in final_dict:
+                    final_dict = {"product": final_dict}
+                # Опциональная валидация через Pydantic (можно включить позже)
+                # ProductOutput(**final_dict["product"])
+                return final_dict, token_usage, True
+            except Exception as e:
+                log.error(f"SGR formatter JSON error (attempt {attempt+1}): {e}")
+                self._save_sgr_error_response("formatter", content, attempt)
+        return None, token_usage, False
 
     def _save_sgr_error_response(self, stage: str, content: str, attempt: int) -> None:
         """Сохраняет ошибочный ответ SGR в файл для отладки."""
