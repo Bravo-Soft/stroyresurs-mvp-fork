@@ -42,10 +42,14 @@ class Config:
     # 2026-07-27: прод переведён на gemma4:31b (полный офлайн-прогон 1142 стр. 42 комп. + A/B промпта:
     #   полнота ТХ медиана 1.00 vs deepseek, перевод ключей 0, дисциплина полей 0 нарушений;
     #   отчёт: mvp/Анализ системы/_gemma4_test/REPORT.md).
-    # 2026-08-18: по решению заказчика прод переведён на deepseek-v4-flash:0731 (закреплённый тег 0731,
-    #   https://ollama.com/library/deepseek-v4-flash). Идёт 2-вызовной SGR (single_1call у v4-flash
-    #   ломается — см. _SINGLE_CALL_MODELS). Откат на gemma4:31b — через env OLLAMA_MODEL.
-    ollama_model: str = 'deepseek-v4-flash:0731'
+    # 2026-08-18: по решению заказчика прод переводился на deepseek-v4-flash:0731 (закреплённый тег,
+    #   https://ollama.com/library/deepseek-v4-flash, 2-вызовная SGR). На тестовом прогоне 11 компаний
+    #   выявлен «убегающий reasoning» (пустой content, ~7% страниц; лечение: max_tokens=16384 +
+    #   анти-луп ретраи temp=0.7 — реализовано и сохранено в ai_integration._MODEL_TUNING).
+    # 2026-08-19: для прогона-переписи 2082 возвращена gemma4:31b (single-call) — решение оператора.
+    #   Возврат на deepseek: OLLAMA_MODEL=deepseek-v4-flash:0731 (или правка этой строки) —
+    #   его тюнинг и анти-луп ретраи сохранены и включатся автоматически.
+    ollama_model: str = 'gemma4:31b'
 
     # Параметры для фильтрации изображений
     min_image_size_kb = 9  # Минимальный размер изображений в КБ
