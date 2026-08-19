@@ -891,6 +891,12 @@ class MonitoringSystem:
             if (self._company_profile is not None
                     and profile.extract.markdown.min_len is not None):
                 metrics.min_len = profile.extract.markdown.min_len
+            # Эффективные лимиты прогона — baseline сравним только при их совпадении
+            limits = profile.crawl.limits
+            metrics.limits = {
+                'pages': limits.pages or self.config.max_pages_per_site,
+                'product_pages': limits.product_pages or self.config.max_product_pages_per_site,
+            }
             self._profile_metrics = metrics
             self.crawler.metrics_collector = metrics
             set_census_sink(metrics.sink)

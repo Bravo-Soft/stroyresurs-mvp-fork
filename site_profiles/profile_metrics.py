@@ -50,6 +50,8 @@ class RunMetricsCollector:
         self.cms_hits = Counter()               # как выбрался контейнер universal-пути
         self.structure_hashes = Counter()       # skeleton-hash товарных страниц
         self.document_files = Counter()         # общие документы по блокам профиля
+        self.limits = {}                        # эффективные лимиты прогона (pages/product_pages):
+                                                # baseline сравним только при одинаковых лимитах
         self.output = {}                        # срез CompanyStatistics
 
     # ---------- хуки краулера ----------
@@ -169,6 +171,7 @@ class RunMetricsCollector:
             # Drift
             'structure_hash': dominant_structure,
             'company_document_files': dict(self.document_files),
+            'limits_used': dict(self.limits) or None,
             'output': dict(self.output),
         }
         metrics['alerts'] = self._alerts(metrics)

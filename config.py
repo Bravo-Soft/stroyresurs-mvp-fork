@@ -52,7 +52,7 @@ class Config:
     
     # Graph DB API настройки
     graph_db_api_url: str = "https://stroy-resurs-db.bravo-soft.ru/api/companies"
-    graph_db_enable: bool = True
+    graph_db_enable: bool = False
     graph_db_max_retries: int = 3
     graph_db_request_timeout: int = 600
     graph_db_chunk_size_products: int = 5 
