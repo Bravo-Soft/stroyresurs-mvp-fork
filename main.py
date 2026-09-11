@@ -12,6 +12,7 @@ import traceback
 import aiofiles
 from urllib.parse import urlparse
 from config import Config
+from domain_equivalency import normalize_site_url
 from web_crawler import WebCrawler  
 from ai_integration import AITunnelClient
 from docx_generator import DOCXGenerator
@@ -528,10 +529,18 @@ class MonitoringSystem:
 
                     safe_name = sanitize_company_name(original_name)
                     
+                    # Адрес из Site_list приводим к виду scheme://host (D147: «www.berghome.ru»
+                    # без схемы давала пустой хост и обход «https://»); без хоста краулить нечего.
+                    website = normalize_site_url(row['Website'])
+                    if not website:
+                        log.error(f"Адрес компании «{original_name}» не содержит хоста "
+                                  f"({row['Website']!r}) — компания пропущена, краул невозможен")
+                        continue
+
                     companies.append({
                         'original_name': original_name,
                         'safe_name': safe_name,
-                        'website': row['Website'],
+                        'website': website,
                         'folder_name': safe_name,
                         'company_id': manufacturer_id,
                         'generated_company_id': f"company_{len(companies)}"

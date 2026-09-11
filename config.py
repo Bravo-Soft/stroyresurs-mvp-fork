@@ -291,6 +291,26 @@ class Config:
     # без www. Скоуплено ПО ДОМЕНУ; пусто для прочих → нулевой регресс.
     strict_www_domains: list = field(default_factory=lambda: ["pktmt.ru"])
 
+    # Выбор рабочего URL компании (P05 U1): кандидат подтверждается содержимым, а не одним
+    # кодом ответа. Отклик живых сайтов не измерялся — значения выбраны консервативно.
+    working_url_probe_timeout: int = 20   # таймаут одной пробы кандидата, сек (было жёстко 15)
+    working_url_min_content: int = 300    # тело короче — заглушка, а не сайт; совпадает с
+                                          # порогом сохранения страницы в краулере
+    # Маркеры заглушек и панелей хостера в теле ответа (нижний регистр, подстрока).
+    # Кандидат с таким телом не рабочий: живой сайт компании лежит на соседнем кандидате
+    # (D148 reg.ru, D205 Beget, D258 ISPmanager, D241 дефолтный vhost).
+    hoster_stub_markers: list = field(default_factory=lambda: [
+        "домен не привязан к хостингу",   # reg.ru
+        "домен не прилинкован",           # Beget
+        "/ispmgr",                        # ISPmanager
+        "/manimg/",                       # ISPmanager
+        "<title>authorization</title>",   # страница входа ISPmanager
+        "defaultwebpage.cgi",             # дефолтная страница cPanel
+        "web server's default page",      # дефолтная страница Plesk
+        "welcome to nginx!",              # дефолтный vhost nginx
+        "apache2 ubuntu default page",    # дефолтный vhost apache
+    ])
+
     # Профилирование сайтов (декларативные YAML-профили + перепись/метрики).
     # Пер-доменные словари выше (ajax_product_tabs_domains, bitrix_offers_domains,
     # exclude_url_patterns_by_domain, strict_www_domains, equivalent_domains) —
