@@ -2,6 +2,7 @@
 import re
 import os
 import gc
+import gzip
 import time
 import json
 import hashlib
@@ -1287,10 +1288,13 @@ class SiteMapParser:
         self.url_normalizer = url_normalizer
         
         
-        # Форматы карт сайта
+        # Форматы карт сайта. D214: после '/sitemap1.xml' была пропущена запятая —
+        # Python склеивал литералы в '/sitemap1.xml/rss.xml', и в списке было 12 путей
+        # вместо 13; отдельно добавлены штатные пути WordPress >= 5.5 и индексов.
         self.sitemap_paths = [
             '/sitemap.xml', '/sitemap/index.xml', '/sitemap_index.xml', '/sitemap',
-            '/sitemap.txt', '/sitemap.html', '/site-map.html', '/sitemap/xml/', '/xml/sitemap.xml', '/sitemap1.xml'
+            '/sitemap.txt', '/sitemap.html', '/site-map.html', '/sitemap/xml/', '/xml/sitemap.xml', '/sitemap1.xml',
+            '/wp-sitemap.xml', '/sitemap-index.xml', '/wp-sitemap-index.xml',
             '/rss.xml', '/feed.xml', '/atom.xml'
         ]
         
@@ -1326,39 +1330,104 @@ class SiteMapParser:
                 0 if self._has_article_slug(path) else 1, len(segments), url)
 
 
+    # D164/D240: ранжирование источников карт. Товарная карта должна разбираться
+    # первой, карта вложений/новостей — последней.
+    _SITEMAP_GOOD_TOKENS = ('product', 'catalog', 'katalog', 'shop', 'iblock', 'tovar')
+    _SITEMAP_BAD_TOKENS = ('attachment', 'media', 'news', 'blog', 'author', 'tag', 'feed')
+
+    def _is_own_sitemap_host(self, sitemap_url: str, base_url: str) -> bool:
+        """D143: карта принадлежит этому сайту? Равенство доменов считает
+        DomainEquivalencyManager, поэтому домены холдинга из config.equivalent_domains
+        остаются своими. Fail-open: при выключенной эквивалентности сравниваем netloc
+        напрямую (is_main_domain в этом режиме возвращает None и отбросил бы всё)."""
+        try:
+            if self.url_categorizer.is_main_domain(sitemap_url, base_url):
+                return True
+            if not getattr(self.config, 'domain_equivalency_enabled', True):
+                return urlparse(sitemap_url).netloc.lower() == urlparse(base_url).netloc.lower()
+        except Exception:
+            return True
+        return False
+
+    def _sitemap_source_rank(self, sitemap_url: str, base_url: str):
+        """D164/D240: детерминированный порядок карт вместо list(set(...)).
+        По возрастанию: свой хост, товарное имя, не карта вложений/новостей, адрес."""
+        try:
+            name = urlparse(sitemap_url).path.lower()
+            same_host = self.url_categorizer.is_main_domain(sitemap_url, base_url)
+        except Exception:
+            name, same_host = sitemap_url.lower(), False
+        return (0 if same_host else 1,
+                0 if any(token in name for token in self._SITEMAP_GOOD_TOKENS) else 1,
+                1 if any(token in name for token in self._SITEMAP_BAD_TOKENS) else 0,
+                sitemap_url)
+
     async def discover_sitemap_urls(self, base_url: str) -> List[str]:
-        """Обнаружение карт сайта по стандартным путям и через robots.txt"""
+        """Обнаружение карт сайта по стандартным путям и через robots.txt.
+
+        D214: кандидат принимается по фактическому адресу после редиректов.
+        D143: карты на чужом registrable-домене отбрасываются (равенство доменов
+        считает DomainEquivalencyManager, поэтому домены холдинга из
+        config.equivalent_domains остаются разрешёнными).
+        D164/D240: порядок карт детерминированный."""
         sitemap_urls = []
         parsed_base = urlparse(base_url)
-        
+
         # 1. Проверка стандартных путей
         for path in self.sitemap_paths:
             sitemap_url = f"{parsed_base.scheme}://{parsed_base.netloc}{path}"
-            if await self._check_sitemap_exists(sitemap_url):
-                sitemap_urls.append(sitemap_url)
-        
+            effective_url = await self._check_sitemap_exists(sitemap_url)
+            if effective_url:
+                sitemap_urls.append(effective_url)
+
         # 2. Извлечение из robots.txt
         robots_url = f"{parsed_base.scheme}://{parsed_base.netloc}/robots.txt"
         robots_sitemaps = await self._extract_sitemaps_from_robots(robots_url)
         sitemap_urls.extend(robots_sitemaps)
-        
+
         # 3. Поиск ссылок на карту сайта на главной странице
         html_sitemaps = await self._find_sitemap_links_in_html(base_url)
         sitemap_urls.extend(html_sitemaps)
-        
-        # Удаление дубликатов
-        return list(set(sitemap_urls))
-    
-    async def _check_sitemap_exists(self, url: str) -> bool:
-        """Проверка существования карты сайта"""
+
+        # D143: фильтр принадлежности — карта чужого домена (дорвей в robots.txt,
+        # ссылка на сервис-агрегатор) приносит чужие адреса и жжёт товарную квоту
+        own_urls = []
+        for sitemap_url in sitemap_urls:
+            if self._is_own_sitemap_host(sitemap_url, base_url):
+                own_urls.append(sitemap_url)
+            else:
+                log.info(f"Карта сайта на чужом домене отброшена: {sitemap_url}")
+
+        # Удаление дубликатов с сохранением детерминированного порядка
+        unique_urls = list(dict.fromkeys(own_urls))
+        unique_urls.sort(key=lambda u: self._sitemap_source_rank(u, base_url))
+        return unique_urls
+
+    async def _check_sitemap_exists(self, url: str) -> Optional[str]:
+        """Проверка существования карты сайта. D214: возвращает ФАКТИЧЕСКИЙ адрес карты
+        (после редиректов) либо None. Раньше метод отдавал bool по HEAD без редиректов
+        (у aiohttp для HEAD allow_redirects=False по умолчанию), и 301 на живую карту
+        читался как «карты нет»; часть хостеров к тому же отвечает на HEAD 405."""
+        timeout = aiohttp.ClientTimeout(total=self.config.sitemap_timeout_seconds)
         try:
             connector = aiohttp.TCPConnector(ssl=False)
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.head(url, timeout=10) as response:
-                    return response.status == 200
-        except:
-            return False
-    
+                async with session.head(url, timeout=timeout, allow_redirects=True) as response:
+                    if 200 <= response.status < 300:
+                        return str(response.url)
+                    if 300 <= response.status < 400:
+                        location = response.headers.get('Location')
+                        return urljoin(url, location) if location else None
+                    if response.status not in (400, 403, 405, 501):
+                        return None
+                # HEAD не поддержан хостером — пробуем GET
+                async with session.get(url, timeout=timeout, allow_redirects=True) as response:
+                    if 200 <= response.status < 300:
+                        return str(response.url)
+        except Exception as e:
+            log.debug(f"Карта сайта {url} недоступна: {e}")
+        return None
+
     async def _extract_sitemaps_from_robots(self, robots_url: str) -> List[str]:
         """Извлечение карт сайта из robots.txt"""
         try:
@@ -1425,12 +1494,22 @@ class SiteMapParser:
                 async with session.get(sitemap_url, timeout=10) as response:
                     if response.status != 200:
                         return []
-                    
-                    content = await response.text()
-                    
+
+                    # D196: тело читаем как БАЙТЫ. Раньше .text() всегда декодировал
+                    # ответ как текст, и .gz-карта валила парсер на первом же байте.
+                    raw = await response.read()
+                    content = self._decode_sitemap_body(raw, sitemap_url)
+                    if content is None:
+                        # Битый .gz — та же карта часто лежит и без расширения
+                        if sitemap_url.lower().endswith('.gz'):
+                            log.warning(f"Не удалось распаковать {sitemap_url}, "
+                                        f"пробуем тот же адрес без .gz")
+                            return await self.parse_sitemap(sitemap_url[:-3], depth, max_depth)
+                        return []
+
                     # Определение типа карты сайта по content-type или расширению
                     content_type = response.headers.get('content-type', '').lower()
-                    
+
                     if 'xml' in content_type or sitemap_url.endswith('.xml') or '/sitemap' in sitemap_url.lower():
                         return await self._parse_xml_sitemap(content, sitemap_url, depth, max_depth)
                     elif 'html' in content_type or any(ext in sitemap_url for ext in ['.html', '.htm']):
@@ -1448,6 +1527,26 @@ class SiteMapParser:
         
         return []
     
+    @staticmethod
+    def _decode_sitemap_body(raw: bytes, sitemap_url: str) -> Optional[str]:
+        """D196: распаковывает gzip по сигнатуре 0x1f 0x8b или расширению .gz и
+        декодирует тело карты сайта. None — тело не читается (битый .gz)."""
+        try:
+            if raw[:2] == b'\x1f\x8b' or sitemap_url.lower().endswith('.gz'):
+                raw = gzip.decompress(raw)
+            return raw.decode('utf-8', errors='replace')
+        except Exception as e:
+            log.warning(f"Не удалось прочитать тело карты сайта {sitemap_url}: {e}")
+            return None
+
+    def _submap_rank(self, loc: str):
+        """D154: при ограничении числа подкарт индекса первыми разбираются товарные
+        (Bitrix нумерует карты по id инфоблока, товарный часто заводится последним)."""
+        name = loc.lower()
+        return (0 if any(token in name for token in self._SITEMAP_GOOD_TOKENS) else 1,
+                1 if any(token in name for token in self._SITEMAP_BAD_TOKENS) else 0,
+                loc)
+
     async def _parse_xml_sitemap(self, content: str, sitemap_url: str, depth: int, max_depth: int) -> List[Tuple[str, str, str, int]]:
         """Парсинг XML карты сайта (включая sitemap index)"""
         try:
@@ -1457,14 +1556,22 @@ class SiteMapParser:
             # Проверка на sitemap index
             sitemap_tags = soup.find_all('sitemap')
             if sitemap_tags:
-                # Это индексный файл - парсим вложенные карты сайта
-                tasks = []
-                for sitemap_tag in sitemap_tags[:5]:  # Ограничиваем количество вложенных
-                    loc_tag = sitemap_tag.find('loc')
-                    if loc_tag and loc_tag.text:
-                        task = self.parse_sitemap(loc_tag.text, depth + 1, max_depth)
-                        tasks.append(task)
-                
+                # Это индексный файл - парсим вложенные карты сайта.
+                # D154: жёсткий срез [:5] заменён конфиг-параметром (по умолчанию — все);
+                # при действующем лимите первыми берутся товарные подкарты.
+                locs = [tag.find('loc').text.strip() for tag in sitemap_tags
+                        if tag.find('loc') and tag.find('loc').text]
+                limit = self.config.sitemap_max_submaps
+                if limit and len(locs) > limit:
+                    chosen = sorted(locs, key=self._submap_rank)[:limit]
+                    log.info(f"Индекс {sitemap_url}: {len(locs)} карт, разобрано {len(chosen)}, "
+                             f"пропущено {len(locs) - len(chosen)}: "
+                             f"{', '.join(loc for loc in locs if loc not in chosen)[:500]}")
+                else:
+                    chosen = locs
+                    log.info(f"Индекс {sitemap_url}: {len(locs)} карт, разобраны все")
+                tasks = [self.parse_sitemap(loc, depth + 1, max_depth) for loc in chosen]
+
                 if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     for result in results:
@@ -2972,6 +3079,46 @@ class WebCrawler:
         async with self._stats_lock:
             return self.stats['total_pages']
 
+    @staticmethod
+    def _sitemap_locale_prefix(site_url: str) -> Optional[str]:
+        """D240: локаль-префикс из адреса компании в Site_list ('/ru-ru/', '/ru/').
+        None — адрес без локали, фильтр не применяется."""
+        try:
+            first = (urlparse(site_url).path or '/').strip('/').split('/')[0].lower()
+        except Exception:
+            return None
+        return first if re.fullmatch(r'[a-z]{2}(-[a-z]{2})?', first or '') else None
+
+    @staticmethod
+    def _url_has_locale(url: str, locale_prefix: str) -> bool:
+        """URL принадлежит той же локали (или лежит в корне сайта)."""
+        try:
+            segments = (urlparse(url).path or '/').strip('/').split('/')
+        except Exception:
+            return True
+        first = segments[0].lower() if segments and segments[0] else ''
+        if not first:
+            return True
+        if first == locale_prefix:
+            return True
+        # чужая локаль отсекается, обычный раздел — нет
+        return not re.fullmatch(r'[a-z]{2}(-[a-z]{2})?', first)
+
+    @staticmethod
+    def _merge_sitemap_maps(per_map: List[List[Tuple[str, str, str, int]]], cap: int) -> List[Tuple[str, str, str, int]]:
+        """D144/D240: сводит списки отдельных карт в один, забирая из каждой по кругу,
+        пока не набран кэп. Так одна большая карта не вытесняет остальные целиком."""
+        merged = []
+        index = 0
+        while len(merged) < cap and any(index < len(rows) for rows in per_map):
+            for rows in per_map:
+                if index < len(rows):
+                    merged.append(rows[index])
+                    if len(merged) >= cap:
+                        break
+            index += 1
+        return merged
+
     async def _discover_and_parse_sitemap(self, site_url: str) -> List[Tuple[str, str, str, int]]:
         """Обнаружение и парсинг карты сайта"""
         if not self.config.sitemap_discovery_enabled:
@@ -2991,35 +3138,55 @@ class WebCrawler:
                 task = self.sitemap_parser.parse_sitemap(sitemap_url, max_depth=self.config.sitemap_max_depth)
                 tasks.append(task)
             
-            # Ограничиваем время выполнения
+            # Ограничиваем время выполнения. D154: после снятия среза [:5] объём разбора
+            # у сайтов с большими индексами вырос, поэтому потолок вынесен в Config
+            # и поднят консервативно.
             results = await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
-                timeout=30.0
+                timeout=self.config.sitemap_phase_timeout_seconds
             )
-            
-            # Собираем все URL
-            all_urls = []
-            for result in results:
-                if isinstance(result, list):
-                    all_urls.extend(result)
-            
-            # Фильтруем только товарные URL и категории
+
+            # Фильтруем только товарные URL и категории, ПОКАРТОЧНО
             # (элемент: опубликованный адрес, нормализованный ключ, категория, приоритет)
-            filtered_urls = []
-            for url, normalized_url, category, priority in all_urls:
-                if category in ['product', 'category']:
-                    filtered_urls.append((url, normalized_url, category, priority))
-                elif priority >= 7:  # Высокоприоритетные страницы
-                    filtered_urls.append((url, normalized_url, category, priority))
-            
+            locale_prefix = self._sitemap_locale_prefix(site_url)
+            per_map = []
+            other_urls = []
+            for result in results:
+                if not isinstance(result, list):
+                    continue
+                kept = []
+                for url, normalized_url, category, priority in result:
+                    # D240: локаль из Site_list — берём только адреса своей локали,
+                    # иначе мультилокальная карта отдаёт кэп чужим языкам
+                    if locale_prefix and not self._url_has_locale(url, locale_prefix):
+                        continue
+                    if category in ['product', 'category'] or priority >= 7:
+                        kept.append((url, normalized_url, category, priority))
+                    else:
+                        other_urls.append((url, normalized_url, category, priority))
+                if kept:
+                    kept.sort(key=self.sitemap_parser._sitemap_rank_key)
+                    per_map.append(kept)
+
             # Ограничиваем общее количество (профиль сайта может задать свой лимит).
-            # D144/D208: кэп применяется ПОСЛЕ ранжирования, а не в порядке прихода карт —
-            # иначе при нескольких картах в срез попадала та, что ответила первой.
+            # D144/D240: кэп квотируется ПО КАРТАМ, а не по объединённому списку —
+            # иначе одна карта (например, карта вложений) забирала весь лимит, а
+            # товарная не получала ни слота.
             _sitemap_cap = self.config.sitemap_max_urls
             if self.profile is not None and self.profile.crawl.limits.sitemap_urls:
                 _sitemap_cap = self.profile.crawl.limits.sitemap_urls
-            filtered_urls.sort(key=self.sitemap_parser._sitemap_rank_key)
-            filtered_urls = filtered_urls[:_sitemap_cap]
+            filtered_urls = self._merge_sitemap_maps(per_map, _sitemap_cap)
+
+            # P04 U2 п.7: если товарных адресов в карте не нашлось вовсе, служебные
+            # (роль other) не выбрасываем — ставим их в конец с низким приоритетом,
+            # иначе у сайта не остаётся ни одной точки входа из карты.
+            if other_urls and not any(row[2] == 'product' for row in filtered_urls):
+                other_urls.sort(key=self.sitemap_parser._sitemap_rank_key)
+                addition = other_urls[:max(_sitemap_cap - len(filtered_urls), 0)]
+                if addition:
+                    log.info(f"В карте сайта нет товарных адресов — добавляем {len(addition)} "
+                             f"служебных с низким приоритетом")
+                    filtered_urls.extend(addition)
 
             log.info(f"Отфильтровано {len(filtered_urls)} URL из карты сайта")
             if self.metrics_collector is not None:
