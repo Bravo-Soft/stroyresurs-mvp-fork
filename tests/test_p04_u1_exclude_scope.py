@@ -201,12 +201,21 @@ class _QueueOnlyCrawler:
     категоризатор, нормализатор, visited_urls и метрики."""
 
     _apply_exclude_failopen = WebCrawler._apply_exclude_failopen
+    # P04 U4 (F8 ревью слияния): хук резервирует слот товарной квоты возвращённым
+    # товарным URL, поэтому стенду нужны учётные поля квоты и два её метода.
+    _product_quota_reject_reason = WebCrawler._product_quota_reject_reason
+    _count_queue_gate_rejection = WebCrawler._count_queue_gate_rejection
 
     def __init__(self, categorizer, metrics=None):
         self.url_categorizer = categorizer
         self.url_normalizer = SmartURLNormalizer(categorizer)
         self.visited_urls = set()
         self.metrics_collector = metrics
+        self.product_urls = set()
+        self.max_product_pages_per_site = Config().max_product_pages_per_site
+        self.product_quota_card_reserve = Config().product_quota_card_reserve
+        self._quota_rejected_urls = []
+        self._queue_gate_rejections = {}
 
 
 def test_failopen_hook_requeues_deferred_urls(categorizer):
