@@ -79,7 +79,8 @@ baseline:                     # метрики последней перепис
   pages_crawled: null
   product_pages: null
   product_cards: null
-  avg_specs_per_card: null
+  card_yield: null            # product_cards / product_pages (W1)
+  avg_specs_per_card: null    # среднее число числовых ТХ у карточек, прошедших гейт >=3 (W1)
   jsonld_share: null
   cms_detected: null          # имя CMS по _CMS_SELECTORS universal_extractor
   fetch_fail_rate: null

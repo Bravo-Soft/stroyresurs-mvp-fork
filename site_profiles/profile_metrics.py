@@ -52,6 +52,8 @@ class RunMetricsCollector:
         self.document_files = Counter()         # общие документы по блокам профиля
         self.limits = {}                        # эффективные лимиты прогона (pages/product_pages):
                                                 # baseline сравним только при одинаковых лимитах
+        self.card_specs = []                    # число числовых ТХ у товаров, прошедших гейт >=3
+        self.gate_specs = []                    # то же у всех товаров, дошедших до гейта
         self.output = {}                        # срез CompanyStatistics
 
     # ---------- хуки краулера ----------
@@ -116,6 +118,15 @@ class RunMetricsCollector:
     # ---------- выход пайплайна ----------
 
     @_safe
+    def record_specs(self, numeric_specs, passed):
+        """Гейт качества main.process_product_page: число числовых ТХ товара
+        и прошёл ли он порог >=3 (источник avg_specs_per_card)."""
+        n = int(numeric_specs)
+        self.gate_specs.append(n)
+        if passed:
+            self.card_specs.append(n)
+
+    @_safe
     def record_output(self, stats: dict):
         """Срез итоговых счётчиков компании (main.CompanyStatistics.__dict__ или dict)."""
         keys = ('products_found', 'products_processed', 'products_failed',
@@ -141,6 +152,10 @@ class RunMetricsCollector:
         gate3_total = products_processed + below_min
         dominant_structure = (self.structure_hashes.most_common(1)[0][0]
                               if self.structure_hashes else None)
+        product_pages = pages_by_category.get('product', 0)
+        product_cards = self.output.get('cards_generated')
+        avg_specs = (round(sum(self.card_specs) / len(self.card_specs), 2)
+                     if self.card_specs else None)
         metrics = {
             'domain': self.domain,
             'company_name': self.company_name,
@@ -149,8 +164,11 @@ class RunMetricsCollector:
             # Coverage
             'pages_crawled': len(self.page_urls),
             'pages_by_category': dict(pages_by_category),
-            'product_pages': pages_by_category.get('product', 0),
-            'product_cards': self.output.get('cards_generated'),
+            'product_pages': product_pages,
+            'product_cards': product_cards,
+            'card_yield': (self._rate(product_cards, product_pages)
+                           if isinstance(product_cards, int) else None),
+            'avg_specs_per_card': avg_specs,
             'sitemap_url_count': self.sitemap_url_count,
             # Extraction
             'extraction_path_share': {k: self._rate(v, extraction_total)
@@ -201,6 +219,11 @@ class RunMetricsCollector:
             alerts.append(f'empty_markdown_rate {metrics["empty_markdown_rate"]} > 0.3')
         if metrics.get('gate3_pass_rate') is not None and metrics['gate3_pass_rate'] < 0.5:
             alerts.append(f'gate3_pass_rate {metrics["gate3_pass_rate"]} < 0.5')
+        if metrics.get('card_yield') is not None and metrics.get('product_pages'):
+            if metrics['card_yield'] < 0.35:
+                alerts.append(f'card_yield {metrics["card_yield"]} < 0.35')
+        if metrics.get('avg_specs_per_card') is not None and metrics['avg_specs_per_card'] < 5:
+            alerts.append(f'avg_specs_per_card {metrics["avg_specs_per_card"]} < 5')
         if (baseline.get('structure_hash') and metrics.get('structure_hash')
                 and baseline['structure_hash'] != metrics['structure_hash']):
             alerts.append('structure_hash изменился (кандидат RE-PROFILE)')

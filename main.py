@@ -1075,6 +1075,10 @@ class MonitoringSystem:
                     is_product = False
                 else:
                     is_product = True
+                # Телеметрия профилирования (W1): avg_specs_per_card. Fail-open внутри record_specs.
+                metrics = getattr(self, '_profile_metrics', None)
+                if metrics is not None:
+                    metrics.record_specs(numeric_specs, is_product)
             else:
                 # Неизвестный формат, сохраняем в Not_products
                 log.warning(f"Неизвестный формат AI данных, сохраняем в Not_products: {metadata.get('url', '')}")

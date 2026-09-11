@@ -52,6 +52,8 @@ def main():
     parser.add_argument('--out', default=str(MVP / 'tests' / 'golden'))
     parser.add_argument('--per-cat', type=int, default=25,
                         help='максимум страниц на категорию на компанию (детерминированно: сортировка имён)')
+    parser.add_argument('--companies', nargs='*', default=None,
+                        help='папки корпуса (имена компаний); по умолчанию — весь корпус')
     args = parser.parse_args()
 
     corpus = Path(args.corpus)
@@ -60,6 +62,8 @@ def main():
 
     for company_dir in sorted(corpus.iterdir()) if corpus.is_dir() else []:
         if not company_dir.is_dir():
+            continue
+        if args.companies and company_dir.name not in args.companies:
             continue
         for cat, page_type in CATEGORIES.items():
             cat_dir = company_dir / cat

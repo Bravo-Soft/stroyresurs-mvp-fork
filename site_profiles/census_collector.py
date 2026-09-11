@@ -155,7 +155,8 @@ class CensusCollector:
             'baseline': {
                 key: metrics.get(key) for key in (
                     'structure_hash', 'selector_hit_rate', 'pages_crawled',
-                    'product_pages', 'product_cards', 'jsonld_share', 'cms_detected',
+                    'product_pages', 'product_cards', 'card_yield', 'avg_specs_per_card',
+                    'jsonld_share', 'cms_detected',
                     'fetch_fail_rate', 'challenge_rate', 'empty_markdown_rate',
                     'gate3_pass_rate', 'sitemap_url_count', 'extraction_path_share',
                     'limits_used')
