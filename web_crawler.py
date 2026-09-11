@@ -136,6 +136,38 @@ def sanitize_href(href: str) -> str:
     return f"{last.group(1).lower()}//{path_part[last.end():].lstrip('/')}{tail}"
 
 
+# D157 (P04 U4 п.4): адрес перехода, записанный не в href, а в обработчике onclick
+# ("window.location.href='/catalog/x/'", "document.location=...") — так устроена
+# навигация плиток каталога в части Bitrix-шаблонов (Москабельмет).
+_ONCLICK_LOCATION_RE = re.compile(
+    r"""location(?:\.href)?\s*=\s*['"]([^'"]+)['"]""", re.I)
+# Обработчики «в корзину» / «сравнить» — это ДЕЙСТВИЕ, а не переход на страницу.
+# В общем сборщике ссылок такие адреса до сих пор не появлялись вовсе, и пускать их
+# в обход нельзя: '?cartAction=add&cartItem=7' балльная эвристика считает товаром
+# (совпадение 'item=') и он занял бы слот товарной квоты.
+_ACTION_URL_RE = re.compile(
+    r'cartaction|addtocart|add2cart|add_to_cart|add2basket|action=add|compare=', re.I)
+
+
+def extract_element_url(element) -> str:
+    """D157: адрес перехода элемента, у которого нет href: onclick с присваиванием
+    location, либо data-href / data-url. Возвращает '' , если адреса нет.
+    Разбор статический — атрибут уже есть в HTML, отдельного прохода по DOM
+    (в т.ч. в Playwright-ветке) не требуется."""
+    try:
+        value = ''
+        for attr in ('data-href', 'data-url'):
+            value = (element.get(attr) or '').strip()
+            if value:
+                break
+        if not value:
+            match = _ONCLICK_LOCATION_RE.search(element.get('onclick') or '')
+            value = match.group(1).strip() if match else ''
+        return '' if _ACTION_URL_RE.search(value) else value
+    except Exception:
+        return ''
+
+
 @dataclass
 class ParseResult:
     soup: BeautifulSoup
@@ -486,7 +518,9 @@ class URLCategorizer:
             r'/p/\d+', r'/sku/', r'/art/', r'/article/', r'/model/',
             r'/\d+\.html$', r'/\d+$', r'/[a-z0-9-]+-\d+', 
             r'_[a-z0-9]{6,}', r'/[a-z]{2,}\d{3,}', r'/\?product=', 
-            r'/buy/', r'/purchase/', r'/[a-z0-9-]+-\d+[a-z]*/',
+            # D271: после '/buy/' обязателен товарный слаг — голый '/buy/?id=8940'
+            # (раздел «Где купить» kvil.ru) съедал квоту как товарная страница
+            r'/buy/[a-z0-9-]+', r'/purchase/', r'/[a-z0-9-]+-\d+[a-z]*/',
             r'/productinfo/', r'/productdetail/', r'/product-detail/',
             r'/goods/', r'/ware/', r'/produkt/', r'/mah-\d+a-\d+(?:[.-]\d+)?om-m/?$/',
             # E-COMMERCE ПАТТЕРНЫ
@@ -661,6 +695,18 @@ class URLCategorizer:
         # P04 U3 (D228): шаблонные служебные пути uCoz — гостевая книга, регистрация и
         # страницы-заглушки '/index/0-N'. Товарами они не бывают никогда.
         self._ucoz_service_re = re.compile(r'^/(?:index/\d+-\d+|gb|register)(?:/|$)')
+        # === P04 U4: листинг против карточки (D100) ===
+        # Пагинация листинга в query (?PAGEN_1=2, ?page=3) и в пути (/page/2, /stranica-3)
+        self._pagination_query_re = re.compile(
+            r'(?:^|&)(?:page|pagen(?:_\d+)?|paging|pg|start|offset)=\d+')
+        self._pagination_path_re = re.compile(r'/(?:page|pagen|stranica)[-_/]?\d+$')
+        # Числовой идентификатор в query у скриптовых карточек ('detail.php?ID=123').
+        # Листинговые параметры (categoryID, SECTION_ID) отсекаются раньше — признаком
+        # листинга, поэтому здесь достаточно общей формы.
+        self._generic_id_query_re = re.compile(r'(?:^|&)[a-z_]*id=\d+')
+        # D271: раздел «Где купить» одним сегментом пути. Подстрокой такое слово брать
+        # нельзя ('/buyer/product.php' — карточка), поэтому сверяется сегмент целиком.
+        self.distributor_segments = {'buy'}
         # Признак «плоского» сайта: заполняется observe_urls() по набору URL хоста
         self.flat_site = False
         # Ключевые слова товаров/категорий сопоставляем ПО ЛЕВОЙ ГРАНИЦЕ ТОКЕНА, а не
@@ -912,6 +958,64 @@ class URLCategorizer:
                 return False
             name = base
         return bool(name) and name not in self.flat_site_stop_segments
+
+    # ==================== P04 U4: листинг против карточки =======================
+
+    def is_listing_url(self, url: str) -> bool:
+        """Форма URL говорит «листинг каталога», а не «карточка товара» (D100):
+        пагинация в пути или в query, листинговый параметр (categoryID и т. п.) либо
+        путь-раздел — последний сегмент без товарного слага (ни дефиса, ни цифры, ни
+        расширения). Признак РОЛЬ НЕ МЕНЯЕТ: страница по-прежнему обходится, сохраняется
+        и отдаёт ссылки; он влияет только на приоритет очереди и на резерв товарной
+        квоты. Сознательно узкий: '/catalog/truboprovodnaya-armatura/' с дефисом в
+        последнем сегменте листингом не считается — недобор безопаснее перебора."""
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        query = parsed.query.lower()
+        path_norm = self._normalize_path(parsed.path)
+        # Идентификатор товара в query сильнее формы пути: '/cat/?p_id=89' — карточка
+        if self._product_query_re.search(query):
+            return False
+        if (self._pagination_query_re.search(query)
+                or self._pagination_path_re.search(path_norm)
+                or self._listing_query_re.search(query)):
+            return True
+        segments = [seg for seg in path_norm.split('/') if seg]
+        if not segments:
+            return False
+        last = segments[-1]
+        if '.' in last:
+            return False
+        return not ('-' in last or any(ch.isdigit() for ch in last))
+
+    def is_product_card_url(self, url: str) -> bool:
+        """Похоже на КАРТОЧКУ товара: идентификатор товара в query (в т.ч. голый
+        '?ID=123' скриптовых карточек Bitrix — листинговые параметры отсеиваются
+        раньше признаком листинга), либо путь глубины >= 2 с товарным слагом в
+        последнем сегменте (дефис или цифра), либо односегментный лист
+        .htm/.html/.shtml (форма карточки «плоского» сайта).
+        Используется только для резерва доли товарной квоты (P04 U4, п. 2)."""
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        query = parsed.query.lower()
+        if self._product_query_re.search(query):
+            return True
+        if self.is_listing_url(url):
+            return False
+        if self._generic_id_query_re.search(query):
+            return True
+        segments = [seg for seg in self._normalize_path(parsed.path).split('/') if seg]
+        if not segments:
+            return False
+        last = segments[-1]
+        base, _, ext = last.rpartition('.') if '.' in last else (last, '', '')
+        if len(segments) == 1:
+            return ext in ('htm', 'html', 'shtml') or self.flat_site
+        return '-' in base or any(ch.isdigit() for ch in base)
 
     def calculate_url_depth(self, url: str) -> int:
         """Вычисление глубины URL на основе количества слэшей в пути"""
@@ -1311,14 +1415,23 @@ class URLCategorizer:
         if any(keyword in path_lower for keyword in self.contact_keywords):
             return 'contacts', self.priority_levels['contacts']
 
-        # Проверка на дистрибьюторов
-        if any(keyword in path_lower for keyword in self.distributor_keywords):
+        # Проверка на дистрибьюторов (P04 U4/D271: '/buy/' отдельным сегментом — это
+        # «Где купить», а не товар; подстрокой такое слово брать нельзя — '/buyer/')
+        if (any(keyword in path_lower for keyword in self.distributor_keywords)
+                or any(seg in self.distributor_segments for seg in path_segments)):
             return 'distributor', self.priority_levels['distributor']
 
         # Проверка на прайс-листы. P04 U3 (D181): сильный товарный сигнал пути
         # ('/product/235255') сильнее префикса '/price/' — такой URL идёт в товары.
-        if (any(keyword in path_lower for keyword in self.price_list_keywords)
-                and not self._has_strong_product_path(path_segments)):
+        # P01 U4 п.4: слово из СЕРЕДИНЫ пути — слабое свидетельство роли. Сразу
+        # прайс-листом считаем URL, у которого слово стоит в последнем значащем
+        # сегменте ('/price-plita.htm'); '/price/nasos-nm-100/' сначала проходит
+        # товарную и каталожную проверки и получает прайсовую роль только в конце,
+        # с пониженным приоритетом.
+        price_hit = (any(keyword in path_lower for keyword in self.price_list_keywords)
+                     and not self._has_strong_product_path(path_segments))
+        if price_hit and any(keyword in (path_segments[-1] if path_segments else '')
+                             for keyword in self.price_list_keywords):
             return 'price_list', self.priority_levels['price_list']
 
         # Проверка на товары (антипаттерн профиля запрещает классификацию «товар»).
@@ -1350,7 +1463,13 @@ class URLCategorizer:
                 r'/каталог/', r'/серия/', r'/katalog/', r'/products/'
             ])):
             return 'category', max(self.priority_levels['category'] - downgrade, 1)
-        
+
+        # P01 U4 п.4: отложенная прайсовая роль (слово нашлось в середине пути) —
+        # ни товаром, ни категорией URL не оказался, значит прайс-лист, но с
+        # пониженным доверием
+        if price_hit:
+            return 'price_list', max(self.priority_levels['price_list'] - 1, 1)
+
         return 'other', self.priority_levels['other']
         
     def _is_image_url(self, url: str) -> bool:
@@ -2170,6 +2289,11 @@ class ProductGridParser:
     
     def __init__(self, url_categorizer: URLCategorizer):
         self.url_categorizer = url_categorizer
+        # P04 U4 п.2 (D10): ссылка, найденная в товарной сетке, — это карточка,
+        # подтверждённая разметкой листинга; она должна обходиться раньше самих
+        # листингов и адресов карты сайта (диапазон приоритетов 10..13).
+        self.grid_link_priority = getattr(
+            getattr(url_categorizer, 'config', None), 'product_grid_link_priority', 14)
         self.product_grid_selectors = [
             '.cat-item', '.item', '.ms2_product', '.msoptionsprice-product',
             '.c-catalog-list__item', '.c-catalog-list__item-container',
@@ -2207,20 +2331,31 @@ class ProductGridParser:
     def _extract_links_from_element(self, element, base_url: str, current_url: str) -> List[Tuple[str, str, int]]:
         """Извлечение ссылок из элемента сетки"""
         links = []
-        
-        # Ищем все ссылки внутри элемента сетки
-        for link in element.find_all('a', href=True):
-            href = sanitize_href(link['href'])  # D257/D233
+
+        # Адреса плитки: обычный <a href> плюс переход через onclick/data-href/data-url
+        # (D157) — у самой плитки и у элементов внутри неё
+        raw_hrefs = [link['href'] for link in element.find_all('a', href=True)]
+        try:
+            for holder in [element] + element.select('[onclick], [data-href], [data-url]'):
+                js_href = extract_element_url(holder)
+                if js_href:
+                    raw_hrefs.append(js_href)
+        except Exception as e:
+            log.debug(f"Ошибка разбора onclick в сетке: {e}")
+
+        for raw_href in raw_hrefs:
+            href = sanitize_href(raw_href)  # D257/D233
             if not href or href.startswith(('#', 'javascript:')):
                 continue
-                
+
             full_url = urljoin(current_url, href)
-            
+
             # Проверяем, является ли ссылка товарной
             category, priority = self.url_categorizer.categorize_url(full_url)
             if category == 'product':
-                links.append((full_url, category, priority))
-        
+                # P04 U4 п.2 (D10): ссылкам из сетки — приоритет выше листингов
+                links.append((full_url, category, max(priority, self.grid_link_priority)))
+
         return links
     
 class FileDownloadManager:
@@ -2996,6 +3131,13 @@ class WebCrawler:
         self._product_quota_reused = 0        # сколько раз слот переиспользован
         self.product_quota_reuse_limit = getattr(self.config, 'product_quota_reuse_limit', 50)
         self._quota_rejected_urls = []        # товарные адреса, отбитые гейтом квоты
+        # P04 U4 п.2: доля товарной квоты, зарезервированная под карточки. Листинги
+        # глубины 1 выбирали все 50 слотов раньше, чем обход доходил до карточек (D100).
+        self.product_quota_card_reserve = getattr(
+            self.config, 'product_quota_card_reserve', 0.3)
+        # P04 U4 (хвост полосы B): признак «плоский сайт» считается один раз на компанию —
+        # по карте сайта, а если её нет, по ссылкам первой разобранной страницы.
+        self._flat_site_observed = False
         self._queue_gate_rejections = {}      # немые отказы гейтов очереди: причина -> счётчик
         self._sitemap_hard_fail_streak = 0    # подряд идущие жёсткие отказы товарных URL карты
         self.stale_sitemap_hard_fail_threshold = getattr(
@@ -3107,6 +3249,50 @@ class WebCrawler:
                   f"[{reused}/{self.product_quota_reuse_limit}]")
         return True
 
+    def _product_quota_reject_reason(self, url: str) -> Optional[str]:
+        """P04 U4 п.2: причина отказа гейта товарной квоты или None. Кроме исчерпания
+        квоты появился резерв: последняя доля слотов (product_quota_card_reserve)
+        отдаётся только адресам, похожим на карточку, — иначе листинги и разделы
+        глубины 1 выбирают все 50 слотов раньше, чем обход дойдёт до карточек (D100).
+        Вызывается там же, где раньше стояла проверка len(product_urls) >= квоты."""
+        used = len(self.product_urls)
+        limit = self.max_product_pages_per_site
+        if used >= limit:
+            return 'товарная квота'
+        reserve = int(limit * self.product_quota_card_reserve)
+        if reserve and used >= limit - reserve and not self.url_categorizer.is_product_card_url(url):
+            return 'резерв квоты под карточки'
+        return None
+
+    async def release_product_slot(self, url: str) -> bool:
+        """P04 U4 п.3: обратная связь «вердикт извлечения -> бюджет обхода». Потоковый
+        воркер main.py зовёт этот метод, когда модель отвергла товарную страницу
+        (Trash_418#): слот квоты возвращается тем же механизмом и под тем же потолком
+        product_quota_reuse_limit, что и на путях неуспеха краула. В батч-режиме вызова
+        нет — там извлечение идёт после обхода и возвращать слот уже некому."""
+        try:
+            normalized_url = self.url_normalizer.normalize_url(url)
+        except Exception:
+            return False
+        return await self._release_product_quota_slot(normalized_url, 'вердикт Trash_418#')
+
+    async def _release_listing_quota_slot(self, url: str, normalized_url: str,
+                                          soup: BeautifulSoup) -> bool:
+        """P04 U4 п.1: страница получила слот товарной квоты как карточка, но по форме
+        URL это листинг, и DOM карточку не подтверждает (is_product_page_by_content) —
+        слот возвращаем. Сама страница при этом сохраняется в своей категории, ссылки
+        с неё уже собраны: возвращается только бюджет."""
+        if not self.url_categorizer.is_listing_url(url):
+            return False
+        try:
+            if self.url_categorizer.is_product_page_by_content(soup, url):
+                return False
+        except Exception as e:
+            log.debug(f"Не удалось оценить страницу по содержимому {url}: {e}")
+            return False
+        return await self._release_product_quota_slot(
+            normalized_url, 'страница-листинг, а не карточка')
+
     def _register_page_retry(self, url: str, depth: int, category: str) -> None:
         """D40: запоминает страницу, не отдавшую контент, для повторной попытки.
         Ретраим только целевые категории — терять их значит терять товары/дилеров."""
@@ -3135,6 +3321,7 @@ class WebCrawler:
             self._queue_gate_rejections.clear()
             self._sitemap_hard_fail_streak = 0
             self._page_retry_candidates.clear()
+            self._flat_site_observed = False
 
         # Получаем все файлы компании из временного хранилища
         company_files = await self.temp_storage.get_company_files(company_name)
@@ -3425,6 +3612,16 @@ class WebCrawler:
         
         sitemap_urls = await self._discover_and_parse_sitemap(site_url)
         if sitemap_urls:
+            # P04 U2 п.5 (хвост полосы B, F6 ревью слияния): набор URL хоста известен —
+            # считаем признак «плоского» сайта до постановки адресов в очередь.
+            # Элемент карты — 4-кортеж полосы A (адрес, ключ, роль, приоритет).
+            self._flat_site_observed = True
+            if self.url_categorizer.observe_urls(u for u, _n, _c, _p in sitemap_urls):
+                # Признак включился уже ПОСЛЕ категоризации в парсере карты — роли
+                # адресов пересчитываем, иначе на плоском сайте они остаются 'other'
+                # и гейт сохранения выбрасывает страницы (D145, D228, D237).
+                sitemap_urls = [(u, n) + self._recategorize_sitemap_row(u)
+                                for u, n, _c, _p in sitemap_urls]
             await self._add_sitemap_urls_to_queue(queue, sitemap_urls, site_url)
             log.info(f"Добавлено {len(sitemap_urls)} URL из карты сайта")
         
@@ -3567,6 +3764,16 @@ class WebCrawler:
             category, priority = categorizer.categorize_url(url, link_text)
             if category.startswith('excluded'):
                 continue
+            # F8 ревью слияния: возвращённый товарный URL тоже занимает слот квоты —
+            # иначе учёт полосы A по этим адресам не ведётся вовсе. Без await: хук
+            # зовётся только при пустой очереди и нуле активных задач, гонки нет.
+            if category == 'product':
+                reason = self._product_quota_reject_reason(url)
+                if reason:
+                    self._count_queue_gate_rejection(reason)
+                    self._quota_rejected_urls.append(url)
+                    continue
+                self.product_urls.add(normalized_url)
             queue.append((url, 1, category, priority))
             self.visited_urls.add(normalized_url)
             restored += 1
@@ -3636,6 +3843,12 @@ class WebCrawler:
                         break
             index += 1
         return merged
+
+    def _recategorize_sitemap_row(self, url: str) -> Tuple[str, int]:
+        """P04 U4: роль и приоритет адреса карты сайта после того, как включился признак
+        «плоский сайт». Повторяет надбавку приоритета парсера карты (+1)."""
+        category, priority = self.url_categorizer.categorize_url(url)
+        return category, priority + 1
 
     async def _discover_and_parse_sitemap(self, site_url: str) -> List[Tuple[str, str, str, int]]:
         """Обнаружение и парсинг карты сайта"""
@@ -3773,7 +3986,7 @@ class WebCrawler:
             # sitemap кладёт сотни товарных URL в очередь в обход
             # max_product_pages_per_site. Продукты в карте отсортированы первыми по
             # приоритету, поэтому лишние просто пропускаем (контакты/категории идут дальше).
-            if category == 'product' and len(self.product_urls) >= self.max_product_pages_per_site:
+            if category == 'product' and self._product_quota_reject_reason(url):
                 # D222/D144: отказ по квоте раньше попадал в счётчик «дубликатов» и был
                 # неотличим от дедупа; теперь считается отдельно и служит входом
                 # страховки «второй проход», если товарных страниц не сохранилось вовсе.
@@ -3975,6 +4188,10 @@ class WebCrawler:
             # 5а. D36: детект протухшего sitemap — одинаковый видимый текст у товарных страниц
             if category == 'product':
                 await self._check_stale_sitemap_guard(parse_result.html, url, queue)
+                # P04 U4 п.1 (D100): слот квоты занят как под карточку, но по форме URL
+                # это листинг, и DOM карточку не подтверждает — слот возвращаем.
+                # Страница сохраняется дальше как обычно, ссылки с неё уже собраны.
+                await self._release_listing_quota_slot(url, normalized_url, parse_result.soup)
 
             # 6. Подготовка метаданных
             metadata = {
@@ -4043,7 +4260,7 @@ class WebCrawler:
             new_links = await self._extract_links(url, parse_result, depth, base_url=self.current_base_url)
             added = 0
             for link_url, link_category, priority in new_links:
-                if await self._should_add_to_queue_parallel(link_url, depth + 1):
+                if await self._should_add_to_queue_parallel(link_url, depth + 1, link_category):
                     async with self._queue_lock:
                         queue.append((link_url, depth + 1, link_category, priority))
                     async with self._urls_lock:
@@ -4099,9 +4316,16 @@ class WebCrawler:
             log.debug(f"_product_dedup_key: не удалось построить ключ для {url}: {e}")
             return None
 
-    async def _should_add_to_queue_parallel(self, url: str, depth: int) -> bool:
-        """Потокобезопасная проверка, нужно ли добавлять URL в очередь"""
-        category, _ = self.url_categorizer.categorize_url(url)
+    async def _should_add_to_queue_parallel(self, url: str, depth: int,
+                                            category: str = None) -> bool:
+        """Потокобезопасная проверка, нужно ли добавлять URL в очередь.
+
+        F3 ревью слияния: роль передаётся УЖЕ ПОСЧИТАННОЙ сборщиком ссылок — она
+        учитывает текст ссылки (якоря P04 U2/U3), а пересчёт здесь шёл без текста.
+        Из-за расхождения товарный URL с якорем ложился в очередь как 'product', но
+        слот квоты не резервировал и схемный дедуп D59 не проходил."""
+        if category is None:
+            category, _ = self.url_categorizer.categorize_url(url)
 
         if category == 'excluded':
             log.debug(f"Не добавляем исключённый URL в очередь: {url}")
@@ -4123,8 +4347,7 @@ class WebCrawler:
             # Проверяем языковые префиксы
             if self.url_categorizer.should_exclude_by_language(url):
                 return False
-            
-            category, _ = self.url_categorizer.categorize_url(url)
+
             url_depth = self.url_categorizer.calculate_url_depth(url)
             
             # Для не-товарных страниц ограничиваем глубину. Контакты/дистрибьюторы часто
@@ -4138,10 +4361,12 @@ class WebCrawler:
             # Для товарных страниц ограничиваем количеством.
             # D193/D143/D212: отказ был немым; теперь он считается и попадает в сводку
             # за компанию, а сам адрес — во вход страховки «второй проход».
-            if category == 'product' and len(self.product_urls) >= self.max_product_pages_per_site:
-                self._count_queue_gate_rejection('товарная квота')
-                self._quota_rejected_urls.append(url)
-                return False
+            if category == 'product':
+                reason = self._product_quota_reject_reason(url)
+                if reason:
+                    self._count_queue_gate_rejection(reason)
+                    self._quota_rejected_urls.append(url)
+                    return False
 
             # D59 (RC1+C): один товар под несколькими URL (http↔https / алиас пути /
             # разные домены холдинга) даёт дубль карточки, т.к. product_id из имени LLM
@@ -5464,19 +5689,39 @@ class WebCrawler:
             current_parsed = urlparse(current_url)
             current_scheme = current_parsed.scheme
 
+            # Источники адресов: обычные <a href> и элементы, у которых переход
+            # записан в onclick/data-href/data-url (D157). Второй вид в общем
+            # сборщике не разбирался вовсе, и карточки за плитками Bitrix-шаблона
+            # оставались недостижимыми.
+            link_sources = [(link, link['href'], True) for link in soup.find_all('a', href=True)]
+            try:
+                for holder in soup.select('[onclick], [data-href], [data-url]'):
+                    js_href = extract_element_url(holder)
+                    if js_href:
+                        link_sources.append((holder, js_href, False))
+            except Exception as e:
+                log.debug(f"Ошибка разбора onclick на {current_url}: {e}")
+
+            # P04 U4 (хвост полосы B): если карты сайта не было, набор URL хоста
+            # впервые становится известен здесь — на ссылках первой страницы.
+            # Признак «плоский сайт» считаем один раз на компанию.
+            if not self._flat_site_observed:
+                self._flat_site_observed = True
+                self.url_categorizer.observe_urls(
+                    urljoin(current_url, sanitize_href(raw)) for _el, raw, _is_a in link_sources)
+
             # Извлекаем все ссылки со страницы
-            for link in soup.find_all('a', href=True):
-                raw_href = link['href']
+            for link, raw_href, is_anchor in link_sources:
                 # D257/D233: чиним href ДО склейки — пробельные края (403 на «испорченном
                 # адресе», а не «доступ запрещён») и вклеенный в путь абсолютный URL
                 # (иначе глубина считается по мангленному пути и шлюз очереди выбрасывает
                 # всю навигацию сайта).
                 href = sanitize_href(raw_href)
-                if self.metrics_collector is not None and href != raw_href:
+                if self.metrics_collector is not None and is_anchor and href != raw_href:
                     kind = 'whitespace' if href == raw_href.strip() else 'glued'
                     log.debug(f"Исправлен href ({kind}): {raw_href!r} -> {href!r} на {current_url}")
                     self.metrics_collector.record_mangled_href(kind)
-                if self.metrics_collector is not None:
+                if self.metrics_collector is not None and is_anchor:
                     self.metrics_collector.record_href_seen()
                 if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
                     continue
@@ -5502,22 +5747,36 @@ class WebCrawler:
                 if (self.url_categorizer._is_image_url(full_url) or 
                     self.url_categorizer.is_downloadable_file(full_url)):
                     continue
-                link_text = link.get_text(strip=True)
-                
+                # У плитки с onclick текстом бывает вся её начинка — обрезаем, иначе
+                # случайное слово из описания перекрасит роль ссылки
+                link_text = link.get_text(strip=True)[:200] if not is_anchor else link.get_text(strip=True)
+
                 # Категоризируем URL
                 category, priority = self.url_categorizer.categorize_url(full_url, link_text)
-                
+
+                # P04 U4 п.1 (D100): листинг каталога обходим ПОСЛЕ карточек — форма
+                # URL (пагинация, раздел без товарного слага) понижает приоритет на 1.
+                # Роль не меняется: страница по-прежнему обходится и сохраняется.
+                if category == 'product' and self.url_categorizer.is_listing_url(full_url):
+                    priority = max(priority - 1, 1)
+
                 # Добавляем в список
                 links.append((full_url, category, priority))
             
             # Извлекаем товарные ссылки из сеток
             product_links = self.product_grid_parser.extract_product_links(soup, current_url, current_url)
             links.extend(product_links)
-            
-            # Удаляем дубликаты
-            unique_links = list(set(links))
-            
-            return unique_links
+
+            # Удаляем дубликаты. P04 U4: один и тот же адрес приходит и общим сборщиком,
+            # и из товарной сетки — оставляем вариант с НАИБОЛЬШИМ приоритетом, иначе
+            # set() выбирал между ними случайно и приоритет сетки терялся.
+            best = {}
+            for link_url, link_category, link_priority in links:
+                current = best.get(link_url)
+                if current is None or link_priority > current[2]:
+                    best[link_url] = (link_url, link_category, link_priority)
+
+            return list(best.values())
             
         except Exception as e:
             log.error(f"Ошибка извлечения ссылок: {e}")
@@ -5598,11 +5857,13 @@ class WebCrawler:
             self._count_queue_gate_rejection('глубина не-товарной страницы')
             return False
 
-        # Для товарных страниц ограничиваем количеством
-        if category == 'product' and len(self.product_urls) >= self.max_product_pages_per_site:
-            self._count_queue_gate_rejection('товарная квота')
-            self._quota_rejected_urls.append(url)
-            return False
+        # Для товарных страниц ограничиваем количеством (P04 U4 п.2: плюс резерв под карточки)
+        if category == 'product':
+            reason = self._product_quota_reject_reason(url)
+            if reason:
+                self._count_queue_gate_rejection(reason)
+                self._quota_rejected_urls.append(url)
+                return False
 
         return True
 
@@ -5735,7 +5996,7 @@ class WebCrawler:
         # Извлекаем ссылки и добавляем в очередь
         new_links = await self._extract_links(url, parse_result, depth)
         for link_url, link_category, priority in new_links:
-            if await self._should_add_to_queue_parallel(link_url, depth + 1):
+            if await self._should_add_to_queue_parallel(link_url, depth + 1, link_category):
                 queue.append((link_url, depth + 1, link_category, priority))
                 async with self._urls_lock:
                     self.visited_urls.add(self.url_normalizer.normalize_url(link_url))
