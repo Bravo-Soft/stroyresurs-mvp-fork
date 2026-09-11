@@ -55,6 +55,11 @@ class RunMetricsCollector:
         self.card_specs = []                    # число числовых ТХ у товаров, прошедших гейт >=3
         self.gate_specs = []                    # то же у всех товаров, дошедших до гейта
         self.output = {}                        # срез CompanyStatistics
+        # D120/D219/D245: судьба URL карты сайта на постановке в очередь и на фетче.
+        # Высокая доля дублей одного ключа ловит D245, высокая доля no_content — D120/D219.
+        self.sitemap_offered = 0                # сколько URL карты дошло до гейтов очереди
+        self.sitemap_dup_skipped = 0            # из них отбито как дубликаты ключа
+        self.sitemap_no_content = 0             # адреса карты, не отдавшие содержимое
 
     # ---------- хуки краулера ----------
 
@@ -191,6 +196,10 @@ class RunMetricsCollector:
             'company_document_files': dict(self.document_files),
             'limits_used': dict(self.limits) or None,
             'output': dict(self.output),
+            # Судьба URL карты сайта (D120/D219/D245)
+            'sitemap_offered': self.sitemap_offered,
+            'sitemap_dup_skip_rate': self._rate(self.sitemap_dup_skipped, self.sitemap_offered),
+            'sitemap_no_content_rate': self._rate(self.sitemap_no_content, self.sitemap_offered),
         }
         metrics['alerts'] = self._alerts(metrics)
         return metrics
@@ -230,6 +239,13 @@ class RunMetricsCollector:
         for category in ('contacts', 'distributor'):
             if not metrics.get('pages_by_category', {}).get(category):
                 alerts.append(f'секция {category}: 0 страниц')
+        # D245: карта сайта схлопнулась в один нормализованный ключ;
+        # D120/D219: адреса карты не отдают содержимое (испорчено написание URL).
+        if metrics.get('sitemap_offered'):
+            if (metrics.get('sitemap_dup_skip_rate') or 0) > 0.8:
+                alerts.append(f'sitemap_dup_skip_rate {metrics["sitemap_dup_skip_rate"]} > 0.8')
+            if (metrics.get('sitemap_no_content_rate') or 0) > 0.8:
+                alerts.append(f'sitemap_no_content_rate {metrics["sitemap_no_content_rate"]} > 0.8')
         return alerts
 
     @_safe
@@ -242,3 +258,16 @@ class RunMetricsCollector:
             json.dump(self.to_dict(), fh, ensure_ascii=False, indent=1)
         logger.info(f'Метрики профилирования записаны: {path}')
         return path
+
+    @_safe
+    def record_sitemap_queue(self, offered, dup_skipped):
+        """D245: сколько URL карты сайта дошло до гейтов очереди и сколько из них
+        отбито как дубликаты одного нормализованного ключа."""
+        self.sitemap_offered += int(offered)
+        self.sitemap_dup_skipped += int(dup_skipped)
+
+    @_safe
+    def record_sitemap_no_content(self, url):
+        """D120/D219: адрес из карты сайта не отдал содержимое (кандидат на испорченное
+        написание URL — снятый слеш, снятый локаль-префикс)."""
+        self.sitemap_no_content += 1

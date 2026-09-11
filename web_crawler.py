@@ -1124,9 +1124,12 @@ class SmartURLNormalizer:
             'region',
         }
         
-        # Пагинационные параметры с ограничением глубины
+        # Пагинационные параметры с ограничением глубины.
+        # D245 (Гомельобои): 'p' из списка убран — в WordPress это идентификатор записи
+        # (?p=5845 — товарный пермалинк), а не номер страницы. Считая его пагинацией,
+        # нормализатор схлопывал 637 товарных URL карты сайта в корень сайта.
         self.pagination_params = {
-            'page': 50, 'p': 50, 'paging': 50, 'offset': 100, 'start': 100
+            'page': 50, 'paging': 50, 'offset': 100, 'start': 100
         }
 
         # Кэш для ускорения нормализации - ключ: нормализованный URL
@@ -1179,16 +1182,12 @@ class SmartURLNormalizer:
             if path:
                 path = re.sub(r'^/ru(?=/|$)', '', path, flags=re.I)
             if path:
-                # Проверяем, заканчивается ли путь на число
-                if re.search(r'/\d+/?$', path):
-                    # Если URL уже имеет слеш - сохраняем его
-                    if path.endswith('/'):
-                        path = path  # оставляем как есть
-                    else:
-                        path = path + '/'  # добавляем слеш
-                else:
-                    # Для остальных URL - стандартная обработка
-                    path = path.rstrip('/')
+                # D198 (Костромской силикатный): раньше путям, кончающимся цифрами,
+                # принудительно дописывался слеш (/product/102 -> /product/102/).
+                # В роли КЛЮЧА дедупликации обе формы и так схлопываются общим rstrip('/'),
+                # а как база склейки относительных ссылок дописанный слеш давал лишний
+                # сегмент (/product/product/NNN) и 404 на всех карточках товаров.
+                path = path.rstrip('/')
             
             if not path:
                 path = '/'
@@ -1204,15 +1203,10 @@ class SmartURLNormalizer:
                 if key_lower in self.params_to_remove:
                     continue
                     
-                # Обрабатываем пагинацию
-                if key_lower in self.pagination_params:
-                    if values and values[0].isdigit():
-                        page_num = int(values[0])
-                        max_pages = self.pagination_params[key_lower]
-                        if page_num <= max_pages:
-                            filtered_params[key] = values
-                    continue
-                
+                # D245: пагинационный параметр НЕ вырезаем. Молчаливое удаление
+                # схлопывало разные страницы в один ключ, и гейт дублей гасил их все.
+                # Слишком глубокая пагинация отбраковывается вызывающим кодом целым
+                # URL (is_over_pagination_limit), а не подменой адреса.
                 filtered_params[key] = values
             
             # Сортируем параметры
@@ -1242,7 +1236,21 @@ class SmartURLNormalizer:
         except Exception as e:
             log.warning(f"Ошибка нормализации URL {url}: {e}")
             return url
-    
+
+    def is_over_pagination_limit(self, url: str) -> bool:
+        """D245: признак слишком глубокой пагинации (?page=999) — кандидат на отбраковку
+        URL ЦЕЛИКОМ. Прежде нормализатор молча вырезал такой параметр, и адрес схлопывался
+        с первой страницей листинга; теперь параметр сохраняется, а решение об отказе
+        принимает вызывающий код (постановка в очередь). Fail-open: при любой ошибке False."""
+        try:
+            for key, values in parse_qs(urlparse(url).query, keep_blank_values=True).items():
+                limit = self.pagination_params.get(key.lower())
+                if limit is not None and values and values[0].isdigit() and int(values[0]) > limit:
+                    return True
+        except Exception as e:
+            log.debug(f"is_over_pagination_limit: не удалось разобрать {url}: {e}")
+        return False
+
     def extract_canonical_url(self, soup: BeautifulSoup, current_url: str) -> str:
         """Извлечение canonical URL из HTML мета-тегов"""
         try:
@@ -1368,8 +1376,14 @@ class SiteMapParser:
             pass
         return []
     
-    async def parse_sitemap(self, sitemap_url: str, depth: int = 0, max_depth: int = 3) -> List[Tuple[str, str, int]]:
-        """Рекурсивный парсинг карты сайта с ограничением глубины"""
+    async def parse_sitemap(self, sitemap_url: str, depth: int = 0, max_depth: int = 3) -> List[Tuple[str, str, str, int]]:
+        """Рекурсивный парсинг карты сайта с ограничением глубины.
+
+        D120/D219/D198: элемент результата — четвёрка
+        (опубликованный адрес, нормализованный ключ, категория, приоритет).
+        Опубликованный адрес — ровно тот, что стоит в карте сайта; именно он уходит
+        в очередь и на фетч. Нормализованный вид остаётся ТОЛЬКО ключом дедупликации
+        (visited_urls / product_urls / гейт дублей)."""
         if depth > max_depth or sitemap_url in self._processed_sitemaps:
             return []
             
@@ -1405,7 +1419,7 @@ class SiteMapParser:
         
         return []
     
-    async def _parse_xml_sitemap(self, content: str, sitemap_url: str, depth: int, max_depth: int) -> List[Tuple[str, str, int]]:
+    async def _parse_xml_sitemap(self, content: str, sitemap_url: str, depth: int, max_depth: int) -> List[Tuple[str, str, str, int]]:
         """Парсинг XML карты сайта (включая sitemap index)"""
         try:
             soup = BeautifulSoup(content, 'xml')
@@ -1445,9 +1459,10 @@ class SiteMapParser:
                     
                     # Повышаем приоритет для URL из карты сайта
                     enhanced_priority = min(priority + 1, 10)
-                    
-                    all_urls.append((normalized_url, category, enhanced_priority))
-            
+
+                    # D120: в очередь уйдёт ОПУБЛИКОВАННЫЙ адрес, нормализованный — ключ
+                    all_urls.append((url, normalized_url, category, enhanced_priority))
+
             log.info(f"Извлечено {len(all_urls)} URL из XML карты сайта")
             return all_urls
             
@@ -1455,7 +1470,7 @@ class SiteMapParser:
             log.error(f"Ошибка парсинга XML карты сайта: {e}")
             return []
     
-    async def _parse_html_sitemap(self, content: str, sitemap_url: str) -> List[Tuple[str, str, int]]:
+    async def _parse_html_sitemap(self, content: str, sitemap_url: str) -> List[Tuple[str, str, str, int]]:
         """Парсинг HTML карты сайта"""
         try:
             soup = BeautifulSoup(content, 'html.parser')
@@ -1475,9 +1490,9 @@ class SiteMapParser:
                     
                     category, priority = self.url_categorizer.categorize_url(full_url)
                     enhanced_priority = min(priority + 1, 10)
-                    
-                    all_urls.append((normalized_url, category, enhanced_priority))
-            
+
+                    all_urls.append((full_url, normalized_url, category, enhanced_priority))
+
             log.info(f"Извлечено {len(all_urls)} URL из HTML карты сайта")
             return all_urls
             
@@ -1485,7 +1500,7 @@ class SiteMapParser:
             log.error(f"Ошибка парсинга HTML карты сайта: {e}")
             return []
     
-    async def _parse_text_sitemap(self, content: str, sitemap_url: str) -> List[Tuple[str, str, int]]:
+    async def _parse_text_sitemap(self, content: str, sitemap_url: str) -> List[Tuple[str, str, str, int]]:
         """Парсинг текстовой карты сайта"""
         try:
             all_urls = []
@@ -1504,9 +1519,9 @@ class SiteMapParser:
                     
                     category, priority = self.url_categorizer.categorize_url(full_url)
                     enhanced_priority = min(priority + 1, 10)
-                    
-                    all_urls.append((normalized_url, category, enhanced_priority))
-            
+
+                    all_urls.append((full_url, normalized_url, category, enhanced_priority))
+
             log.info(f"Извлечено {len(all_urls)} URL из текстовой карты сайта")
             return all_urls
             
@@ -2346,6 +2361,11 @@ class WebCrawler:
         self._product_text_hash_counts = {}
         self._stale_sitemap_guard_tripped = False
         self.stale_sitemap_dup_threshold = getattr(self.config, 'stale_sitemap_dup_threshold', 10)
+        # D120 п.7: опубликованные в карте сайта адреса, отличающиеся от своего
+        # нормализованного ключа: {нормализованный ключ: адрес из <loc>}. Нужны, чтобы
+        # при no_content/404 на другом написании того же ключа (напр. бесслешевом
+        # стартовом пути) повторить запрос ровно опубликованным адресом.
+        self._sitemap_published_urls = {}
         # D40: ретраи страниц, не отдавших контент (таймауты медленных сайтов):
         # {normalized_url: (url, depth, category, attempts)}
         self._page_retry_candidates = {}
@@ -2423,6 +2443,7 @@ class WebCrawler:
             self._crawled_scheme_keys.clear()
             self._product_text_hash_counts.clear()
             self._stale_sitemap_guard_tripped = False
+            self._sitemap_published_urls.clear()
             self._page_retry_candidates.clear()
 
         # Получаем все файлы компании из временного хранилища
@@ -2800,7 +2821,7 @@ class WebCrawler:
         async with self._stats_lock:
             return self.stats['total_pages']
 
-    async def _discover_and_parse_sitemap(self, site_url: str) -> List[Tuple[str, str, int]]:
+    async def _discover_and_parse_sitemap(self, site_url: str) -> List[Tuple[str, str, str, int]]:
         """Обнаружение и парсинг карты сайта"""
         if not self.config.sitemap_discovery_enabled:
             return []
@@ -2832,12 +2853,13 @@ class WebCrawler:
                     all_urls.extend(result)
             
             # Фильтруем только товарные URL и категории
+            # (элемент: опубликованный адрес, нормализованный ключ, категория, приоритет)
             filtered_urls = []
-            for url, category, priority in all_urls:
+            for url, normalized_url, category, priority in all_urls:
                 if category in ['product', 'category']:
-                    filtered_urls.append((url, category, priority))
+                    filtered_urls.append((url, normalized_url, category, priority))
                 elif priority >= 7:  # Высокоприоритетные страницы
-                    filtered_urls.append((url, category, priority))
+                    filtered_urls.append((url, normalized_url, category, priority))
             
             # Ограничиваем общее количество (профиль сайта может задать свой лимит)
             _sitemap_cap = self.config.sitemap_max_urls
@@ -2857,18 +2879,23 @@ class WebCrawler:
         
         return []
     
-    async def _add_sitemap_urls_to_queue(self, queue: deque, sitemap_urls: List[Tuple[str, str, int]], base_url: str):
-        """Добавление URL из карты сайта в очередь краулинга"""
+    async def _add_sitemap_urls_to_queue(self, queue: deque, sitemap_urls: List[Tuple[str, str, str, int]], base_url: str):
+        """Добавление URL из карты сайта в очередь краулинга.
+
+        D120/D219/D198: элемент — (опубликованный адрес, нормализованный ключ, категория,
+        приоритет). В очередь ставится ОПУБЛИКОВАННЫЙ адрес, нормализованный вид служит
+        только ключом дедупликации (visited_urls / product_urls / схемный ключ)."""
         added_count = 0
         skipped_count = 0
         skipped_subdomains = 0
-        
-        # Сортируем URL по приоритету (от высокого к низкому)
-        sitemap_urls.sort(key=lambda x: x[2], reverse=True)
+        skipped_pagination = 0
+        diverged_count = 0
+        diverged_examples = []
 
-        for url, category, priority in sitemap_urls:
-            normalized_url = self.url_normalizer.normalize_url(url)
-            
+        # Сортируем URL по приоритету (от высокого к низкому)
+        sitemap_urls.sort(key=lambda x: x[3], reverse=True)
+
+        for url, normalized_url, category, priority in sitemap_urls:
             # Проверяем основной домен
             if self.config.ignore_subdomains:
                 if self.url_categorizer.is_subdomain(url, base_url):
@@ -2884,6 +2911,13 @@ class WebCrawler:
             if self.url_categorizer.should_exclude_by_language(url):
                 log.debug(f"Пропускаем иноязычный URL из карты сайта: {url}")
                 skipped_count += 1
+                continue
+
+            # D245: слишком глубокая пагинация отбраковывается URL ЦЕЛИКОМ (раньше
+            # нормализатор молча вырезал параметр, и адрес схлопывался с листингом).
+            if self.url_normalizer.is_over_pagination_limit(url):
+                log.debug(f"Пропускаем URL глубокой пагинации из карты сайта: {url}")
+                skipped_pagination += 1
                 continue
 
             # Проверяем дублирование
@@ -2913,22 +2947,40 @@ class WebCrawler:
             # Увеличиваем приоритет URL из карты сайта
             enhanced_priority = min(priority + 3, 10)
 
-            # Добавляем в начало очереди
+            # Добавляем в начало очереди ОПУБЛИКОВАННЫЙ адрес (D120/D219/D198)
             queue.appendleft((url, 0, category, enhanced_priority))
             self.visited_urls.add(normalized_url)
             if category == 'product':
                 self.product_urls.add(normalized_url)
+            # D120 п.7: запоминаем опубликованный адрес, чтобы при no_content на ином
+            # написании того же ключа повторить запрос ровно тем адресом, что в карте
+            # (и чтобы считать долю адресов карты, не отдавших содержимое).
+            self._sitemap_published_urls[normalized_url] = url
+            if url != normalized_url:
+                diverged_count += 1
+                if len(diverged_examples) < 3:
+                    diverged_examples.append(f"{url} != {normalized_url}")
             added_count += 1
-            
+
             # Ограничиваем количество для первого прохода
             if added_count >= self.config.sitemap_initial_batch_size:
                 break
-        
+
         log.info(f"Добавлено {added_count} URL из карты сайта в начало очереди")
         if skipped_count > 0:
             log.info(f"Пропущено {skipped_count} дубликатов")
+        if skipped_pagination > 0:
+            log.info(f"Пропущено {skipped_pagination} URL глубокой пагинации из карты сайта")
         if skipped_subdomains > 0:
             log.info(f"Пропущено {skipped_subdomains} поддоменов из карты сайта")
+        if diverged_count > 0:
+            # D120 п.7б: расхождение «опубликованный адрес / нормализованный ключ» раньше
+            # было невидимым — 404 логировался как обычная сетевая ошибка.
+            log.info(f"Карта сайта: у {diverged_count} адресов опубликованный вид отличается "
+                     f"от нормализованного ключа (в очередь поставлен опубликованный); "
+                     f"примеры: {'; '.join(diverged_examples)}")
+        if self.metrics_collector is not None:
+            self.metrics_collector.record_sitemap_queue(len(sitemap_urls), skipped_count)
         return added_count
     
     async def _process_page_with_storage(self, url: str, depth: int, category: str,
@@ -2984,7 +3036,25 @@ class WebCrawler:
                 return None
 
             if not parse_result:
+                # D120 п.7а: адрес, отличающийся от опубликованного в карте сайта, мог
+                # получить 404 именно из-за написания (снятый слеш, снятый /ru). Перед
+                # отбраковкой повторяем запрос ровно опубликованным адресом; запись в
+                # кэше перманентных ошибок относилась к другому адресу — снимаем её.
+                published_url = self._sitemap_published_urls.get(normalized_url)
+                if published_url and published_url != url:
+                    log.warning(f"Нет содержимого по адресу {url}; повтор опубликованным "
+                                f"адресом карты сайта: {published_url}")
+                    async with self._errors_cache_lock:
+                        self.permanent_errors_cache.discard(normalized_url)
+                    retried = await self._fetch_page_content(published_url, category)
+                    if isinstance(retried, list):
+                        retried = retried[0] if retried else None
+                    parse_result = retried
+
+            if not parse_result:
                 log.warning(f"Не удалось получить содержимое страницы: {url}")
+                if normalized_url in self._sitemap_published_urls and self.metrics_collector is not None:
+                    self.metrics_collector.record_sitemap_no_content(url)
                 # D40: таймаутнутые целевые страницы не теряем — кладём в очередь ретраев,
                 # она обходится повторно после основного прохода
                 self._register_page_retry(url, depth, category)
@@ -3449,7 +3519,18 @@ class WebCrawler:
                 if full not in start_urls:
                     start_urls.append(full)
 
-        return [url for url in start_urls if self._is_valid_url(url)]
+        # D192/D120: жёсткие стартовые пути печатались без завершающего слеша, а часть
+        # сайтов (Bitrix со строгой маршрутизацией, Egger) отдаёт раздел только со слешем.
+        # Даём каждому пути слеш-вариант и ставим его ПЕРЕД бесслешевым: очередь дедупится
+        # по нормализованному ключу, где обе формы совпадают, поэтому обойдён будет первый —
+        # и это должна быть каноническая форма со слешем.
+        expanded_urls = []
+        for url in start_urls:
+            if url != base_url and '?' not in url and '#' not in url and not url.endswith('/'):
+                expanded_urls.append(url + '/')
+            expanded_urls.append(url)
+
+        return [url for url in expanded_urls if self._is_valid_url(url)]
 
     async def _should_skip_url(self, url: str, depth: int, company_name: str) -> bool:
         """Проверка, нужно ли пропустить URL"""
