@@ -18,6 +18,14 @@ except Exception:
     _CurlAsyncSession = None
     _CURL_CFFI_AVAILABLE = False
 
+# idna даёт перевод IDN-хоста в A-label (крышев.рф -> xn--b1afoy4br.xn--p1ai).
+# Без него остаётся встроенный кодек 'idna' (IDNA2003), а если и он не справился —
+# хост возвращается как есть (fail-open).
+try:
+    import idna as _idna
+except Exception:
+    _idna = None
+
 log = logging.getLogger("domain_equiv")
 
 # Ответ одной HTTP-пробы кандидата: status/body/final_url либо описание ошибки.
@@ -35,10 +43,30 @@ _SCRIPT_RE = re.compile(r'<script\b[^>]*>(.*?)</script>', re.I | re.S)
 _JS_REDIRECT_RE = re.compile(r'location\s*(?:\.\s*(?:replace|assign)\s*\(|\.\s*href\s*=|\s*=)', re.I)
 
 
+def to_ascii_host(host: str) -> str:
+    """A-label формы хоста: 'крышев.рф' -> 'xn--b1afoy4br.xn--p1ai' (D180).
+
+    Сравнение доменов чисто строковое, поэтому у IDN-сайта, где Site_list содержит
+    punycode, а разметка — кириллицу (или наоборот), каждая абсолютная внутренняя ссылка
+    выглядит чужим хостом. Fail-open: ASCII-хост и любая ошибка перевода возвращают
+    исходное значение."""
+    if not host or host.isascii():
+        return host
+    if _idna is not None:
+        try:
+            return _idna.encode(host, uts46=True).decode('ascii')
+        except Exception:
+            pass
+    try:
+        return host.encode('idna').decode('ascii')
+    except Exception:
+        return host
+
+
 def strip_www(host: str) -> str:
     """Срезает ТОЛЬКО ведущий www. (наивный replace('www.','') резал подстроку в любом
     месте хоста: nowww.ru -> noru)."""
-    host = (host or '').strip().lower().split(':')[0]
+    host = to_ascii_host((host or '').strip().lower().split(':')[0])
     return host[4:] if host.startswith('www.') else host
 
 
@@ -142,6 +170,9 @@ class DomainEquivalencyManager:
         # Машинный статус последнего выбора базы обхода (hoster_stub / http_only / no_host …);
         # краулер кладёт его в stats['site_status'].
         self.last_site_status = None
+        # Пер-сайтовый рычаг crawl.strict_www из профиля текущей компании (P01 U3 п.6);
+        # None = действует только config.strict_www_domains.
+        self.profile_strict_www = None
 
     def normalize_domain(self, domain: str) -> str:
         """Нормализация домена к каноническому виду"""
@@ -152,9 +183,10 @@ class DomainEquivalencyManager:
         if ':' in domain:
             domain = domain.split(':')[0]
             
-        # Приводим к нижнему регистру
-        domain = domain.lower()
-        
+        # Приводим к нижнему регистру и к A-label (D180: 'крышев.рф' и
+        # 'xn--b1afoy4br.xn--p1ai' — один домен)
+        domain = to_ascii_host(domain.lower())
+
         # Домены, отдающие контент только на www (non-www → 404): канонизируем К www,
         # а не срезаем его, иначе краулер резолвит найденные ссылки в non-www и получает 404.
         bare = domain[4:] if domain.startswith('www.') else domain
@@ -162,6 +194,8 @@ class DomainEquivalencyManager:
             (d[4:] if d.lower().startswith('www.') else d).lower()
             for d in (getattr(self.config, 'strict_www_domains', None) or [])
         }
+        if self.profile_strict_www:
+            strict_www.add(self.profile_strict_www)
         if bare in strict_www:
             return 'www.' + bare
 
@@ -172,6 +206,12 @@ class DomainEquivalencyManager:
 
         return domain
         
+    def set_profile_strict_www(self, domain: Optional[str]) -> None:
+        """P01 U3 п.6: профильное поле crawl.strict_www. Домен из профиля отдаёт контент
+        только на www — канонизируем к www без правки config (профиль прошлой компании не
+        протекает: краулер сбрасывает значение в None на каждой компании)."""
+        self.profile_strict_www = strip_www(domain) if domain else None
+
     def get_canonical_domain(self, url: str) -> str:
         """Получение канонического домена из URL"""
         try:

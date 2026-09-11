@@ -3005,6 +3005,12 @@ class WebCrawler:
         # при no_content/404 на другом написании того же ключа (напр. бесслешевом
         # стартовом пути) повторить запрос ровно опубликованным адресом.
         self._sitemap_published_urls = {}
+        # P01 U3: подтверждённая find_working_url рабочая форма хоста и схемы компании.
+        # К ней приводятся хост и схема каждой собранной ссылки ДО постановки в очередь
+        # (D87 — www-форма сохраняется, D134 — http поднимается до https, D270 — www-дубль
+        # не создаётся). Пусто = приведения нет (fail-open).
+        self._working_host = ''
+        self._working_scheme = ''
         # D40: ретраи страниц, не отдавших контент (таймауты медленных сайтов):
         # {normalized_url: (url, depth, category, attempts)}
         self._page_retry_candidates = {}
@@ -3279,6 +3285,9 @@ class WebCrawler:
         # Профиль сайта: пер-сайтовые лимиты/стратегии (mvp/profiles/<домен>.yaml).
         self._apply_site_profile(working_url)
 
+        # P01 U3: рабочая форма хоста и схемы — после профиля, чтобы учесть его strict_www.
+        self._set_working_base(working_url)
+
         # P04 U1 (D211, D260): базовая локаль обхода — языковой префикс рабочего URL
         # (или URL из Site_list). У зарубежного производителя национальная версия и
         # есть весь сайт, языковым фильтром её резать нельзя.
@@ -3336,6 +3345,8 @@ class WebCrawler:
         self.file_download_manager.download_semaphore = asyncio.Semaphore(
             getattr(self.config, 'max_concurrent_file_downloads', 5))
         self.url_categorizer.set_profile(None)
+        if self.url_categorizer.domain_equivalency is not None:
+            self.url_categorizer.domain_equivalency.set_profile_strict_www(None)
         if _get_profile_resolver is None:
             return
         try:
@@ -3347,6 +3358,11 @@ class WebCrawler:
             return
         self.profile = profile
         self.url_categorizer.set_profile(profile)
+        # P01 U3 п.6: профильное поле crawl.strict_www (объявлено в схеме, но краулером
+        # до сих пор не читалось) — домен отдаёт контент только на www.
+        if profile.crawl.strict_www and self.url_categorizer.domain_equivalency is not None:
+            self.url_categorizer.domain_equivalency.set_profile_strict_www(profile.domain)
+            log.info(f"Профиль {profile.domain}: strict_www — хост канонизируется к www")
         limits, load = profile.crawl.limits, profile.crawl.load
         if limits.pages:
             self.max_pages_per_site = limits.pages
@@ -3388,6 +3404,59 @@ class WebCrawler:
             log.warning(f"Ошибка поиска рабочего URL для {url}: {e}")
             return url
     
+    def _set_working_base(self, working_url: str) -> None:
+        """P01 U3 п.2: запоминает рабочую форму хоста и схемы, подтверждённую
+        find_working_url. Хост берётся ДОСЛОВНО (нормализатор срезал бы www и вернул
+        ровно тот дефект D87, из-за которого ссылки уходили на non-www); исключение —
+        домены strict_www, для которых рабочей формой объявлена www."""
+        self._working_host = ''
+        self._working_scheme = ''
+        parsed = urlparse(working_url or '')
+        host = (parsed.netloc or '').lower()
+        if not host or parsed.scheme not in ('http', 'https'):
+            return
+        de = getattr(self.url_categorizer, 'domain_equivalency', None)
+        if de is not None:
+            forced = de.normalize_domain(host)
+            if forced.startswith('www.') and not host.startswith('www.'):
+                host = forced
+        self._working_host = host
+        self._working_scheme = parsed.scheme
+        log.info(f"Рабочая форма базы обхода: {self._working_scheme}://{self._working_host}")
+
+    def _canonicalize_to_working_base(self, url: str) -> str:
+        """P01 U3 п.2: приводит хост и схему ссылки к рабочей форме компании. Путь,
+        параметры и фрагмент не трогаются.
+
+        Приводится ТОЛЬКО ссылка на тот же хост в другой форме (апекс/www/мобильное
+        зеркало): www-дубль не создаётся (D270), www-форма не теряется (D87), http
+        поднимается до подтверждённой https (D134). Домены группы холдинга
+        (config.equivalent_domains) и прочие хосты остаются как есть — иначе сломается
+        переход между доменами группы. Fail-open: при любой ошибке возвращается исходный URL."""
+        if not self._working_host or not url:
+            return url
+        try:
+            parsed = urlparse(url)
+            netloc = (parsed.netloc or '').lower()
+            if parsed.scheme not in ('http', 'https') or not netloc or ':' in netloc:
+                # нестандартная схема или явный порт — вмешиваться не во что
+                return url
+            if netloc == self._working_host and parsed.scheme == self._working_scheme:
+                return url
+            if not hosts_equivalent(netloc, self._working_host):
+                return url
+            return urlunparse((self._working_scheme, self._working_host, parsed.path,
+                               parsed.params, parsed.query, parsed.fragment))
+        except Exception as e:
+            log.debug(f"Не удалось привести {url} к рабочей базе: {e}")
+            return url
+
+    def _log_effective_url(self, requested: str, final_url: Optional[str]) -> None:
+        """P01 U3 п.5: в логе виден реально запрошенный адрес и конечный после редиректов
+        (переписывание пути на www-зеркале не было видно вовсе — D270)."""
+        if final_url and final_url != requested:
+            log.info(f"Запрошен {requested} -> конечный URL после редиректов: {final_url}")
+
     async def _start_crawling_with_storage(self, site_url: str, company_name: str, 
                                          domain_dirs: Dict[str, str], stored_pages: List[Dict]):
         """Запуск процесса краулинга с сохранением в временное хранилище"""              
@@ -3740,6 +3809,14 @@ class WebCrawler:
         block = []
 
         for url, normalized_url, category, priority in sitemap_urls:
+            # P01 U3: хост и схема адреса карты приводятся к рабочей форме компании; путь
+            # остаётся опубликованным (D120). Ключ дедупа пересчитывается по новому адресу,
+            # иначе схема ключа разойдётся с тем, что реально запрашивается.
+            canonical_url = self._canonicalize_to_working_base(url)
+            if canonical_url != url:
+                url = canonical_url
+                normalized_url = self.url_normalizer.normalize_url(url)
+
             # Проверяем основной домен
             if self.config.ignore_subdomains:
                 if self.url_categorizer.is_subdomain(url, base_url):
@@ -4441,8 +4518,11 @@ class WebCrawler:
             if not self.url_categorizer.is_main_domain(url, self.current_base_url):
                 if self.config.log_skipped_subdomains:
                     log.info(f"Пропускаем неэквивалентный домен: {url} (основной: {self.current_base_url})")
-                return True 
-           
+                # P01 U3 п.4: адрес уже занял слот товарной квоты при постановке в очередь —
+                # на отбраковке чужого хоста слот возвращается (хвост P02 U1).
+                await self._release_product_quota_slot(normalized_url, 'чужой домен')
+                return True
+
         # Проверяем посещенные URL
         async with self._urls_lock:
             if normalized_url in self.processed_urls:
@@ -4702,6 +4782,7 @@ class WebCrawler:
                     return aiohttp_parsed
                 if content:
                     effective_url = final_url if final_url and final_url != url else url
+                    self._log_effective_url(url, final_url)
                     # Проверяем, что конечный домен эквивалентен базовому
                     if final_url and final_url != url:
                         if not self.url_categorizer.is_main_domain(final_url, self.current_base_url):
@@ -4729,6 +4810,7 @@ class WebCrawler:
                     if res and not res.from_cache_error and res.status == 200 and res.html:
                         ok_domain = True
                         if res.final_url and res.final_url != url:
+                            self._log_effective_url(url, res.final_url)
                             ok_domain = self.url_categorizer.is_main_domain(res.final_url, self.current_base_url)
                         if ok_domain:
                             self._census_fetch(url, category, 'http_first')
@@ -4742,6 +4824,7 @@ class WebCrawler:
                 if result is not None:
                     content, _, final_url = result
                     if content:
+                        self._log_effective_url(url, final_url)
                         # Сверка хоста после навигации, как в товарной ветке: JS-редиректор
                         # уводил браузер на чужой сайт, и тот сохранялся под адресом
                         # компании — вплоть до карточки чужой организации (D238).
@@ -5540,6 +5623,12 @@ class WebCrawler:
             if category == 'product' and self.url_categorizer.is_print_version(link_url, category):
                 log.debug(f"Пропускаем ссылку на печатную версию: {link_url}")
                 continue
+            # P01 U3: хост и схема ссылки приводятся к подтверждённой рабочей форме ДО
+            # всех гейтов и до нормализации (D87 www, D134 http->https, D270 www-дубль).
+            canonical_link = self._canonicalize_to_working_base(link_url)
+            if canonical_link != link_url:
+                log.debug(f"Ссылка приведена к рабочей базе: {link_url} -> {canonical_link}")
+                link_url = canonical_link
             try:
                 # Проверяем основной домен (фильтруем поддомены и неэквивалентные)
                 if self.config.ignore_subdomains:

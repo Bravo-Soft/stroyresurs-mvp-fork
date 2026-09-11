@@ -19,8 +19,28 @@ logger = logging.getLogger(__name__)
 DEFAULT_PROFILES_DIR = Path(__file__).resolve().parents[1] / 'profiles'
 
 
+def _to_ascii_host(host: str) -> str:
+    """A-label формы хоста ('крышев.рф' -> 'xn--b1afoy4br.xn--p1ai'), fail-open.
+
+    Дубликат to_ascii_host из domain_equivalency: пакет site_profiles намеренно не
+    зависит от модулей краулера (его резолвер тянет и text_extractor)."""
+    if not host or host.isascii():
+        return host
+    try:
+        import idna
+        return idna.encode(host, uts46=True).decode('ascii')
+    except Exception:
+        pass
+    try:
+        return host.encode('idna').decode('ascii')
+    except Exception:
+        return host
+
+
 def normalize_domain(url_or_host: str) -> str:
-    """Канонический домен: netloc без www, нижний регистр. Принимает URL или голый хост."""
+    """Канонический домен: netloc без www, нижний регистр, A-label. Принимает URL или
+    голый хост. D180: профиль IDN-сайта должен резолвиться и по кириллической форме
+    хоста, и по punycode."""
     if not url_or_host:
         return ''
     s = url_or_host.strip().lower()
@@ -31,7 +51,7 @@ def normalize_domain(url_or_host: str) -> str:
         s = s.lstrip('/').split('/', 1)[0]
     if s.startswith('www.'):
         s = s[4:]
-    return s.split(':', 1)[0]
+    return _to_ascii_host(s.split(':', 1)[0])
 
 
 class ProfileResolver:
