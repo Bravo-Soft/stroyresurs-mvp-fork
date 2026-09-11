@@ -110,6 +110,32 @@ IMPERSONATE_HEADERS = {
     "Cache-Control": "max-age=0",
 }
 
+# D233: в ПУТЬ ссылки вклеен ещё один абсолютный адрес («…/catalog/https:/example.ru/x»);
+# встречается и с одним слешем после схемы. В query такое легально (редиректоры,
+# share-ссылки), поэтому эвристика применяется только к пути.
+_GLUED_URL_IN_PATH_RE = re.compile(r'(https?:)/{1,3}', re.I)
+
+
+def sanitize_href(href: str) -> str:
+    """D257/D233: приводит значение атрибута href к пригодному для склейки виду —
+    срезает пробельные края и чинит адрес с вклеенным в ПУТЬ абсолютным URL.
+    Возвращает исходное значение, если чинить нечего."""
+    cleaned = (href or '').strip()
+    if not cleaned:
+        return cleaned
+    cut = len(cleaned)
+    for separator in ('?', '#'):
+        position = cleaned.find(separator)
+        if position != -1:
+            cut = min(cut, position)
+    path_part, tail = cleaned[:cut], cleaned[cut:]
+    matches = list(_GLUED_URL_IN_PATH_RE.finditer(path_part))
+    if not matches or matches[-1].start() == 0:
+        return cleaned
+    last = matches[-1]
+    return f"{last.group(1).lower()}//{path_part[last.end():].lstrip('/')}{tail}"
+
+
 @dataclass
 class ParseResult:
     soup: BeautifulSoup
@@ -1143,6 +1169,10 @@ class SmartURLNormalizer:
         if not url:
             return url
 
+        # D257 (Пластруб): хвостовой пробел в href доезжал до запроса и давал 403 —
+        # сервер видел адрес с '%20' на конце. Ключ дедупликации тоже расходился.
+        url = url.strip()
+
         # D98 (АэроБел): где-то в пайплайне html.unescape декодирует «&region» в URL как
         # legacy-сущность &reg; → «®ion» (®=U+00AE, %C2%AE). Сайт таких URL НЕ отдаёт —
         # это мусор регионального фасета, плодящий бесконечное пространство ссылок
@@ -1462,7 +1492,7 @@ class SiteMapParser:
                         
                         for link in soup.find_all('a', href=True):
                             link_text = link.get_text().lower()
-                            href = link['href']
+                            href = sanitize_href(link['href'])  # D257
                             
                             # Проверка по тексту ссылки
                             if any(keyword in link_text for keyword in sitemap_keywords):
@@ -1539,6 +1569,24 @@ class SiteMapParser:
             log.warning(f"Не удалось прочитать тело карты сайта {sitemap_url}: {e}")
             return None
 
+    @staticmethod
+    def _repair_loc(loc: str, sitemap_url: str) -> Optional[str]:
+        """D151: восстанавливает адрес <loc> без хоста по адресу самой карты сайта.
+        Bitrix с пустым SERVER_NAME пишет 'https:///catalog/x/', а часть генераторов —
+        просто '/catalog/x/'; и то и другое даёт пустой netloc, проходит гейт поддоменов
+        и занимает товарную квоту, а гасится молча уже после постановки в очередь.
+        None — адрес неисправим."""
+        try:
+            parsed = urlparse(loc)
+            if parsed.netloc:
+                return loc
+            if not parsed.path:
+                return None
+            return urljoin(sitemap_url, urlunparse(('', '', parsed.path, parsed.params,
+                                                    parsed.query, '')))
+        except Exception:
+            return None
+
     def _submap_rank(self, loc: str):
         """D154: при ограничении числа подкарт индекса первыми разбираются товарные
         (Bitrix нумерует карты по id инфоблока, товарный часто заводится последним)."""
@@ -1585,10 +1633,17 @@ class SiteMapParser:
             # товарные карточки из хвоста карты не попадали в обход вовсе.
             url_tags = soup.find_all('url')
             scanned_tags = url_tags[:self.config.sitemap_max_scan_urls]
+            broken_locs = 0
             for url_tag in scanned_tags:
                 loc_tag = url_tag.find('loc')
                 if loc_tag and loc_tag.text:
                     url = loc_tag.text.strip()
+                    # D151: <loc> без хоста чиним по адресу самой карты ДО категоризации
+                    # и до постановки в очередь; неисправимые отбрасываем
+                    url = self._repair_loc(url, sitemap_url)
+                    if not url:
+                        broken_locs += 1
+                        continue
                     normalized_url = self.url_normalizer.normalize_url(url)
 
                     # Пропускаем URL с не-русскими языковыми префиксами
@@ -1605,6 +1660,9 @@ class SiteMapParser:
                     # D120: в очередь уйдёт ОПУБЛИКОВАННЫЙ адрес, нормализованный — ключ
                     all_urls.append((url, normalized_url, category, enhanced_priority))
 
+            if broken_locs:
+                log.warning(f"Карта сайта {sitemap_url}: отброшено {broken_locs} "
+                            f"неисправимых <loc> (пустой путь)")
             if len(url_tags) > len(scanned_tags):
                 log.warning(f"Карта сайта {sitemap_url}: {len(url_tags)} адресов, "
                             f"просканировано {len(scanned_tags)} (потолок sitemap_max_scan_urls)")
@@ -1630,7 +1688,7 @@ class SiteMapParser:
             
             # Ищем все ссылки в HTML
             for link in soup.find_all('a', href=True)[:self.config.sitemap_max_urls]:
-                href = link['href']
+                href = sanitize_href(link['href'])  # D257/D233
                 if href and not href.startswith(('#', 'javascript:', 'mailto:')):
                     full_url = urljoin(base_domain, href)
 
@@ -1735,7 +1793,7 @@ class ProductGridParser:
         
         # Ищем все ссылки внутри элемента сетки
         for link in element.find_all('a', href=True):
-            href = link['href']
+            href = sanitize_href(link['href'])  # D257/D233
             if not href or href.startswith(('#', 'javascript:')):
                 continue
                 
@@ -3739,7 +3797,7 @@ class WebCrawler:
                                  'паспорт', 'сертификат', 'certificate', 'manual', 'Документация', 'сертификаты']
 
             for link in soup.find_all('a', href=True):
-                href = link['href']
+                href = sanitize_href(link['href'])  # D257/D233
                 link_text = link.get_text().lower()
                 
                 if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
@@ -3769,7 +3827,7 @@ class WebCrawler:
             for element in download_elements:
                 parent_link = element.find_parent('a', href=True)
                 if parent_link and parent_link['href']:
-                    href = parent_link['href']
+                    href = sanitize_href(parent_link['href'])  # D257/D233
                     normalized_url = self._normalize_file_url(href, url)
                     
                     # Проверяем основной домен
@@ -3782,7 +3840,7 @@ class WebCrawler:
 
             # Ищем все ссылки на файлы по расширениям
             for link in soup.find_all('a', href=True):
-                href = link['href']
+                href = sanitize_href(link['href'])  # D257/D233
                 if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
                     continue
                 
@@ -4934,10 +4992,21 @@ class WebCrawler:
 
             # Извлекаем все ссылки со страницы
             for link in soup.find_all('a', href=True):
-                href = link['href']
+                raw_href = link['href']
+                # D257/D233: чиним href ДО склейки — пробельные края (403 на «испорченном
+                # адресе», а не «доступ запрещён») и вклеенный в путь абсолютный URL
+                # (иначе глубина считается по мангленному пути и шлюз очереди выбрасывает
+                # всю навигацию сайта).
+                href = sanitize_href(raw_href)
+                if self.metrics_collector is not None and href != raw_href:
+                    kind = 'whitespace' if href == raw_href.strip() else 'glued'
+                    log.debug(f"Исправлен href ({kind}): {raw_href!r} -> {href!r} на {current_url}")
+                    self.metrics_collector.record_mangled_href(kind)
+                if self.metrics_collector is not None:
+                    self.metrics_collector.record_href_seen()
                 if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
                     continue
-                    
+
                 full_url = urljoin(current_url, href)
 
                 # Нормализуем URL с сохранением протокола текущей страницы
