@@ -12,6 +12,7 @@ import traceback
 import aiofiles
 from urllib.parse import urlparse
 from config import Config
+from domain_equivalency import normalize_site_url, same_registrable_domain
 from web_crawler import WebCrawler  
 from ai_integration import AITunnelClient
 from docx_generator import DOCXGenerator
@@ -528,10 +529,18 @@ class MonitoringSystem:
 
                     safe_name = sanitize_company_name(original_name)
                     
+                    # Адрес из Site_list приводим к виду scheme://host (D147: «www.berghome.ru»
+                    # без схемы давала пустой хост и обход «https://»); без хоста краулить нечего.
+                    website = normalize_site_url(row['Website'])
+                    if not website:
+                        log.error(f"Адрес компании «{original_name}» не содержит хоста "
+                                  f"({row['Website']!r}) — компания пропущена, краул невозможен")
+                        continue
+
                     companies.append({
                         'original_name': original_name,
                         'safe_name': safe_name,
-                        'website': row['Website'],
+                        'website': website,
                         'folder_name': safe_name,
                         'company_id': manufacturer_id,
                         'generated_company_id': f"company_{len(companies)}"
@@ -1995,12 +2004,18 @@ class MonitoringSystem:
                 original_website = company_data['website']
                 
                 if working_url and working_url != original_website:
-                    # Сохраняем оригинальный URL для отслеживания
-                    company_data['original_website'] = original_website
-                    # Обновляем website на рабочий URL
-                    company_data['website'] = working_url
-                    log.info(f"Обновлен website компании: {company_data['original_name']} "
-                            f"с {original_website} на {working_url}")
+                    if not same_registrable_domain(working_url, original_website):
+                        # Рабочий URL уехал на чужой registrable-домен (парковка хостера,
+                        # редиректор): в карточку компании такой адрес не пишем (D167).
+                        log.warning(f"Рабочий URL {working_url} на чужом домене — website компании "
+                                    f"{company_data['original_name']} оставлен прежним: {original_website}")
+                    else:
+                        # Сохраняем оригинальный URL для отслеживания
+                        company_data['original_website'] = original_website
+                        # Обновляем website на рабочий URL
+                        company_data['website'] = working_url
+                        log.info(f"Обновлен website компании: {company_data['original_name']} "
+                                f"с {original_website} на {working_url}")
                 else:
                     log.info(f"Website компании остался без изменений: {original_website}")
 
