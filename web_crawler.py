@@ -34,7 +34,8 @@ except Exception:
 from config import Config
 from product_utils import sanitize_filename
 from temp_storage_manager import TempStorageManager
-from domain_equivalency import DomainEquivalencyManager, hosts_equivalent
+from domain_equivalency import (DomainEquivalencyManager, hosts_equivalent,
+                                same_registrable_domain)
 from data_island import (needs_javascript, has_product_island, is_unrendered_store_listing,
                          looks_like_product_shell)
 
@@ -968,8 +969,9 @@ class URLCategorizer:
                 if normalized_url_domain == normalized_base_domain:
                     return False
                 
-                # Проверяем, является ли поддоменом
-                return url_domain.endswith('.' + normalized_base_domain)
+                # Проверяем, является ли поддоменом (D180: сравниваем A-label формы,
+                # иначе поддомен IDN-сайта не распознаётся)
+                return normalized_url_domain.endswith('.' + normalized_base_domain)
             
         except Exception:
             return False
@@ -3005,6 +3007,18 @@ class WebCrawler:
         # при no_content/404 на другом написании того же ключа (напр. бесслешевом
         # стартовом пути) повторить запрос ровно опубликованным адресом.
         self._sitemap_published_urls = {}
+        # P01 U3: подтверждённая find_working_url рабочая форма хоста и схемы компании.
+        # К ней приводятся хост и схема каждой собранной ссылки ДО постановки в очередь
+        # (D87 — www-форма сохраняется, D134 — http поднимается до https, D270 — www-дубль
+        # не создаётся). Пусто = приведения нет (fail-open).
+        self._working_host = ''
+        self._working_scheme = ''
+        # P05 U3: пер-компанийный allowlist хостов сверх домена компании — поддомены-носители
+        # каталога (D131) и подтверждённое зеркало на внешнем хосте (D124). Наследуют бюджет
+        # страниц компании, без транзитивности (разрешённый хост сам никого не разрешает).
+        self._allowed_hosts = set()
+        self._skipped_link_hosts = {}      # отброшено гейтом периметра: хост -> счётчик
+        self._mirror_autodetect_done = False
         # D40: ретраи страниц, не отдавших контент (таймауты медленных сайтов):
         # {normalized_url: (url, depth, category, attempts)}
         self._page_retry_candidates = {}
@@ -3135,6 +3149,10 @@ class WebCrawler:
             self._queue_gate_rejections.clear()
             self._sitemap_hard_fail_streak = 0
             self._page_retry_candidates.clear()
+            # P05 U3: периметр обхода пер-компанийный
+            self._allowed_hosts.clear()
+            self._skipped_link_hosts.clear()
+            self._mirror_autodetect_done = False
 
         # Получаем все файлы компании из временного хранилища
         company_files = await self.temp_storage.get_company_files(company_name)
@@ -3270,14 +3288,25 @@ class WebCrawler:
         """Основной метод краулинга сайта с сохранением в временное хранилище"""
         log.info(f"Начинаем краулинг сайта: {site_url} для компании: {company_name}")
         
+        # Профиль сайта: пер-сайтовые лимиты/стратегии (mvp/profiles/<домен>.yaml).
+        # P05 U3 п.1: применяется ДО выбора рабочего URL и резолвится по исходному адресу
+        # компании — его crawl.equivalent_domains / subdomain_collapse / strict_www должны
+        # влиять на выбор базы обхода, а не только на то, что делать после.
+        self._apply_site_profile(site_url)
+
         # Определяем рабочий URL с учетом эквивалентности доменов
         working_url = await self._get_working_url(site_url)
 
         # Сохраняем базовый URL для проверки поддоменов
         self.current_base_url = working_url
 
-        # Профиль сайта: пер-сайтовые лимиты/стратегии (mvp/profiles/<домен>.yaml).
-        self._apply_site_profile(working_url)
+        # База уехала на другой домен (алиас/зеркало) — профиль перечитывается по нему
+        if self.url_categorizer.extract_main_domain(urlparse(working_url).netloc) != \
+                self.url_categorizer.extract_main_domain(urlparse(site_url).netloc):
+            self._apply_site_profile(working_url)
+
+        # P01 U3: рабочая форма хоста и схемы — после профиля, чтобы учесть его strict_www.
+        self._set_working_base(working_url)
 
         # P04 U1 (D211, D260): базовая локаль обхода — языковой префикс рабочего URL
         # (или URL из Site_list). У зарубежного производителя национальная версия и
@@ -3336,6 +3365,9 @@ class WebCrawler:
         self.file_download_manager.download_semaphore = asyncio.Semaphore(
             getattr(self.config, 'max_concurrent_file_downloads', 5))
         self.url_categorizer.set_profile(None)
+        if self.url_categorizer.domain_equivalency is not None:
+            self.url_categorizer.domain_equivalency.set_profile_strict_www(None)
+            self.url_categorizer.domain_equivalency.set_profile_domains(None)
         if _get_profile_resolver is None:
             return
         try:
@@ -3347,6 +3379,22 @@ class WebCrawler:
             return
         self.profile = profile
         self.url_categorizer.set_profile(profile)
+        # P01 U3 п.6: профильное поле crawl.strict_www (объявлено в схеме, но краулером
+        # до сих пор не читалось) — домен отдаёт контент только на www.
+        if profile.crawl.strict_www and self.url_categorizer.domain_equivalency is not None:
+            self.url_categorizer.domain_equivalency.set_profile_strict_www(profile.domain)
+            log.info(f"Профиль {profile.domain}: strict_www — хост канонизируется к www")
+        # P05 U3 п.1: периметр обхода из профиля — зеркала и бренд-домены группы
+        # (crawl.equivalent_domains) и поддомены (crawl.subdomain_collapse). До сих пор эти
+        # поля влияли только на выбор профиля, а гейт периметра их не видел.
+        if self.url_categorizer.domain_equivalency is not None and (
+                profile.crawl.equivalent_domains or profile.crawl.subdomain_collapse):
+            self.url_categorizer.domain_equivalency.set_profile_domains(
+                profile.domain, profile.crawl.equivalent_domains,
+                profile.crawl.subdomain_collapse)
+            log.info(f"Профиль {profile.domain}: периметр обхода расширен на "
+                     f"{profile.crawl.equivalent_domains or []} "
+                     f"{profile.crawl.subdomain_collapse or []}")
         limits, load = profile.crawl.limits, profile.crawl.load
         if limits.pages:
             self.max_pages_per_site = limits.pages
@@ -3388,6 +3436,171 @@ class WebCrawler:
             log.warning(f"Ошибка поиска рабочего URL для {url}: {e}")
             return url
     
+    def _set_working_base(self, working_url: str) -> None:
+        """P01 U3 п.2: запоминает рабочую форму хоста и схемы, подтверждённую
+        find_working_url. Хост берётся ДОСЛОВНО (нормализатор срезал бы www и вернул
+        ровно тот дефект D87, из-за которого ссылки уходили на non-www); исключение —
+        домены strict_www, для которых рабочей формой объявлена www."""
+        self._working_host = ''
+        self._working_scheme = ''
+        parsed = urlparse(working_url or '')
+        host = (parsed.netloc or '').lower()
+        if not host or parsed.scheme not in ('http', 'https'):
+            return
+        de = getattr(self.url_categorizer, 'domain_equivalency', None)
+        if de is not None:
+            forced = de.normalize_domain(host)
+            if forced.startswith('www.') and not host.startswith('www.'):
+                host = forced
+        self._working_host = host
+        self._working_scheme = parsed.scheme
+        log.info(f"Рабочая форма базы обхода: {self._working_scheme}://{self._working_host}")
+
+    def _canonicalize_to_working_base(self, url: str) -> str:
+        """P01 U3 п.2: приводит хост и схему ссылки к рабочей форме компании. Путь,
+        параметры и фрагмент не трогаются.
+
+        Приводится ТОЛЬКО ссылка на тот же хост в другой форме (апекс/www/мобильное
+        зеркало): www-дубль не создаётся (D270), www-форма не теряется (D87), http
+        поднимается до подтверждённой https (D134). Домены группы холдинга
+        (config.equivalent_domains) и прочие хосты остаются как есть — иначе сломается
+        переход между доменами группы. Fail-open: при любой ошибке возвращается исходный URL."""
+        if not self._working_host or not url:
+            return url
+        try:
+            parsed = urlparse(url)
+            netloc = (parsed.netloc or '').lower()
+            if parsed.scheme not in ('http', 'https') or not netloc or ':' in netloc:
+                # нестандартная схема или явный порт — вмешиваться не во что
+                return url
+            if netloc == self._working_host and parsed.scheme == self._working_scheme:
+                return url
+            if not hosts_equivalent(netloc, self._working_host):
+                return url
+            return urlunparse((self._working_scheme, self._working_host, parsed.path,
+                               parsed.params, parsed.query, parsed.fragment))
+        except Exception as e:
+            log.debug(f"Не удалось привести {url} к рабочей базе: {e}")
+            return url
+
+    @staticmethod
+    def _url_host(url: str) -> str:
+        """Хост адреса в нижнем регистре, без порта."""
+        try:
+            return (urlparse(url).netloc or '').lower().split(':')[0]
+        except Exception:
+            return ''
+
+    def _in_crawl_perimeter(self, url: str, base_url: str) -> bool:
+        """P05 U3: периметр обхода — домен компании (в т.ч. www/мобильное зеркало, группа
+        config.equivalent_domains и периметр профиля) ИЛИ хост, разрешённый для этой
+        компании (поддомен-носитель каталога, подтверждённое зеркало)."""
+        if self.url_categorizer.is_main_domain(url, base_url):
+            return True
+        return self._url_host(url) in self._allowed_hosts
+
+    # Служебные поддомены: носителем каталога не бывают, а потолок разрешённых поддоменов
+    # выбирают первыми (живая проба gexa.ru: partner./tender. занимали оба слота, а
+    # продуктовый isospan.gexa.ru оставался за периметром).
+    _NON_CATALOG_SUBDOMAINS = frozenset({
+        'partner', 'partners', 'tender', 'tenders', 'sb', 'lk', 'my', 'cabinet',
+        'hr', 'job', 'jobs', 'career', 'vacancy', 'mail', 'webmail', 'smtp', 'ftp',
+        'cdn', 'static', 'img', 'images', 'media', 'blog', 'news', 'forum',
+        'support', 'help', 'status', 'test', 'dev', 'stage', 'beta',
+    })
+
+    def _maybe_allow_subdomain(self, url: str, category: str, depth: int, base_url: str) -> bool:
+        """P05 U3 п.2: поддомен ТОГО ЖЕ корневого домена как носитель каталога
+        (flowsolutions.plasson.com, isospan.gexa.ru — D131).
+
+        Условие из досье: ссылка стоит в навигации главной (глубина 0) ЛИБО URL
+        категоризуется как каталожный/товарный. Потолок config.max_allowed_subdomains
+        (0 = прежнее поведение); разрешённый хост наследует бюджет страниц компании и сам
+        никого не разрешает (без транзитивности)."""
+        limit = getattr(self.config, 'max_allowed_subdomains', 2)
+        host = self._url_host(url)
+        if limit <= 0 or not host:
+            return False
+        if not same_registrable_domain(url, base_url):
+            return False
+        if depth != 0 and category not in ('product', 'category'):
+            return False
+        if (host.split('.')[0] in self._NON_CATALOG_SUBDOMAINS
+                and category not in ('product', 'category')):
+            log.debug(f"Поддомен {host} не разрешён: служебный, не носитель каталога")
+            return False
+        if len(self._allowed_hosts) >= limit:
+            log.debug(f"Поддомен {host} не разрешён: потолок {limit} уже выбран "
+                      f"({', '.join(sorted(self._allowed_hosts))})")
+            return False
+        self._allowed_hosts.add(host)
+        log.info(f"Разрешён поддомен {host} как носитель каталога "
+                 f"(роль ссылки: {category}, глубина страницы: {depth}); "
+                 f"бюджет страниц общий с компанией [{len(self._allowed_hosts)}/{limit}]")
+        return True
+
+    async def _maybe_autodetect_mirror_host(self, parse_result: ParseResult, depth: int,
+                                            skipped_hosts: dict, skipped_examples: dict,
+                                            product_links: int) -> bool:
+        """P05 U3 пп.3,5: автодетект «внешний хост отдаёт тот же сайт» (навигация на
+        техдомене хостера — D124). За флагом config.foreign_host_autodetect, по умолчанию
+        ВЫКЛЮЧЕН: ошибочно разрешённый внешний хост означает обход чужого сайта (D114/D167).
+
+        Срабатывает один раз за компанию, только на главной, только если товарных ссылок на
+        ней не осталось, и только для хоста, подтверждённого совпадением title/canonical
+        главной. Возвращает True, если хост разрешён (ссылки надо перебрать заново)."""
+        if (not getattr(self.config, 'foreign_host_autodetect', False)
+                or self._mirror_autodetect_done or depth != 0 or product_links
+                or self._allowed_hosts or not skipped_hosts):
+            return False
+        self._mirror_autodetect_done = True
+        min_links = getattr(self.config, 'foreign_host_min_links', 5)
+        host, count = max(skipped_hosts.items(), key=lambda item: item[1])
+        if count < min_links:
+            return False
+        de = getattr(self.url_categorizer, 'domain_equivalency', None)
+        if de is None:
+            return False
+        own_title = self._page_title(parse_result.soup)
+        example = skipped_examples.get(host) or f'https://{host}/'
+        candidate_root = f"{urlparse(example).scheme or 'https'}://{host}/"
+        try:
+            body = await de.fetch_page_body(candidate_root)
+        except Exception as e:
+            log.warning(f"Автодетект зеркала: {candidate_root} не опрошен ({e})")
+            return False
+        if not body:
+            return False
+        soup = BeautifulSoup(body, 'html.parser')
+        canonical = self.url_normalizer.extract_canonical_url(soup, candidate_root)
+        same_canonical = bool(canonical) and self.url_categorizer.is_main_domain(
+            canonical, self.current_base_url)
+        same_title = bool(own_title) and self._page_title(soup) == own_title
+        if not (same_title or same_canonical):
+            log.info(f"Автодетект зеркала: {host} ({count} ссылок) не подтверждён "
+                     f"(title/canonical главной не совпали) — хост остаётся чужим")
+            return False
+        self._allowed_hosts.add(host)
+        log.warning(f"Разрешён внешний хост {host}: {count} ссылок главной, подтверждение — "
+                    f"{'title' if same_title else 'canonical'} главной; бюджет страниц общий "
+                    f"с компанией, дальше периметр не расширяется")
+        return True
+
+    @staticmethod
+    def _page_title(soup: BeautifulSoup) -> str:
+        """Заголовок страницы в сравнимом виде (пробелы схлопнуты, нижний регистр)."""
+        try:
+            title = soup.title.get_text(strip=True) if soup and soup.title else ''
+        except Exception:
+            return ''
+        return re.sub(r'\s+', ' ', title).strip().lower()
+
+    def _log_effective_url(self, requested: str, final_url: Optional[str]) -> None:
+        """P01 U3 п.5: в логе виден реально запрошенный адрес и конечный после редиректов
+        (переписывание пути на www-зеркале не было видно вовсе — D270)."""
+        if final_url and final_url != requested:
+            log.info(f"Запрошен {requested} -> конечный URL после редиректов: {final_url}")
+
     async def _start_crawling_with_storage(self, site_url: str, company_name: str, 
                                          domain_dirs: Dict[str, str], stored_pages: List[Dict]):
         """Запуск процесса краулинга с сохранением в временное хранилище"""              
@@ -3516,6 +3729,14 @@ class WebCrawler:
         if self._product_quota_reused:
             log.info(f"Слотов товарной квоты возвращено: {self._product_quota_reused} "
                      f"(потолок {self.product_quota_reuse_limit})")
+        # P05 U3 п.6: без разреза по хостам класс «каталог на другом домене» не виден
+        if self._skipped_link_hosts:
+            top = sorted(self._skipped_link_hosts.items(), key=lambda item: item[1], reverse=True)
+            log.info(f"Отброшено гейтом периметра ссылок: {sum(self._skipped_link_hosts.values())}; "
+                     f"чаще всего — {', '.join(f'{host}: {count}' for host, count in top[:5])}")
+        if self._allowed_hosts:
+            log.info(f"Хосты сверх домена компании в периметре: "
+                     f"{', '.join(sorted(self._allowed_hosts))}")
         await self._second_pass_for_quota_rejected(company_name, domain_dirs, stored_pages, queue)
 
     async def _second_pass_for_quota_rejected(self, company_name: str, domain_dirs: Dict[str, str],
@@ -3746,9 +3967,20 @@ class WebCrawler:
         block = []
 
         for url, normalized_url, category, priority in sitemap_urls:
-            # Проверяем основной домен
+            # P01 U3: хост и схема адреса карты приводятся к рабочей форме компании; путь
+            # остаётся опубликованным (D120). Ключ дедупа пересчитывается по новому адресу,
+            # иначе схема ключа разойдётся с тем, что реально запрашивается.
+            canonical_url = self._canonicalize_to_working_base(url)
+            if canonical_url != url:
+                url = canonical_url
+                normalized_url = self.url_normalizer.normalize_url(url)
+
+            # Проверяем основной домен. P05 U3: фильтр карты сайта (is_subdomain) и гейт
+            # очереди (is_main_domain) должны решать согласованно, иначе разрешённый
+            # поддомен-носитель каталога добавлялся бы и тут же отбрасывался.
             if self.config.ignore_subdomains:
-                if self.url_categorizer.is_subdomain(url, base_url):
+                if (self.url_categorizer.is_subdomain(url, base_url)
+                        and not self._in_crawl_perimeter(url, base_url)):
                     if self.config.log_skipped_subdomains:
                         log.info(f"Пропускаем поддомен из карты сайта: {url}")
                     skipped_subdomains += 1
@@ -4462,11 +4694,14 @@ class WebCrawler:
         
         # Проверяем основной домен (фильтруем поддомены)
         if self.config.ignore_subdomains:
-            if not self.url_categorizer.is_main_domain(url, self.current_base_url):
+            if not self._in_crawl_perimeter(url, self.current_base_url):
                 if self.config.log_skipped_subdomains:
                     log.info(f"Пропускаем неэквивалентный домен: {url} (основной: {self.current_base_url})")
-                return True 
-           
+                # P01 U3 п.4: адрес уже занял слот товарной квоты при постановке в очередь —
+                # на отбраковке чужого хоста слот возвращается (хвост P02 U1).
+                await self._release_product_quota_slot(normalized_url, 'чужой домен')
+                return True
+
         # Проверяем посещенные URL
         async with self._urls_lock:
             if normalized_url in self.processed_urls:
@@ -4726,6 +4961,7 @@ class WebCrawler:
                     return aiohttp_parsed
                 if content:
                     effective_url = final_url if final_url and final_url != url else url
+                    self._log_effective_url(url, final_url)
                     # Проверяем, что конечный домен эквивалентен базовому
                     if final_url and final_url != url:
                         if not self.url_categorizer.is_main_domain(final_url, self.current_base_url):
@@ -4753,6 +4989,7 @@ class WebCrawler:
                     if res and not res.from_cache_error and res.status == 200 and res.html:
                         ok_domain = True
                         if res.final_url and res.final_url != url:
+                            self._log_effective_url(url, res.final_url)
                             ok_domain = self.url_categorizer.is_main_domain(res.final_url, self.current_base_url)
                         if ok_domain:
                             self._census_fetch(url, category, 'http_first')
@@ -4766,6 +5003,7 @@ class WebCrawler:
                 if result is not None:
                     content, _, final_url = result
                     if content:
+                        self._log_effective_url(url, final_url)
                         # Сверка хоста после навигации, как в товарной ветке: JS-редиректор
                         # уводил браузер на чужой сайт, и тот сохранялся под адресом
                         # компании — вплоть до карточки чужой организации (D238).
@@ -5563,17 +5801,32 @@ class WebCrawler:
         parsed_base = urlparse(base_url)
         # Используем базовый домен для проверки
         base_domain_for_check = base_url
+        # P05 U3 п.6: отброшенные гейтом периметра хосты — разрезом, а не общим счётчиком
+        skipped_hosts = {}
+        skipped_examples = {}   # хост -> пример адреса (нужен схеме пробы автодетекта)
 
         for link_url, category, priority in all_links:
             if category == 'product' and self.url_categorizer.is_print_version(link_url, category):
                 log.debug(f"Пропускаем ссылку на печатную версию: {link_url}")
                 continue
+            # P01 U3: хост и схема ссылки приводятся к подтверждённой рабочей форме ДО
+            # всех гейтов и до нормализации (D87 www, D134 http->https, D270 www-дубль).
+            canonical_link = self._canonicalize_to_working_base(link_url)
+            if canonical_link != link_url:
+                log.debug(f"Ссылка приведена к рабочей базе: {link_url} -> {canonical_link}")
+                link_url = canonical_link
             try:
                 # Проверяем основной домен (фильтруем поддомены и неэквивалентные)
                 if self.config.ignore_subdomains:
-                    if not self.url_categorizer.is_main_domain(link_url, base_domain_for_check):
+                    if not (self._in_crawl_perimeter(link_url, base_domain_for_check)
+                            or self._maybe_allow_subdomain(link_url, category, depth,
+                                                           base_domain_for_check)):
                         if self.config.log_skipped_subdomains:
                             log.info(f"Пропускаем неэквивалентный домен: {link_url} (основной: {base_domain_for_check})")
+                        host = self._url_host(link_url)
+                        skipped_hosts[host] = skipped_hosts.get(host, 0) + 1
+                        skipped_examples.setdefault(host, link_url)
+                        self._skipped_link_hosts[host] = self._skipped_link_hosts.get(host, 0) + 1
                         async with self._stats_lock:
                             self.stats['skipped_subdomains'] += 1
                         continue
@@ -5596,6 +5849,18 @@ class WebCrawler:
             except Exception as e:
                 log.debug(f"Ошибка фильтрации ссылки {link_url}: {e}")
                 continue
+
+        # P05 U3 пп.3,5: автодетект зеркала на внешнем хосте (за флагом, по умолчанию
+        # выключен). Если хост разрешён, ссылки на него уже отброшены этим проходом —
+        # перебираем список заново (флаг _mirror_autodetect_done исключает повтор).
+        if await self._maybe_autodetect_mirror_host(
+                parse_result, depth, skipped_hosts, skipped_examples,
+                sum(1 for _u, cat, _p in filtered_links if cat == 'product')):
+            return await self._extract_links(url, parse_result, depth, base_url)
+
+        if self.metrics_collector is not None:
+            # P05 U2: счётчики периметра (реализованы полосой C, вызов — здесь)
+            self.metrics_collector.record_link_gate(len(all_links), sum(skipped_hosts.values()))
 
         # Сортировка и удаление дубликатов
         unique_links = []
