@@ -1296,7 +1296,36 @@ class SiteMapParser:
         
         # Кэш для избежания повторной обработки
         self._processed_sitemaps = set()
-        
+
+    # D144/D208: разделы, которые товарных карточек не дают, но в карте сайта
+    # конкурируют за кэп sitemap_max_urls с настоящими карточками.
+    _INFO_PATH_TOKENS = frozenset({
+        'news', 'novosti', 'blog', 'article', 'articles', 'stati', 'press',
+        'about', 'o-kompanii', 'company', 'faq', 'vacancy', 'vakansii',
+        'gallery', 'photo', 'video', 'reviews', 'otzyvy', 'events',
+    })
+
+    @staticmethod
+    def _has_article_slug(path: str) -> bool:
+        """Последний сегмент пути похож на артикул/детальную карточку: содержит цифру."""
+        slug = path.rstrip('/').rsplit('/', 1)[-1].lower()
+        return bool(slug) and bool(re.search(r'\d', slug))
+
+    def _sitemap_rank_key(self, row):
+        """D144/D208: ключ ранжирования кандидатов карты сайта ДО применения кэпа.
+        По возрастанию: приоритет (выше — раньше), не-info раздел, артикульный слаг,
+        глубина пути, сам адрес (детерминизм между запусками)."""
+        url, normalized_url, category, priority = row
+        try:
+            path = urlparse(url).path or '/'
+        except Exception:
+            path = '/'
+        segments = [seg.lower() for seg in path.split('/') if seg]
+        is_info = any(seg in self._INFO_PATH_TOKENS for seg in segments)
+        return (-priority, 1 if is_info else 0,
+                0 if self._has_article_slug(path) else 1, len(segments), url)
+
+
     async def discover_sitemap_urls(self, base_url: str) -> List[str]:
         """Обнаружение карт сайта по стандартным путям и через robots.txt"""
         sitemap_urls = []
@@ -1443,9 +1472,13 @@ class SiteMapParser:
                             all_urls.extend(result)
                 return all_urls
             
-            # Обычная карта сайта с URL
+            # Обычная карта сайта с URL. D144/D208: категоризуем адреса карты (до потолка
+            # сканирования) и режем по кэпу ПОСЛЕ ранжирования — прежде срез
+            # url_tags[:sitemap_max_urls] шёл в порядке документа, до категоризации, и
+            # товарные карточки из хвоста карты не попадали в обход вовсе.
             url_tags = soup.find_all('url')
-            for url_tag in url_tags[:self.config.sitemap_max_urls]:
+            scanned_tags = url_tags[:self.config.sitemap_max_scan_urls]
+            for url_tag in scanned_tags:
                 loc_tag = url_tag.find('loc')
                 if loc_tag and loc_tag.text:
                     url = loc_tag.text.strip()
@@ -1457,11 +1490,22 @@ class SiteMapParser:
 
                     category, priority = self.url_categorizer.categorize_url(url)
                     
-                    # Повышаем приоритет для URL из карты сайта
-                    enhanced_priority = min(priority + 1, 10)
+                    # Повышаем приоритет для URL из карты сайта. D208: потолок 10 снят —
+                    # он схлопывал товар, категорию и контакты в один приоритет, и
+                    # пересортировка очереди переставала что-либо различать.
+                    enhanced_priority = priority + 1
 
                     # D120: в очередь уйдёт ОПУБЛИКОВАННЫЙ адрес, нормализованный — ключ
                     all_urls.append((url, normalized_url, category, enhanced_priority))
+
+            if len(url_tags) > len(scanned_tags):
+                log.warning(f"Карта сайта {sitemap_url}: {len(url_tags)} адресов, "
+                            f"просканировано {len(scanned_tags)} (потолок sitemap_max_scan_urls)")
+            all_urls.sort(key=self._sitemap_rank_key)
+            if len(all_urls) > self.config.sitemap_max_urls:
+                log.info(f"Карта сайта {sitemap_url}: {len(all_urls)} адресов после "
+                         f"категоризации, в кэп {self.config.sitemap_max_urls} берём лучшие по рангу")
+                all_urls = all_urls[:self.config.sitemap_max_urls]
 
             log.info(f"Извлечено {len(all_urls)} URL из XML карты сайта")
             return all_urls
@@ -1489,7 +1533,8 @@ class SiteMapParser:
                     normalized_url = self.url_normalizer.normalize_url(full_url)
                     
                     category, priority = self.url_categorizer.categorize_url(full_url)
-                    enhanced_priority = min(priority + 1, 10)
+                    # D208: потолок 10 снят (см. _parse_xml_sitemap)
+                    enhanced_priority = priority + 1
 
                     all_urls.append((full_url, normalized_url, category, enhanced_priority))
 
@@ -1518,7 +1563,8 @@ class SiteMapParser:
                     normalized_url = self.url_normalizer.normalize_url(full_url)
                     
                     category, priority = self.url_categorizer.categorize_url(full_url)
-                    enhanced_priority = min(priority + 1, 10)
+                    # D208: потолок 10 снят (см. _parse_xml_sitemap)
+                    enhanced_priority = priority + 1
 
                     all_urls.append((full_url, normalized_url, category, enhanced_priority))
 
@@ -2861,10 +2907,13 @@ class WebCrawler:
                 elif priority >= 7:  # Высокоприоритетные страницы
                     filtered_urls.append((url, normalized_url, category, priority))
             
-            # Ограничиваем общее количество (профиль сайта может задать свой лимит)
+            # Ограничиваем общее количество (профиль сайта может задать свой лимит).
+            # D144/D208: кэп применяется ПОСЛЕ ранжирования, а не в порядке прихода карт —
+            # иначе при нескольких картах в срез попадала та, что ответила первой.
             _sitemap_cap = self.config.sitemap_max_urls
             if self.profile is not None and self.profile.crawl.limits.sitemap_urls:
                 _sitemap_cap = self.profile.crawl.limits.sitemap_urls
+            filtered_urls.sort(key=self.sitemap_parser._sitemap_rank_key)
             filtered_urls = filtered_urls[:_sitemap_cap]
 
             log.info(f"Отфильтровано {len(filtered_urls)} URL из карты сайта")
@@ -2892,8 +2941,12 @@ class WebCrawler:
         diverged_count = 0
         diverged_examples = []
 
-        # Сортируем URL по приоритету (от высокого к низкому)
-        sitemap_urls.sort(key=lambda x: x[3], reverse=True)
+        # Сортируем URL по рангу (приоритет, не-info раздел, артикульный слаг, глубина)
+        sitemap_urls.sort(key=self.sitemap_parser._sitemap_rank_key)
+        # D208: блок собирается целиком и кладётся в голову одной операцией. Прежний
+        # appendleft в цикле разворачивал порядок: первым из очереди доставался элемент
+        # с САМЫМ НИЗКИМ рангом, а товарные адреса уезжали в хвост за все служебные.
+        block = []
 
         for url, normalized_url, category, priority in sitemap_urls:
             # Проверяем основной домен
@@ -2944,11 +2997,13 @@ class WebCrawler:
                     self._crawled_scheme_keys.add(skey)
 
             url_depth = self.url_categorizer.calculate_url_depth(url)
-            # Увеличиваем приоритет URL из карты сайта
-            enhanced_priority = min(priority + 3, 10)
+            # Увеличиваем приоритет URL из карты сайта. D208: потолок 10 снят — иначе
+            # товар, категория и контакты получали один и тот же приоритет, и
+            # пересортировка очереди в главном цикле переставала их различать.
+            enhanced_priority = priority + 3
 
-            # Добавляем в начало очереди ОПУБЛИКОВАННЫЙ адрес (D120/D219/D198)
-            queue.appendleft((url, 0, category, enhanced_priority))
+            # Блок пойдёт в голову очереди, ОПУБЛИКОВАННЫМ адресом (D120/D219/D198)
+            block.append((url, 0, category, enhanced_priority))
             self.visited_urls.add(normalized_url)
             if category == 'product':
                 self.product_urls.add(normalized_url)
@@ -2966,7 +3021,15 @@ class WebCrawler:
             if added_count >= self.config.sitemap_initial_batch_size:
                 break
 
+        # D208: extendleft разворачивает вставляемую последовательность, поэтому
+        # подаём её перевёрнутой — порядок ранжирования доживает до popleft.
+        queue.extendleft(reversed(block))
+
         log.info(f"Добавлено {added_count} URL из карты сайта в начало очереди")
+        if block:
+            # D208 п.5: фактический порядок обхода раньше в логе не печатался вовсе
+            log.info(f"Первые адреса очереди из карты сайта: "
+                     f"{', '.join(item[0] for item in block[:5])}")
         if skipped_count > 0:
             log.info(f"Пропущено {skipped_count} дубликатов")
         if skipped_pagination > 0:
