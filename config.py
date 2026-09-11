@@ -122,6 +122,10 @@ class Config:
     exclude_failopen_ratio: float = 0.8      # доля отсеянных URL, при которой фильтр снимается
     exclude_failopen_min_urls: int = 20      # меньше этого числа URL доля недостоверна
     exclude_failopen_max_deferred: int = 500 # потолок буфера отложенных URL (память)
+    # P04 U3: потолок страниц второго прохода товарного извлечения (роли
+    # category/price_list/other). Запускается, только если товарных карточек нет
+    # совсем, и стоит денег LLM, поэтому значение консервативное; 0 отключает проход.
+    second_pass_max_pages: int = 15
     
     # Настройки HTTP-first слоя (curl_cffi impersonate + cookie-warmup).
     # Требуется пакет curl_cffi (pip install curl_cffi); без него слой авто-отключается.

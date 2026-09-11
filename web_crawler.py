@@ -631,6 +631,9 @@ class URLCategorizer:
             'map', 'gb', 'price', 'faq', 'forum', 'blog', 'info', 'help',
             'glavnaya', 'главная', 'novosti', 'kontakty', 'o-nas', 'karta-sayta',
         }
+        # P04 U3 (D228): шаблонные служебные пути uCoz — гостевая книга, регистрация и
+        # страницы-заглушки '/index/0-N'. Товарами они не бывают никогда.
+        self._ucoz_service_re = re.compile(r'^/(?:index/\d+-\d+|gb|register)(?:/|$)')
         # Признак «плоского» сайта: заполняется observe_urls() по набору URL хоста
         self.flat_site = False
         # Ключевые слова товаров/категорий сопоставляем ПО ЛЕВОЙ ГРАНИЦЕ ТОКЕНА, а не
@@ -858,6 +861,17 @@ class URLCategorizer:
             'exclude_filter_disabled': self.exclude_filter_disabled,
             'language_filter_disabled': self.language_filter_disabled,
         }
+
+    # ==================== P04 U3: порядок проверок и тупиковые роли ==============
+
+    def _has_strong_product_path(self, segments: List[str]) -> bool:
+        """Сильный товарный сигнал пути: сегмент product/tovar/item/produkt/goods, за
+        которым идёт идентификатор товара. Такой путь сильнее префикса '/price/'
+        ('/price/product/235255' — карточка, а не прайс-лист; D181)."""
+        strong = {'product', 'products', 'tovar', 'tovary', 'item', 'items',
+                  'produkt', 'produkty', 'goods'}
+        return any(seg in strong and segments[i + 1]
+                   for i, seg in enumerate(segments[:-1]))
 
     def _is_flat_product_candidate(self, segments: List[str]) -> bool:
         """Односегментный слаг-директория или лист .htm/.html/.shtml в корне — типовая
@@ -1261,24 +1275,40 @@ class URLCategorizer:
         if not path or path in self.main_page_indicators:
             return 'main_page', self.priority_levels['main_page']
         
+        # P04 U3 (D138): роль сначала определяется ПУТЁМ. Текст ссылки — слабый
+        # сигнал, он смотрится ниже, только если путь роли не дал: иначе кнопка
+        # «Где купить» внутри плитки каталога уводила карточки в distributor, а якорь
+        # «Цены и контакты» — прайс-лист в contacts.
+
         # Проверка на контакты
-        if any(keyword in path_lower or keyword in text_lower for keyword in self.contact_keywords):
+        if any(keyword in path_lower for keyword in self.contact_keywords):
             return 'contacts', self.priority_levels['contacts']
-        
+
         # Проверка на дистрибьюторов
-        if any(keyword in path_lower or keyword in text_lower for keyword in self.distributor_keywords):
+        if any(keyword in path_lower for keyword in self.distributor_keywords):
             return 'distributor', self.priority_levels['distributor']
-        
-        # Проверка на прайс-листы
-        if any(keyword in path_lower or keyword in text_lower for keyword in self.price_list_keywords):
+
+        # Проверка на прайс-листы. P04 U3 (D181): сильный товарный сигнал пути
+        # ('/product/235255') сильнее префикса '/price/' — такой URL идёт в товары.
+        if (any(keyword in path_lower for keyword in self.price_list_keywords)
+                and not self._has_strong_product_path(path_segments)):
             return 'price_list', self.priority_levels['price_list']
-        
+
         # Проверка на товары (антипаттерн профиля запрещает классификацию «товар»).
         # P04 U2/D228: текст ссылки участвует в товарной оценке.
         if not profile_not_product and self._is_product_url(url, link_text):
             # downgrade (P04 U1, п. 3): URL прошёл мимо exclude-токена только за счёт
             # каталожного сигнала — берём его в обход, но позже настоящих товарных
             return 'product', max(self.priority_levels['product'] - downgrade, 1)
+
+        # P04 U3 (D138): путь роли не дал — теперь можно слушать текст ссылки
+        if text_lower:
+            if any(keyword in text_lower for keyword in self.contact_keywords):
+                return 'contacts', self.priority_levels['contacts']
+            if any(keyword in text_lower for keyword in self.distributor_keywords):
+                return 'distributor', self.priority_levels['distributor']
+            if any(keyword in text_lower for keyword in self.price_list_keywords):
+                return 'price_list', self.priority_levels['price_list']
 
         # Проверка на категории (P04 U2: ключевые слова — по границам токена, а не
         # подстрокой; плюс каталожные стемы, сегмент 'cat' и листинговые параметры
@@ -1349,6 +1379,9 @@ class URLCategorizer:
         _last_base = segments[-1].rsplit('.', 1)[0] if segments else ''
         if (any(seg in self.service_segments for seg in segments)
                 or _last_base in self.service_segments):
+            return False
+        # P04 U3 (D228): служебные шаблонные пути uCoz
+        if self._ucoz_service_re.match(path_norm):
             return False
         # Листинги-скрипты и не-HTML ресурсы (Bitrix list.php?SECTION_ID, *.js/*.css и т.п.)
         if _path.endswith(('list.php', '.js', '.css', '.json', '.xml')) or _path.split('/')[-1] in ('list.php',):
@@ -3418,7 +3451,9 @@ class WebCrawler:
                 return None
 
             # 4. РЕШЕНИЕ: сохранять ли страницу?
-            target_categories = {'product', 'contacts', 'distributor', 'main_page'}
+            # P04 U3 (D168/D181): category и price_list — не тупиковые роли: страницы
+            # сохраняются в Other_pages и доступны второму проходу извлечения в main.py
+            target_categories = {'product', 'contacts', 'distributor', 'main_page', 'category', 'price_list'}
             if category not in target_categories:
                 log.debug(f"Страница категории '{category}' не подлежит сохранению, ссылки извлечены: {url}")
                 return None

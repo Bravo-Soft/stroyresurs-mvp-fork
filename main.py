@@ -828,6 +828,34 @@ class MonitoringSystem:
                 self._processing_urls.discard(normalized_url)
             return None
 
+    async def _second_pass_product_extraction(self, all_pages: List[Dict], company_data: Dict[str, str],
+                                              company_stats: CompanyStatistics,
+                                              company_dir: str) -> List[Dict[str, Any]]:
+        """P04 U3 (п. 3): второй проход товарного извлечения по сохранённым страницам
+        ролей category/price_list/other. Запускается, только когда товарных карточек нет
+        совсем: товарных страниц не было вовсе либо все вернули Trash_418#. Расход LLM
+        ограничен потолком config.second_pass_max_pages (0 отключает проход)."""
+        limit = getattr(self.config, 'second_pass_max_pages', 0)
+        if limit <= 0:
+            return []
+        candidates = [p for p in all_pages
+                      if p.get('category') in ('category', 'price_list', 'other')][:limit]
+        if not candidates:
+            return []
+        log.info(f"Второй проход товарного извлечения: товарных карточек нет, пробуем "
+                 f"{len(candidates)} страниц ролей category/price_list/other")
+        retry_pages = []
+        for page in candidates:
+            # первый проход уже пометил URL обработанным как нетоварный — снимаем отметку,
+            # иначе страница будет пропущена дедупом
+            self._global_processed_urls.discard(page.get('normalized_url'))
+            retry_pages.append(dict(page, category='product'))
+        products = await self.process_stored_pages_with_checkpoints(
+            retry_pages, company_data, company_stats, company_dir)
+        if products:
+            log.info(f"Второй проход дал {len(products)} товаров")
+        return products or []
+
     # === Потоковая обработка страниц (конвейер внутри компании) ===
 
     def _actual_name_cache_path(self, company_data: Dict[str, str]) -> str:
@@ -2138,6 +2166,14 @@ class MonitoringSystem:
             structured_products = await self.process_stored_pages_with_checkpoints(pages_for_processing, company_data, company_stats, company_dir)
             if use_streaming and isinstance(structured_products, list):
                 structured_products = streamed_products + structured_products
+
+            # P04 U3 (D168, D181): роли category и price_list раньше были тупиковыми —
+            # страница скачивалась, но в товарное извлечение не попадала. Теперь она
+            # сохраняется, и если товаров не нашлось совсем (или все вернули Trash_418#),
+            # делаем по ней второй проход. Расход LLM ограничен потолком из config.
+            if isinstance(structured_products, list) and not structured_products:
+                structured_products = await self._second_pass_product_extraction(
+                    all_pages, company_data, company_stats, company_dir)
 
             # Обрабатываем возможные исключения
             if isinstance(downloaded_files, Exception):
