@@ -541,12 +541,12 @@ class URLCategorizer:
 
         # D58: подстрочное сопоставление отсекало товарные слаги, содержащие паттерн
         # внутри слова ('press' -> pressure/kompressor: 4 товара РАСКО у Саранского
-        # приборостроительного не краулились). Сопоставляем по границам слова:
-        # слева/справа не буква/цифра ('/press/', 'press-tsentr' — да; 'pressure' — нет).
-        # 'pressa' добавлен отдельным паттерном, т.к. границей больше не ловится.
-        self._exclude_patterns_re = re.compile(
-            "|".join(r"(?<![a-z0-9])" + re.escape(p) + r"(?![a-z0-9])"
-                     for p in self.exclude_url_patterns))
+        # приборостроительного не краулились). P04 U1 идёт дальше: сопоставляем не с
+        # полным URL, а ПОСЕГМЕНТНО — сегмент целиком либо его часть, отделённая
+        # дефисом ('/press/', 'press-tsentr' — да; 'pressure', 'service_product' — нет).
+        # Хост из области сопоставления убран совсем (D139: зона '.info' вырезала сайт).
+        # 'pressa' — отдельный токен, границей больше не ловится.
+        self.exclude_url_patterns_set = set(self.exclude_url_patterns)
 
         self.exclude_language_prefixes = {
             'en', 'tr', 'de', 'fr', 'es', 'it', 'zh', 'ja', 'ko', 
@@ -642,6 +642,40 @@ class URLCategorizer:
         self._product_keywords_re = self._compile_keyword_prefixes(self.product_keywords)
         self._category_keywords_re = self._compile_keyword_prefixes(self.category_keywords)
 
+        # === P04 U1: область применения фильтров, вырезающих сайт целиком ===
+        # Отраслевые омонимы: вырезают URL, ТОЛЬКО совпав с сегментом целиком
+        # ('/profile/', '/media/'). Внутри составного сегмента это обычные отраслевые
+        # слова: 'profile-catalog' — каталог ПВХ-профиля (D207), а не личный кабинет.
+        self.exclude_exact_segment_only = {
+            'profile', 'application', 'objects', 'files', 'media',
+            'test', 'reference', 'project', 'projects',
+        }
+        # Маршрутные ключи CMS: их ЗНАЧЕНИЯ в exclude-сопоставлении не участвуют
+        # (Joomla 'view=article' красила в excluded2 100 % страниц сайта — D197)
+        self.cms_route_query_keys = {'option', 'view', 'task', 'layout', 'tmpl',
+                                     'route', 'r', 'do', 'p', 'id'}
+        # Явные каталожные маркеры пути: при них exclude-токен не вырезает URL, а лишь
+        # понижает приоритет (D158 '/info/catalog/', D207, D251). Список намеренно
+        # узкий — отраслевые омонимы товарных ключевых слов ('model', 'sale', 'ware')
+        # сюда класть НЕЛЬЗЯ, иначе exclude перестанет работать на новостях.
+        self.catalog_signal_stems = [
+            'catalog', 'katalog', 'product', 'produkt', 'produkc', 'produkts',
+            'tovar', 'izdeli', 'assortiment',
+            'каталог', 'продукц', 'товар', 'издели', 'ассортимент',
+        ]
+        self._catalog_signal_re = self._compile_keyword_prefixes(self.catalog_signal_stems)
+        # Базовая локаль обхода (set_base_locale): у зарубежного производителя
+        # национальная версия сайта и есть весь сайт (D211, D260)
+        self.base_locale = None
+        # Предохранитель «фильтр съел сайт» (release_starved_filters)
+        self.exclude_filter_disabled = False
+        self.language_filter_disabled = False
+        self._urls_categorized = 0
+        self._lang_excluded = 0
+        self._pattern_excluded = 0
+        self._deferred_urls = []
+        self._deferred_seen = set()
+
     @staticmethod
     def _compile_keyword_prefixes(keywords) -> 're.Pattern':
         """Регэксп «ключевое слово с левой границы токена»: слева от слова не должно
@@ -690,6 +724,140 @@ class URLCategorizer:
             log.info(f"Признак «плоский сайт»: товарных/каталожных сегментов не найдено "
                      f"на {observed} URL — односегментные слаги считаем товарными кандидатами")
         return self.flat_site
+
+    # ==================== P04 U1: область применения фильтров ====================
+
+    def set_base_locale(self, locale: Optional[str]) -> None:
+        """Базовая локаль обхода (D211, D260): языковой префикс рабочего URL компании.
+        URL с этим префиксом языковой фильтр не режет — у зарубежного производителя
+        национальная версия и есть весь сайт."""
+        self.base_locale = (locale or '').lower() or None
+        if self.base_locale:
+            log.info(f"Базовая локаль обхода: /{self.base_locale}/ — языковой фильтр её не режет")
+
+    def detect_locale_prefix(self, url: str) -> Optional[str]:
+        """Первый сегмент пути, если он выглядит языковым префиксом ('/pl/', '/en-US/'),
+        иначе None. Нужен, чтобы вычислить базовую локаль по URL компании."""
+        try:
+            segments = [seg for seg in urlparse(url).path.split('/') if seg]
+        except Exception:
+            return None
+        if not segments:
+            return None
+        first = segments[0].lower()
+        base = first.replace('_', '-').split('-')[0]
+        if first in self.exclude_language_prefixes or base in self.exclude_language_prefixes:
+            return first
+        return None
+
+    def _is_base_locale(self, segment: str) -> bool:
+        """Сегмент совпадает с базовой локалью сайта, включая формы pl-PL / pl_PL."""
+        if not self.base_locale:
+            return False
+        base = self.base_locale.replace('_', '-').split('-')[0]
+        return segment.replace('_', '-').split('-')[0] == base
+
+    def _segment_hits_exclude(self, token: str) -> bool:
+        """Сегмент пути (или значение query) совпал с exclude-токеном: целиком либо
+        частью, отделённой дефисом. '_' границей НЕ считается (D158 'service_product',
+        D283 'product_info.php'), отраслевые омонимы — только целым сегментом (D207)."""
+        if not token:
+            return False
+        if token in self.exclude_url_patterns_set:
+            return True
+        if '-' in token:
+            return any(part in self.exclude_url_patterns_set
+                       and part not in self.exclude_exact_segment_only
+                       for part in token.split('-'))
+        return False
+
+    def _is_excluded_by_patterns(self, segments: List[str], query: str) -> bool:
+        """Глобальный exclude-список, применённый ТОЛЬКО к сегментам пути и к значениям
+        query (P04 U1, пп. 1-2). Хост в сопоставлении не участвует (D139: зона '.info'
+        вырезала весь сайт), последний сегмент берётся без расширения, значения
+        маршрутных ключей CMS пропускаются (D197: 'view=article')."""
+        if self.exclude_filter_disabled:
+            return False
+        last = len(segments) - 1
+        for i, segment in enumerate(segments):
+            token = segment.rsplit('.', 1)[0] if (i == last and '.' in segment) else segment
+            if self._segment_hits_exclude(token):
+                return True
+        for part in query.split('&'):
+            if not part:
+                continue
+            key, _, value = part.partition('=')
+            if key.strip().lower() in self.cms_route_query_keys or not value:
+                continue
+            try:
+                value = unquote(value)
+            except Exception:
+                pass
+            if self._segment_hits_exclude(value.casefold()):
+                return True
+        return False
+
+    def _has_catalog_signal(self, path_norm: str, text_lower: str = '') -> bool:
+        """Явный каталожный/товарный маркер в пути или в тексте ссылки ('/catalog/',
+        '/produkt/', 'profile-catalog', '/produkcziya/', якорь «Продукция»). При нём
+        exclude-токен не вырезает URL, а только понижает приоритет (P04 U1, п. 3)."""
+        if self._catalog_signal_re.search(path_norm):
+            return True
+        return bool(text_lower) and bool(self._catalog_signal_re.search(text_lower))
+
+    def _defer_excluded(self, url: str, link_text: str, kind: str) -> None:
+        """Копим отброшенные URL, чтобы вернуть их в обход, если окажется, что фильтр
+        вырезал весь сайт (P04 U1, п. 5)."""
+        if kind == 'lang':
+            self._lang_excluded += 1
+        else:
+            self._pattern_excluded += 1
+        limit = getattr(self.config, 'exclude_failopen_max_deferred', 500) if self.config else 500
+        if len(self._deferred_urls) >= limit or url in self._deferred_seen:
+            return
+        self._deferred_seen.add(url)
+        self._deferred_urls.append((url, link_text))
+
+    def release_starved_filters(self) -> Tuple[bool, List[Tuple[str, str]]]:
+        """Предохранитель «фильтр вырезал весь сайт» (P04 U1, п. 5). Если доля URL,
+        отсеянных языковым фильтром или глобальным exclude-списком, достигла порога
+        config.exclude_failopen_ratio, фильтр отключается до конца компании. Возвращает
+        (сработал ли, отложенные URL для переклассификации). Зовётся, когда очередь
+        обхода опустела — то есть фильтр действительно оставил краулер без работы."""
+        if self.exclude_filter_disabled and self.language_filter_disabled:
+            return False, []
+        total = self._urls_categorized
+        min_urls = getattr(self.config, 'exclude_failopen_min_urls', 20) if self.config else 20
+        ratio = getattr(self.config, 'exclude_failopen_ratio', 0.8) if self.config else 0.8
+        if total < min_urls:
+            return False, []
+        released = False
+        if not self.language_filter_disabled and self._lang_excluded / total >= ratio:
+            self.language_filter_disabled = True
+            released = True
+            log.warning(f"Языковой фильтр отсеял {self._lang_excluded} из {total} URL и оставил "
+                        f"обход без работы — отключаем его для этой компании (fail-open)")
+        if not self.exclude_filter_disabled and self._pattern_excluded / total >= ratio:
+            self.exclude_filter_disabled = True
+            released = True
+            log.warning(f"Глобальный exclude-список отсеял {self._pattern_excluded} из {total} URL "
+                        f"и оставил обход без работы — отключаем его для этой компании (fail-open)")
+        if not released:
+            return False, []
+        deferred = self._deferred_urls
+        self._deferred_urls, self._deferred_seen = [], set()
+        return True, deferred
+
+    def filter_stats(self) -> Dict[str, Any]:
+        """Доли URL, отсеянных фильтрами по домену — для profile_metrics (P04 U1, п. 5)."""
+        total = self._urls_categorized
+        return {
+            'urls_categorized': total,
+            'excluded2_rate': round(self._pattern_excluded / total, 3) if total else None,
+            'lang_excluded_rate': round(self._lang_excluded / total, 3) if total else None,
+            'exclude_filter_disabled': self.exclude_filter_disabled,
+            'language_filter_disabled': self.language_filter_disabled,
+        }
 
     def _is_flat_product_candidate(self, segments: List[str]) -> bool:
         """Односегментный слаг-директория или лист .htm/.html/.shtml в корне — типовая
@@ -865,7 +1033,10 @@ class URLCategorizer:
         Поддомен и срединные сегменты (п.1, п.3) матчатся курированным набором
         exclude_language_segments (без 'id'/'no'); первый сегмент и query —
         полным exclude_language_prefixes.
+        Базовая локаль сайта (set_base_locale) из проверки исключается — D211/D260.
         """
+        if self.language_filter_disabled:
+            return False
         try:
             parsed = urlparse(url)
 
@@ -879,18 +1050,21 @@ class URLCategorizer:
             if path:
                 segments = path.split('/')
 
-                # 2. Первый сегмент пути (полный набор + составные en-US, en_US)
+                # 2. Первый сегмент пути (полный набор + составные en-US, en_US);
+                #    базовую локаль сайта пропускаем (P04 U1: '/pl/' у bolix.pl — не
+                #    иноязычная версия, а весь сайт)
                 first_segment = segments[0].lower()
-                if first_segment in self.exclude_language_prefixes:
-                    return True
-                if '-' in first_segment and first_segment.split('-')[0] in self.exclude_language_prefixes:
-                    return True
-                if '_' in first_segment and first_segment.split('_')[0] in self.exclude_language_prefixes:
-                    return True
+                if not self._is_base_locale(first_segment):
+                    if first_segment in self.exclude_language_prefixes:
+                        return True
+                    if '-' in first_segment and first_segment.split('-')[0] in self.exclude_language_prefixes:
+                        return True
+                    if '_' in first_segment and first_segment.split('_')[0] in self.exclude_language_prefixes:
+                        return True
 
                 # 3. Языковой сегмент в любом месте пути: /catalog/en/product
                 for seg in segments[1:]:
-                    if seg.lower() in self.exclude_language_segments:
+                    if seg.lower() in self.exclude_language_segments and not self._is_base_locale(seg.lower()):
                         return True
 
             # 4. Язык в query-параметрах
@@ -916,9 +1090,18 @@ class URLCategorizer:
         self.profile = profile
         self._profile_product_res = []
         self._profile_antipattern_res = []
-        # Признак «плоский сайт» — состояние ПРЕДЫДУЩЕЙ компании, сбрасываем вместе
-        # с профилем (set_profile зовётся из _apply_site_profile на каждую компанию)
+        # Пер-компанийное состояние категоризатора (признак плоского сайта, базовая
+        # локаль, счётчики и предохранитель фильтров) — сбрасываем вместе с профилем:
+        # set_profile зовётся из _apply_site_profile на каждую компанию.
         self.flat_site = False
+        self.base_locale = None
+        self.exclude_filter_disabled = False
+        self.language_filter_disabled = False
+        self._urls_categorized = 0
+        self._lang_excluded = 0
+        self._pattern_excluded = 0
+        self._deferred_urls = []
+        self._deferred_seen = set()
         if profile is None:
             return
         for pattern in profile.sections.product_url_patterns:
@@ -968,9 +1151,11 @@ class URLCategorizer:
 
     def categorize_url(self, url: str, link_text: str = "") -> Tuple[str, int]:
         """Категоризация URL с возвратом категории и приоритета"""
+        self._urls_categorized += 1
         # Проверяем на языковые префиксы
         if self.should_exclude_by_language(url):
             log.debug(f"Исключаем URL по языковому префиксу: {url}")
+            self._defer_excluded(url, link_text, 'lang')
             return 'excluded', 0
         
         parsed = urlparse(url)
@@ -1054,14 +1239,22 @@ class URLCategorizer:
             if _p_path.rstrip('/') in [r if r.startswith('/') else '/' + r for r in _roots if r]:
                 return 'category', self.priority_levels['category']
 
-        # Проверка на исключаемые паттерны (D58: по границам слова, не подстрокой)
-        if self._exclude_patterns_re.search(url_lower):
+        # Проверка на исключаемые паттерны (P04 U1: посегментно, без хоста и без
+        # значений маршрутных ключей CMS)
+        downgrade = 0
+        if self._is_excluded_by_patterns(path_segments, parsed.query.lower()):
             # D37: разделы дилеров часто живут под исключаемыми сегментами
             # (/about/predstavitelstva, /info/gde-kupit) — их не исключаем
             if any(k in path_lower or k in text_lower for k in self.distributor_keywords):
                 return 'distributor', self.priority_levels['distributor']
-            return 'excluded2', 0
-        
+            # P04 U1 (п. 3): явный каталожный сигнал сильнее exclude-токена — такой URL
+            # не вырезаем, а лишь понижаем ему приоритет (D158, D207, D251)
+            if self._has_catalog_signal(path_norm, text_lower):
+                downgrade = 2
+            else:
+                self._defer_excluded(url, link_text, 'pattern')
+                return 'excluded2', 0
+
         # Проверка на главную страницу
         parsed_url = urlparse(url)
         path = parsed_url.path.strip('/')
@@ -1083,7 +1276,9 @@ class URLCategorizer:
         # Проверка на товары (антипаттерн профиля запрещает классификацию «товар»).
         # P04 U2/D228: текст ссылки участвует в товарной оценке.
         if not profile_not_product and self._is_product_url(url, link_text):
-            return 'product', self.priority_levels['product']
+            # downgrade (P04 U1, п. 3): URL прошёл мимо exclude-токена только за счёт
+            # каталожного сигнала — берём его в обход, но позже настоящих товарных
+            return 'product', max(self.priority_levels['product'] - downgrade, 1)
 
         # Проверка на категории (P04 U2: ключевые слова — по границам токена, а не
         # подстрокой; плюс каталожные стемы, сегмент 'cat' и листинговые параметры
@@ -1097,7 +1292,7 @@ class URLCategorizer:
                 r'/catalog/', r'/category/', r'/collection/', r'/series/',
                 r'/каталог/', r'/серия/', r'/katalog/', r'/products/'
             ])):
-            return 'category', self.priority_levels['category']
+            return 'category', max(self.priority_levels['category'] - downgrade, 1)
         
         return 'other', self.priority_levels['other']
         
@@ -1159,10 +1354,13 @@ class URLCategorizer:
         if _path.endswith(('list.php', '.js', '.css', '.json', '.xml')) or _path.split('/')[-1] in ('list.php',):
             return False
 
-        # Исключаем не товарные URL (D58: по границам слова, не подстрокой)
-        if self._exclude_patterns_re.search(url_lower):
+        # Исключаем не товарные URL (P04 U1: посегментно, без хоста; явный каталожный
+        # сигнал в пути или в тексте ссылки отменяет исключение — D158, D207, D251)
+        if (self._is_excluded_by_patterns(segments, parsed.query.lower())
+                and not self._has_catalog_signal(path_norm, (link_text or '').casefold())):
             return False
-            
+
+
         # Проверка по паттернам URL (P04 U2/D145: дополнительно по нормализованному
         # URL — завершающий слеш больше не ломает якорные паттерны '...$').
         # Нормализованный кандидат берём ТОЛЬКО для слага (в последнем сегменте есть
@@ -2737,6 +2935,14 @@ class WebCrawler:
 
         # Профиль сайта: пер-сайтовые лимиты/стратегии (mvp/profiles/<домен>.yaml).
         self._apply_site_profile(working_url)
+
+        # P04 U1 (D211, D260): базовая локаль обхода — языковой префикс рабочего URL
+        # (или URL из Site_list). У зарубежного производителя национальная версия и
+        # есть весь сайт, языковым фильтром её резать нельзя.
+        self.url_categorizer.set_base_locale(
+            self.url_categorizer.detect_locale_prefix(working_url)
+            or self.url_categorizer.detect_locale_prefix(site_url))
+
         if self.profile is not None and self.profile.crawl.antibot == 'blocked':
             log.warning(f"Профиль {self.profile.domain}: antibot=blocked — сайт не "
                         f"обрабатывается (ждёт решения в REVIEW)")
@@ -2890,7 +3096,8 @@ class WebCrawler:
         processed_count = 0
         active_tasks = set()
         
-        while (queue or active_tasks) and await self._get_total_pages() < self.max_pages_per_site:
+        while ((queue or active_tasks) or self._apply_exclude_failopen(queue)) \
+                and await self._get_total_pages() < self.max_pages_per_site:
             # Сортируем очередь по приоритету
             async with self._queue_lock:
                 queue_list = list(queue)
@@ -2945,6 +3152,32 @@ class WebCrawler:
                             await self.page_sink.put(stored_page)
                 except Exception as e:
                     log.error(f"Ошибка повторной обработки страницы {url}: {e}")
+
+    def _apply_exclude_failopen(self, queue: deque) -> bool:
+        """P04 U1 (п. 5): очередь обхода опустела — проверяем, не вырезал ли сайт целиком
+        языковой фильтр или глобальный exclude-список. Если да, фильтр отключается для
+        компании, а отложенные URL переклассифицируются и возвращаются в очередь
+        (fail-open). Заодно отдаём доли отсева в метрики прогона. Вызывается только при
+        пустой очереди и без активных задач, поэтому блокировки не требуются."""
+        categorizer = self.url_categorizer
+        if self.metrics_collector is not None:
+            self.metrics_collector.record_url_filters(categorizer.filter_stats())
+        released, deferred = categorizer.release_starved_filters()
+        if not released:
+            return False
+        restored = 0
+        for url, link_text in deferred:
+            normalized_url = self.url_normalizer.normalize_url(url)
+            if normalized_url in self.visited_urls:
+                continue
+            category, priority = categorizer.categorize_url(url, link_text)
+            if category.startswith('excluded'):
+                continue
+            queue.append((url, 1, category, priority))
+            self.visited_urls.add(normalized_url)
+            restored += 1
+        log.warning(f"Предохранитель фильтров: в обход возвращено {restored} отложенных URL")
+        return restored > 0
 
     async def _process_page_parallel(self, url: str, depth: int, category: str, company_name: str,
                                    domain_dirs: Dict[str, str], queue: deque, stored_pages: List[Dict]):

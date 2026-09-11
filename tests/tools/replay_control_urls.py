@@ -22,6 +22,8 @@ def main() -> int:
     categorizer.set_profile(None)
     snapshot = []
     for case in cases:
+        # base_locale — то, что crawl_site вычисляет по рабочему URL компании (P04 U1)
+        categorizer.set_base_locale(case.get('base_locale'))
         role, priority = categorizer.categorize_url(case['url'], case.get('text', ''))
         snapshot.append({**case, 'role': role, 'priority': priority})
         print(f"{case['code']:<6} {case['unit']:<3} {role:<11} {priority:<2} "

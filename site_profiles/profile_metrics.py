@@ -55,6 +55,7 @@ class RunMetricsCollector:
         self.card_specs = []                    # число числовых ТХ у товаров, прошедших гейт >=3
         self.gate_specs = []                    # то же у всех товаров, дошедших до гейта
         self.output = {}                        # срез CompanyStatistics
+        self.url_filters = {}                   # доли отсева URL фильтрами категоризатора (P04 U1)
 
     # ---------- хуки краулера ----------
 
@@ -82,6 +83,12 @@ class RunMetricsCollector:
     @_safe
     def record_sitemap(self, url_count):
         self.sitemap_url_count = int(url_count)
+
+    @_safe
+    def record_url_filters(self, stats):
+        """Доли URL, отсеянных языковым фильтром и глобальным exclude-списком (P04 U1):
+        по ним видно «фильтр съел сайт» без чтения логов."""
+        self.url_filters = dict(stats or {})
 
     @_safe
     def record_document_files(self, section, count):
@@ -191,6 +198,11 @@ class RunMetricsCollector:
             'company_document_files': dict(self.document_files),
             'limits_used': dict(self.limits) or None,
             'output': dict(self.output),
+            # Фильтры категоризатора URL (P04 U1): доля отсева по домену и факт
+            # срабатывания предохранителя «фильтр съел сайт»
+            'excluded2_rate': self.url_filters.get('excluded2_rate'),
+            'lang_excluded_rate': self.url_filters.get('lang_excluded_rate'),
+            'url_filters': dict(self.url_filters) or None,
         }
         metrics['alerts'] = self._alerts(metrics)
         return metrics
