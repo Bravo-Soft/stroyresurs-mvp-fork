@@ -2407,6 +2407,17 @@ class WebCrawler:
         self._product_text_hash_counts = {}
         self._stale_sitemap_guard_tripped = False
         self.stale_sitemap_dup_threshold = getattr(self.config, 'stale_sitemap_dup_threshold', 10)
+        # P02 U1: учёт товарной квоты. Слот занимается при ПОСТАНОВКЕ URL в очередь и
+        # до сих пор не возвращался ни на одном пути неуспеха — сайт с мёртвой картой
+        # сжигал все 50 слотов, не сохранив ни одной страницы.
+        self._quota_released = set()          # ключи, по которым слот уже возвращён
+        self._product_quota_reused = 0        # сколько раз слот переиспользован
+        self.product_quota_reuse_limit = getattr(self.config, 'product_quota_reuse_limit', 50)
+        self._quota_rejected_urls = []        # товарные адреса, отбитые гейтом квоты
+        self._queue_gate_rejections = {}      # немые отказы гейтов очереди: причина -> счётчик
+        self._sitemap_hard_fail_streak = 0    # подряд идущие жёсткие отказы товарных URL карты
+        self.stale_sitemap_hard_fail_threshold = getattr(
+            self.config, 'stale_sitemap_hard_fail_threshold', 15)
         # D120 п.7: опубликованные в карте сайта адреса, отличающиеся от своего
         # нормализованного ключа: {нормализованный ключ: адрес из <loc>}. Нужны, чтобы
         # при no_content/404 на другом написании того же ключа (напр. бесслешевом
@@ -2449,7 +2460,17 @@ class WebCrawler:
         if n < self.stale_sitemap_dup_threshold:
             return
         self._stale_sitemap_guard_tripped = True
+        await self._purge_sitemap_tail(
+            queue, f"Протухший sitemap: {n} товарных страниц с одинаковым текстом "
+                   f"(последняя: {url}).")
+
+    async def _purge_sitemap_tail(self, queue: deque, reason: str) -> None:
+        """D36/D225: снимает из очереди необойдённые товарные URL карты сайта (глубина 0)
+        и освобождает их слоты товарной квоты. Вместе с product_urls/visited_urls
+        снимается и схемный ключ D59 RC1 — иначе те же адреса, предложенные ссылками из
+        каталога, отбиваются как «схемный дубль», и освобождённый бюджет некому занять."""
         purged = 0
+        purged_keys = 0
         async with self._queue_lock:
             kept = deque()
             while queue:
@@ -2457,16 +2478,52 @@ class WebCrawler:
                 q_url, q_depth, q_category = item[0], item[1], item[2]
                 if q_category == 'product' and q_depth == 0:
                     norm = self.url_normalizer.normalize_url(q_url)
+                    skey = self._scheme_dedup_key(q_url)
                     async with self._urls_lock:
                         self.product_urls.discard(norm)
                         self.visited_urls.discard(norm)
+                        if skey is not None and skey in self._crawled_scheme_keys:
+                            self._crawled_scheme_keys.discard(skey)
+                            purged_keys += 1
                     purged += 1
                 else:
                     kept.append(item)
             queue.extend(kept)
-        log.warning(f"Протухший sitemap: {n} товарных страниц с одинаковым текстом "
-                    f"(последняя: {url}). Из очереди убрано {purged} товарных URL карты сайта, "
-                    f"бюджет освобождён для ссылок из каталога")
+        log.warning(f"{reason} Из очереди убрано {purged} товарных URL карты сайта "
+                    f"(снято схемных ключей: {purged_keys}), бюджет освобождён для "
+                    f"ссылок из каталога")
+
+    async def _check_hard_fail_sitemap_guard(self, url: str, depth: int, category: str,
+                                             queue: deque) -> None:
+        """P02 U1 п.2: жёсткие отказы (404/410, таймаут) подряд среди товарных URL карты
+        сайта глубины 0. Сторож D36 против них слеп по построению: ему нужен пришедший
+        HTML, а на жёстком отказе parse_result=None и до него управление не доходит."""
+        if self._stale_sitemap_guard_tripped or category != 'product' or depth != 0:
+            return
+        self._sitemap_hard_fail_streak += 1
+        if self._sitemap_hard_fail_streak < self.stale_sitemap_hard_fail_threshold:
+            return
+        self._stale_sitemap_guard_tripped = True
+        await self._purge_sitemap_tail(
+            queue, f"Карта сайта не отдаёт содержимое: {self._sitemap_hard_fail_streak} "
+                   f"товарных адресов подряд без контента (последний: {url}).")
+
+    async def _release_product_quota_slot(self, normalized_url: str, reason: str) -> bool:
+        """P02 U1 п.1: возврат слота товарной квоты на пути неуспеха товарной страницы.
+        Потолок product_quota_reuse_limit обязателен: без него сайт со сплошными 404
+        крутил бы квоту, пока не упрётся в max_pages_per_site."""
+        async with self._urls_lock:
+            if normalized_url not in self.product_urls or normalized_url in self._quota_released:
+                return False
+            if self._product_quota_reused >= self.product_quota_reuse_limit:
+                return False
+            self.product_urls.discard(normalized_url)
+            self._quota_released.add(normalized_url)
+            self._product_quota_reused += 1
+            reused = self._product_quota_reused
+        log.debug(f"Возвращён слот товарной квоты ({reason}): {normalized_url} "
+                  f"[{reused}/{self.product_quota_reuse_limit}]")
+        return True
 
     def _register_page_retry(self, url: str, depth: int, category: str) -> None:
         """D40: запоминает страницу, не отдавшую контент, для повторной попытки.
@@ -2490,6 +2547,11 @@ class WebCrawler:
             self._product_text_hash_counts.clear()
             self._stale_sitemap_guard_tripped = False
             self._sitemap_published_urls.clear()
+            self._quota_released.clear()
+            self._product_quota_reused = 0
+            self._quota_rejected_urls.clear()
+            self._queue_gate_rejections.clear()
+            self._sitemap_hard_fail_streak = 0
             self._page_retry_candidates.clear()
 
         # Получаем все файлы компании из временного хранилища
@@ -2843,6 +2905,49 @@ class WebCrawler:
                 except Exception as e:
                     log.error(f"Ошибка повторной обработки страницы {url}: {e}")
 
+        # P02 U1 пп.4-5: сводка немых отказов гейтов очереди и страховка на случай,
+        # когда квота потрачена, а товарных страниц не сохранено ни одной.
+        if self._queue_gate_rejections:
+            summary = ', '.join(f"{reason}: {count}"
+                                for reason, count in sorted(self._queue_gate_rejections.items()))
+            log.info(f"Отказы гейтов очереди за компанию — {summary}")
+        if self._product_quota_reused:
+            log.info(f"Слотов товарной квоты возвращено: {self._product_quota_reused} "
+                     f"(потолок {self.product_quota_reuse_limit})")
+        await self._second_pass_for_quota_rejected(company_name, domain_dirs, stored_pages, queue)
+
+    async def _second_pass_for_quota_rejected(self, company_name: str, domain_dirs: Dict[str, str],
+                                              stored_pages: List[Dict], queue: deque) -> None:
+        """P02 U1 п.5: страховка. Если по итогам обхода сохранённых товарных страниц 0,
+        а товарные адреса отбивались гейтом квоты, значит квота была занята адресами, не
+        давшими ни одной страницы. Освобождаем её и проходим по отбитым адресам."""
+        async with self._stats_lock:
+            product_pages = self.stats['product_pages']
+        if product_pages or not self._quota_rejected_urls:
+            return
+
+        async with self._urls_lock:
+            candidates = list(dict.fromkeys(self._quota_rejected_urls))[:self.max_product_pages_per_site]
+            self._quota_rejected_urls.clear()
+            self.product_urls.clear()
+            for candidate in candidates:
+                self.visited_urls.discard(self.url_normalizer.normalize_url(candidate))
+
+        log.warning(f"Товарных страниц не сохранено ни одной, а по квоте было отбито "
+                    f"{len(candidates)} товарных адресов — второй проход по ним")
+        for candidate in candidates:
+            if await self._get_total_pages() >= self.max_pages_per_site:
+                break
+            try:
+                stored_page = await self._process_page_with_storage(
+                    candidate, 1, 'product', company_name, domain_dirs, queue)
+                if stored_page:
+                    stored_pages.append(stored_page)
+                    if self.page_sink is not None:
+                        await self.page_sink.put(stored_page)
+            except Exception as e:
+                log.error(f"Ошибка второго прохода по {candidate}: {e}")
+
     async def _process_page_parallel(self, url: str, depth: int, category: str, company_name: str,
                                    domain_dirs: Dict[str, str], queue: deque, stored_pages: List[Dict]):
         """Параллельная обработка отдельной страницы"""
@@ -2938,6 +3043,7 @@ class WebCrawler:
         skipped_count = 0
         skipped_subdomains = 0
         skipped_pagination = 0
+        skipped_quota = 0
         diverged_count = 0
         diverged_examples = []
 
@@ -2983,7 +3089,11 @@ class WebCrawler:
             # max_product_pages_per_site. Продукты в карте отсортированы первыми по
             # приоритету, поэтому лишние просто пропускаем (контакты/категории идут дальше).
             if category == 'product' and len(self.product_urls) >= self.max_product_pages_per_site:
-                skipped_count += 1
+                # D222/D144: отказ по квоте раньше попадал в счётчик «дубликатов» и был
+                # неотличим от дедупа; теперь считается отдельно и служит входом
+                # страховки «второй проход», если товарных страниц не сохранилось вовсе.
+                skipped_quota += 1
+                self._quota_rejected_urls.append(url)
                 continue
 
             # D59 RC1: схемный дубль http↔https из sitemap (общий набор ключей с гейтом ссылок).
@@ -3032,6 +3142,9 @@ class WebCrawler:
                      f"{', '.join(item[0] for item in block[:5])}")
         if skipped_count > 0:
             log.info(f"Пропущено {skipped_count} дубликатов")
+        if skipped_quota > 0:
+            log.info(f"Пропущено {skipped_quota} товарных URL по квоте "
+                     f"(занято {len(self.product_urls)} из {self.max_product_pages_per_site})")
         if skipped_pagination > 0:
             log.info(f"Пропущено {skipped_pagination} URL глубокой пагинации из карты сайта")
         if skipped_subdomains > 0:
@@ -3118,10 +3231,18 @@ class WebCrawler:
                 log.warning(f"Не удалось получить содержимое страницы: {url}")
                 if normalized_url in self._sitemap_published_urls and self.metrics_collector is not None:
                     self.metrics_collector.record_sitemap_no_content(url)
+                # P02 U1: страница не получена — слот товарной квоты держать незачем
+                if category == 'product':
+                    await self._release_product_quota_slot(normalized_url, 'нет содержимого')
+                    await self._check_hard_fail_sitemap_guard(url, depth, category, queue)
                 # D40: таймаутнутые целевые страницы не теряем — кладём в очередь ретраев,
                 # она обходится повторно после основного прохода
                 self._register_page_retry(url, depth, category)
                 return None
+
+            # P02 U1: содержимое пришло — серия жёстких отказов карты сайта прервана
+            if category == 'product' and depth == 0:
+                self._sitemap_hard_fail_streak = 0
 
             # 2. ИЗВЛЕЧЕНИЕ ССЫЛОК (ВСЕГДА, независимо от категории и is_processed)
             await self._process_links_from_parse_result(url, parse_result, depth, queue)
@@ -3156,6 +3277,9 @@ class WebCrawler:
             # 5. Проверка размера оригинального HTML
             if len(parse_result.html) < 300:
                 log.info(f"Пропускаем сохранение страницы {url}: размер оригинального HTML менее 300 символов")
+                # P02 U1: страница не сохранена — слот товарной квоты возвращается
+                if category == 'product':
+                    await self._release_product_quota_slot(normalized_url, 'HTML менее 300 символов')
                 return None
 
             # 5а. D36: детект протухшего sitemap — одинаковый видимый текст у товарных страниц
@@ -3318,10 +3442,15 @@ class WebCrawler:
             # согласованный с _should_skip_url (там не-товарные отсекаются при depth > 4).
             non_product_depth_limit = 4 if category in ('contacts', 'distributor') else 2
             if category != 'product' and url_depth > non_product_depth_limit:
+                self._count_queue_gate_rejection('глубина не-товарной страницы')
                 return False
-                
-            # Для товарных страниц ограничиваем количеством
+
+            # Для товарных страниц ограничиваем количеством.
+            # D193/D143/D212: отказ был немым; теперь он считается и попадает в сводку
+            # за компанию, а сам адрес — во вход страховки «второй проход».
             if category == 'product' and len(self.product_urls) >= self.max_product_pages_per_site:
+                self._count_queue_gate_rejection('товарная квота')
+                self._quota_rejected_urls.append(url)
                 return False
 
             # D59 (RC1+C): один товар под несколькими URL (http↔https / алиас пути /
@@ -4756,13 +4885,22 @@ class WebCrawler:
         
         # Для не-товарных страниц ограничиваем глубину
         if category != 'product' and url_depth > 2:
+            self._count_queue_gate_rejection('глубина не-товарной страницы')
             return False
-            
+
         # Для товарных страниц ограничиваем количеством
         if category == 'product' and len(self.product_urls) >= self.max_product_pages_per_site:
+            self._count_queue_gate_rejection('товарная квота')
+            self._quota_rejected_urls.append(url)
             return False
-            
+
         return True
+
+    def _count_queue_gate_rejection(self, reason: str) -> None:
+        """D193/D143/D212: гейты очереди отказывали немым return False. Копим причины
+        отказа, чтобы после обхода компании увидеть их сводкой (лог одной строкой на
+        каждый отказ утопил бы всё остальное)."""
+        self._queue_gate_rejections[reason] = self._queue_gate_rejections.get(reason, 0) + 1
 
     def _count_elements(self, soup: BeautifulSoup) -> Dict[str, int]:
         """Подсчет элементов на странице"""
