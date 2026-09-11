@@ -582,6 +582,128 @@ class URLCategorizer:
             'product_attrs': ['артикул', 'sku', 'art', 'модель', 'model', 'характеристики', 'specifications', 'код товара']
         }
 
+        # === P04 U2: распознавание товарных и каталожных URL ===
+        # Стемы разделов продукции: сопоставляются с НАЧАЛОМ сегмента пути (после
+        # percent-декодирования), поэтому 'продукц' ловит '/продукция/', 'izdeliya' —
+        # '/izdeliya/gajki/', 'produkcziya' — '/produkcziya/rigeli/' (D117, D223, D153).
+        self.product_segment_stems = [
+            'продукц', 'издели', 'товар', 'ассортимент',
+            'produkciya', 'produkcia', 'produkcziya', 'produkcija', 'produktsiya',
+            'izdeliya', 'izdelija', 'tovar', 'sizes', 'razmer', 'tiporazmer',
+        ]
+        # Каталожные стемы и точные сегменты. 'cat' — ТОЛЬКО целым сегментом (D274),
+        # иначе он матчится внутри location/certificate/application.
+        self.category_segment_stems = ['катал', 'категор']
+        self.category_segment_tokens = {'cat'}
+        # Товарные паттерны, сопоставляемые с нормализованным ПУТЁМ (не с полным URL):
+        # ведущий числовой идентификатор ЧПУ PrestaShop '/28-fundamentnye-bloki' (D284).
+        self.product_path_patterns = [
+            r'^/\d+-[a-z0-9-]+$',
+            r'/\d+-[a-z0-9-]+',
+        ]
+        # Идентификатор товара в query (D274 '/cat/?p_id=89', D127 '?product_ID=310')
+        self._product_query_re = re.compile(
+            r'(?:^|[?&])(?:p|product|tovar|item|goods|prod)_?id=\d+')
+        # Листинговые параметры query — это КАТАЛОГ, а не товар (D127 '?categoryID=94')
+        self._listing_query_re = re.compile(
+            r'(?:^|[?&])(?:pt_id|c_id|cpath|categoryid|category_id|cat_id|'
+            r'section_id|sectionid|group_id|grp)=')
+        # Служебные сегменты, которые НИКОГДА не товар. Сверяются и с сегментами пути,
+        # и с именем последнего сегмента без расширения, поэтому '/sitemap.html'
+        # больше не товар (D145), как и '/shoppingcart' (D237).
+        self.service_segments = {
+            'cart', 'basket', 'korzina', 'order', 'checkout', 'oformlenie',
+            'personal', 'auth', 'login', 'register', 'compare', 'sravnenie',
+            'eshop_app', 'search', 'poisk',
+            'sitemap', 'sitemaps', 'shoppingcart', 'shopping-cart', 'wishlist',
+        }
+        # Якоря ссылки, прямо указывающие на карточку товара (D228). Список намеренно
+        # узкий: одиночное «подробнее» стоит и у новостей, и у статей.
+        self.product_anchor_markers = [
+            'подробнее о товаре', 'подробнее о продукте', 'подробнее о продукции',
+            'подробнее о материале', 'описание товара', 'карточка товара',
+            'технические характеристики', 'характеристики',
+            'смотреть товар', 'перейти к товару',
+        ]
+        # Сегменты, не считающиеся товарными на «плоском» сайте (см. observe_urls)
+        self.flat_site_stop_segments = self.service_segments | {
+            'index', 'main', 'home', 'about', 'contacts', 'contact', 'news',
+            'map', 'gb', 'price', 'faq', 'forum', 'blog', 'info', 'help',
+            'glavnaya', 'главная', 'novosti', 'kontakty', 'o-nas', 'karta-sayta',
+        }
+        # Признак «плоского» сайта: заполняется observe_urls() по набору URL хоста
+        self.flat_site = False
+        # Ключевые слова товаров/категорий сопоставляем ПО ЛЕВОЙ ГРАНИЦЕ ТОКЕНА, а не
+        # произвольной подстрокой: 'item' больше не матчится внутри 'sitemap' (D145).
+        # Правую границу НЕ требуем намеренно: иначе отвалились бы живые товарные
+        # разделы '/products', '/catalogitems/', '/produkty' (-1400 товарных URL на
+        # корпусе прогона). Служебные 'shoppingcart'/'sitemap.html' отсекаются раньше
+        # стоп-листом service_segments (D237).
+        self._product_keywords_re = self._compile_keyword_prefixes(self.product_keywords)
+        self._category_keywords_re = self._compile_keyword_prefixes(self.category_keywords)
+
+    @staticmethod
+    def _compile_keyword_prefixes(keywords) -> 're.Pattern':
+        """Регэксп «ключевое слово с левой границы токена»: слева от слова не должно
+        быть буквы или цифры (начало сегмента пути, '-', '_', '?', '&')."""
+        return re.compile("|".join(r"(?<![a-z0-9а-яё])" + re.escape(k) for k in keywords))
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        """Путь URL, подготовленный к сопоставлению: percent-декодирование, casefold
+        и снятие завершающего слеша (D117, D145). Корень остаётся '/'."""
+        try:
+            decoded = unquote(path or '')
+        except Exception:
+            decoded = path or ''
+        decoded = decoded.casefold()
+        if not decoded.startswith('/'):
+            decoded = '/' + decoded
+        return decoded.rstrip('/') or '/'
+
+    def observe_urls(self, urls) -> bool:
+        """Сигнал «плоский сайт» (D145, D228, D237): если ни один URL хоста не лежит
+        под товарным или каталожным сегментом, сайт считается плоским — односегментные
+        слаги-директории и листы .htm/.html/.shtml в корне начинают учитываться как
+        товарные кандидаты. Вызывается один раз на компанию по уже известному набору
+        URL (карта сайта / ссылки главной). Возвращает значение флага."""
+        observed = 0
+        stems = self.product_segment_stems + self.category_segment_stems
+        for url in urls:
+            try:
+                path_norm = self._normalize_path(urlparse(url).path)
+            except Exception:
+                continue
+            segments = [seg for seg in path_norm.split('/') if seg]
+            if not segments:
+                continue
+            observed += 1
+            if (self._product_keywords_re.search(path_norm)
+                    or self._category_keywords_re.search(path_norm)
+                    or any(seg.startswith(stem) for seg in segments for stem in stems)
+                    or any(seg in self.category_segment_tokens for seg in segments)):
+                self.flat_site = False
+                return False
+        min_urls = getattr(self.config, 'flat_site_min_urls', 5) if self.config else 5
+        self.flat_site = observed >= min_urls
+        if self.flat_site:
+            log.info(f"Признак «плоский сайт»: товарных/каталожных сегментов не найдено "
+                     f"на {observed} URL — односегментные слаги считаем товарными кандидатами")
+        return self.flat_site
+
+    def _is_flat_product_candidate(self, segments: List[str]) -> bool:
+        """Односегментный слаг-директория или лист .htm/.html/.shtml в корне — типовая
+        форма товарной страницы «плоского» сайта, за вычетом служебного стоп-листа."""
+        if len(segments) != 1:
+            return False
+        name = segments[0]
+        if '.' in name:
+            base, ext = name.rsplit('.', 1)
+            if not base or ext not in ('htm', 'html', 'shtml'):
+                return False
+            name = base
+        return bool(name) and name not in self.flat_site_stop_segments
+
     def calculate_url_depth(self, url: str) -> int:
         """Вычисление глубины URL на основе количества слэшей в пути"""
         try:
@@ -794,6 +916,9 @@ class URLCategorizer:
         self.profile = profile
         self._profile_product_res = []
         self._profile_antipattern_res = []
+        # Признак «плоский сайт» — состояние ПРЕДЫДУЩЕЙ компании, сбрасываем вместе
+        # с профилем (set_profile зовётся из _apply_site_profile на каждую компанию)
+        self.flat_site = False
         if profile is None:
             return
         for pattern in profile.sections.product_url_patterns:
@@ -873,6 +998,10 @@ class URLCategorizer:
         # имени красит сайт целиком в одну категорию (floordealer.ru -> 'dealer': все 420
         # страниц Beaulieu of America ушли в distributor, product_pages=0).
         path_lower = parsed.path.lower() + (('?' + parsed.query.lower()) if parsed.query else '')
+        # P04 U2: нормализованный путь и его сегменты для сопоставления по границам
+        # сегмента (percent-декодирование + casefold + без завершающего слеша)
+        path_norm = self._normalize_path(parsed.path)
+        path_segments = [seg for seg in path_norm.split('/') if seg]
 
         # D69: пер-доменное исключение разделов (скоуплено по netloc, НЕ глобально).
         # Пустой словарь для прочих доменов => цикл ничего не делает, регресса нет.
@@ -951,12 +1080,19 @@ class URLCategorizer:
         if any(keyword in path_lower or keyword in text_lower for keyword in self.price_list_keywords):
             return 'price_list', self.priority_levels['price_list']
         
-        # Проверка на товары (антипаттерн профиля запрещает классификацию «товар»)
-        if not profile_not_product and self._is_product_url(url):
+        # Проверка на товары (антипаттерн профиля запрещает классификацию «товар»).
+        # P04 U2/D228: текст ссылки участвует в товарной оценке.
+        if not profile_not_product and self._is_product_url(url, link_text):
             return 'product', self.priority_levels['product']
-        
-        # Проверка на категории
-        if (any(keyword in path_lower or keyword in text_lower for keyword in self.category_keywords) or
+
+        # Проверка на категории (P04 U2: ключевые слова — по границам токена, а не
+        # подстрокой; плюс каталожные стемы, сегмент 'cat' и листинговые параметры
+        # query, которым положена роль «категория», а не «товар» — D127, D274)
+        if (self._category_keywords_re.search(path_lower) or
+            self._category_keywords_re.search(text_lower) or
+            any(seg.startswith(stem) for seg in path_segments for stem in self.category_segment_stems) or
+            any(seg in self.category_segment_tokens for seg in path_segments) or
+            self._listing_query_re.search(parsed.query.lower()) or
             any(re.search(pattern, url_lower) for pattern in [
                 r'/catalog/', r'/category/', r'/collection/', r'/series/',
                 r'/каталог/', r'/серия/', r'/katalog/', r'/products/'
@@ -988,13 +1124,22 @@ class URLCategorizer:
             
         return False
     
-    def _is_product_url(self, url: str) -> bool:
+    def _is_product_url(self, url: str, link_text: str = "") -> bool:
         """Определение товарного URL с улучшенной эвристикой"""
         url_lower = url.lower()
-        
+        parsed = urlparse(url)
+        # P04 U2 (D117/D145): путь нормализуем ДО матчинга — percent-декодирование,
+        # casefold и снятие завершающего слеша (иначе якорные паттерны '...$' не
+        # срабатывают на '/kategoriya/tovar/'). url_norm — URL с таким путём.
+        path_norm = self._normalize_path(parsed.path)
+        segments = [seg for seg in path_norm.split('/') if seg]
+        url_norm = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path_norm}"
+        if parsed.query:
+            url_norm += '?' + parsed.query.lower()
+
         # Явное исключение для контактов (D123: по пути, иначе слово из домена
         # запрещает товарную классификацию всему сайту)
-        if any(keyword in urlparse(url).path.lower() for keyword in self.contact_keywords):
+        if any(keyword in path_norm for keyword in self.contact_keywords):
             return False
 
         # Явные служебные/корзинные/листинговые страницы интернет-магазинов и 1С-Bitrix — это НЕ товары
@@ -1002,14 +1147,13 @@ class URLCategorizer:
         # Сегментная проверка: эти маркеры стоят отдельным сегментом пути или именем скрипта, поэтому
         # НЕ отсеивают товарные страницы (их slug таких сегментов не содержит, напр.
         # /catalog/stenovye-bloki/stenovoy-blok-d400.../ или /products/ognestoykie-paneli/giplast/).
-        _path = urlparse(url).path.lower()
-        _segments = _path.split('/')
-        _service_segments = {
-            'cart', 'basket', 'korzina', 'order', 'checkout', 'oformlenie',
-            'personal', 'auth', 'login', 'register', 'compare', 'sravnenie',
-            'eshop_app', 'search', 'poisk',
-        }
-        if any(seg in _service_segments for seg in _segments):
+        # P04 U2 (D145/D237): стоп-лист вынесен в self.service_segments и расширен
+        # ('sitemap', 'shoppingcart'); сверяем и сегменты пути, и имя последнего
+        # сегмента без расширения, иначе '/sitemap.html' остаётся товаром.
+        _path = parsed.path.lower()
+        _last_base = segments[-1].rsplit('.', 1)[0] if segments else ''
+        if (any(seg in self.service_segments for seg in segments)
+                or _last_base in self.service_segments):
             return False
         # Листинги-скрипты и не-HTML ресурсы (Bitrix list.php?SECTION_ID, *.js/*.css и т.п.)
         if _path.endswith(('list.php', '.js', '.css', '.json', '.xml')) or _path.split('/')[-1] in ('list.php',):
@@ -1019,31 +1163,57 @@ class URLCategorizer:
         if self._exclude_patterns_re.search(url_lower):
             return False
             
-        # Проверка по паттернам URL
-        url_pattern_match = any(re.search(pattern, url_lower) for pattern in self.product_url_patterns)
-        
-        # Проверка по ключевым словам в пути
-        path = urlparse(url).path.lower()
-        keyword_match = any(keyword in path for keyword in self.product_keywords)
-        
+        # Проверка по паттернам URL (P04 U2/D145: дополнительно по нормализованному
+        # URL — завершающий слеш больше не ломает якорные паттерны '...$').
+        # Нормализованный кандидат берём ТОЛЬКО для слага (в последнем сегменте есть
+        # дефис): иначе снятие слеша красит в товар любую двухсегментную служебную
+        # страницу ('/where-buy/almaty/', '/dillers/dillers/', '/o-kompanii/nagrady/')
+        # — на корпусе прогона это давало +260 ложных товарных URL.
+        _slug_candidate = url_norm if (segments and '-' in segments[-1]) else None
+        url_pattern_match = any(re.search(pattern, url_lower)
+                                or (_slug_candidate is not None and re.search(pattern, _slug_candidate))
+                                for pattern in self.product_url_patterns)
+        # P04 U2/D284: ведущий числовой идентификатор ЧПУ — только по пути, не по URL
+        if not url_pattern_match:
+            url_pattern_match = any(re.search(pattern, path_norm)
+                                    for pattern in self.product_path_patterns)
+
+        # Проверка по ключевым словам в пути (P04 U2: по границам токена + стемы
+        # разделов продукции на кириллице и в транслите — D117, D223, D153)
+        keyword_match = (bool(self._product_keywords_re.search(path_norm))
+                         or any(seg.startswith(stem) for seg in segments
+                                for stem in self.product_segment_stems))
+
         # Проверка на наличие цифр (артикулов)
         has_digits = bool(re.search(r'\d{2,}', url_lower))
-        
+
         # Дополнительная проверка для русскоязычных URL с цифрами в конце
         has_product_pattern = bool(re.search(r'/[a-z0-9-]+-\d+[a-z]*/?$', url_lower))
-        
-        # Проверка на параметры товаров
-        has_product_param = 'product=' in url_lower or 'item=' in url_lower or 'goods=' in url_lower
-        
+
+        # Проверка на параметры товаров (P04 U2/D274/D127: идентификатор товара в query)
+        has_product_param = ('product=' in url_lower or 'item=' in url_lower
+                             or 'goods=' in url_lower
+                             or bool(self._product_query_re.search(parsed.query.lower())))
+
+        # P04 U2/D228: явный товарный якорь ссылки — слабый самостоятельный сигнал
+        text_norm = (link_text or '').casefold()
+        anchor_match = bool(text_norm) and any(m in text_norm for m in self.product_anchor_markers)
+
+        # P04 U2: «плоский» сайт (observe_urls) — односегментный слаг или лист
+        # .htm/.html/.shtml в корне считаем товарным кандидатом
+        flat_match = self.flat_site and self._is_flat_product_candidate(segments)
+
         # Комбинированная оценка
         score = sum([
             url_pattern_match * 2,
-            keyword_match * 1.5, 
+            keyword_match * 1.5,
             has_digits * 1,
             has_product_pattern * 1.5,
-            has_product_param * 2
+            has_product_param * 2,
+            anchor_match * 1.5,
+            flat_match * 1.5
         ])
-        
+
         return score >= 1.5
 
     def is_product_page_by_content(self, soup: BeautifulSoup, url: str) -> bool:

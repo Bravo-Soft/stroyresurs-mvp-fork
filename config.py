@@ -111,6 +111,10 @@ class Config:
     memory_check_interval_pages: int = 50  
     memory_cleanup_threshold_mb: int = 20000  # порог RSS до очистки; держать НИЖЕ mem_limit контейнера (~24 ГБ)
     max_concurrent_contexts: int = 25
+    # P04 U2: минимум URL хоста, по которым определяется признак «плоский сайт»
+    # (нет ни одного товарного/каталожного сегмента). Значение консервативное:
+    # на меньшей выборке признак ненадёжен, порог живым прогоном не измерен.
+    flat_site_min_urls: int = 5
     
     # Настройки HTTP-first слоя (curl_cffi impersonate + cookie-warmup).
     # Требуется пакет curl_cffi (pip install curl_cffi); без него слой авто-отключается.
