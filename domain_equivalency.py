@@ -173,6 +173,11 @@ class DomainEquivalencyManager:
         # Пер-сайтовый рычаг crawl.strict_www из профиля текущей компании (P01 U3 п.6);
         # None = действует только config.strict_www_domains.
         self.profile_strict_www = None
+        # P05 U3: пер-сайтовый периметр из профиля — домен профиля и его
+        # crawl.equivalent_domains (зеркала, бренд-домены группы) плюс суффиксы
+        # crawl.subdomain_collapse ('*.gexa.ru'). Пусто = только config.equivalent_domains.
+        self.profile_domains = set()
+        self.profile_suffixes = ()
 
     def normalize_domain(self, domain: str) -> str:
         """Нормализация домена к каноническому виду"""
@@ -211,6 +216,33 @@ class DomainEquivalencyManager:
         только на www — канонизируем к www без правки config (профиль прошлой компании не
         протекает: краулер сбрасывает значение в None на каждой компании)."""
         self.profile_strict_www = strip_www(domain) if domain else None
+
+    def set_profile_domains(self, domain: Optional[str], equivalent_domains=None,
+                            subdomain_collapse=None) -> None:
+        """P05 U3 п.1: периметр обхода из профиля сайта. До сих пор crawl.equivalent_domains
+        и crawl.subdomain_collapse влияли только на выбор профиля (resolver.py), а гейт
+        периметра читал исключительно config.equivalent_domains. Сбрасывается на каждой
+        компании (профиль прошлой не протекает)."""
+        domains = {self.normalize_domain(domain)} if domain else set()
+        for alias in (equivalent_domains or []):
+            if alias:
+                domains.add(self.normalize_domain(alias))
+        suffixes = []
+        for pattern in (subdomain_collapse or []):
+            suffix = str(pattern or '').lstrip('*').lower()
+            if suffix.startswith('.') and len(suffix) > 1:
+                suffixes.append('.' + self.normalize_domain(suffix[1:]))
+        self.profile_domains = domains
+        self.profile_suffixes = tuple(suffixes)
+
+    def _in_profile_scope(self, domain: str) -> bool:
+        """Хост входит в пер-сайтовый периметр профиля: домен профиля или его алиас
+        (crawl.equivalent_domains) либо суффикс crawl.subdomain_collapse."""
+        if not domain:
+            return False
+        if domain in self.profile_domains:
+            return True
+        return any(domain.endswith(suffix) for suffix in self.profile_suffixes)
 
     def get_canonical_domain(self, url: str) -> str:
         """Получение канонического домена из URL"""
@@ -260,6 +292,10 @@ class DomainEquivalencyManager:
         (напр. vmp-holding.ru <-> vmp-anticor.ru / vmp-plamcor.ru / vmp-goodline.ru).
         Возвращает нормализованные домены; если домен ни в одну группу не входит — {domain}."""
         normalized = self.normalize_domain(domain)
+        if normalized in self.profile_domains:
+            # P05 U3: allowlist профиля (зеркало хостера, бренд-домены группы) —
+            # такая же группа, как config.equivalent_domains, но пер-сайтовая
+            return set(self.profile_domains)
         groups = getattr(self.config, 'equivalent_domains', None) or {}
         for primary, related in groups.items():
             members = {self.normalize_domain(primary)}
@@ -277,8 +313,14 @@ class DomainEquivalencyManager:
             domain1 = self.get_canonical_domain(url1)
             domain2 = self.get_canonical_domain(url2)
 
-            # Сравниваем канонические домены
-            if domain1 == domain2:
+            # Сравниваем канонические домены. hosts_equivalent добавляет мобильное
+            # зеркало (m./mobile./touch.) — тот же сайт, что и апекс (P05 U3 п.2, D272).
+            if domain1 == domain2 or hosts_equivalent(domain1, domain2):
+                return True
+
+            # P05 U3: пер-сайтовый периметр из профиля (crawl.equivalent_domains,
+            # crawl.subdomain_collapse) — каталог на поддомене/бренд-домене группы
+            if self._in_profile_scope(domain1) and self._in_profile_scope(domain2):
                 return True
 
             # Домены из одной группы config.equivalent_domains тоже эквивалентны:
@@ -360,6 +402,15 @@ class DomainEquivalencyManager:
             return weak_url
         log.warning(f"Не найден рабочий URL для {url}, откат на адрес из Site_list: {original_url}")
         return original_url
+
+    async def fetch_page_body(self, url: str) -> str:
+        """Одиночная проба произвольного адреса: тело ответа 200 либо пустая строка.
+        Нужна автодетекту зеркала (P05 U3): подтвердить, что внешний хост отдаёт тот же
+        сайт, можно только заглянув на его главную."""
+        answer = await self._probe_http(url, verify_tls=True, use_range=False)
+        if answer.status is None and answer.tls_error:
+            answer = await self._probe_http(url, verify_tls=False, use_range=False)
+        return answer.body if answer.status == 200 else ''
 
     def _build_candidates(self, original_url: str) -> list:
         """Кандидаты из ИСХОДНОГО адреса: путь сохраняется (/ru/, /ru_RU/…), первой идёт
