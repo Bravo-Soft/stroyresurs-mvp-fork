@@ -62,6 +62,14 @@ class RunMetricsCollector:
         self.sitemap_queued = None              # поставлено в очередь из карты сайта
         self.sitemap_filtered = None            # отфильтровано из карты сайта
         self.url_filters = {}                   # доли отсева URL фильтрами категоризатора (P04 U1)
+        # D120/D219/D245: судьба URL карты сайта на постановке в очередь и на фетче.
+        # Высокая доля дублей одного ключа ловит D245, высокая доля no_content — D120/D219.
+        self.sitemap_offered = 0                # сколько URL карты дошло до гейтов очереди
+        self.sitemap_dup_skipped = 0            # из них отбито как дубликаты ключа
+        self.sitemap_no_content = 0             # адреса карты, не отдавшие содержимое
+        # D257/D233: испорченные href страницы (пробельные края, вклеенный в путь URL)
+        self.href_total = 0
+        self.mangled_href = Counter()           # whitespace / glued
 
     # ---------- хуки краулера ----------
 
@@ -228,6 +236,13 @@ class RunMetricsCollector:
             'excluded2_rate': self.url_filters.get('excluded2_rate'),
             'lang_excluded_rate': self.url_filters.get('lang_excluded_rate'),
             'url_filters': dict(self.url_filters) or None,
+            # Судьба URL карты сайта (D120/D219/D245)
+            'sitemap_offered': self.sitemap_offered,
+            'sitemap_dup_skip_rate': self._rate(self.sitemap_dup_skipped, self.sitemap_offered),
+            'sitemap_no_content_rate': self._rate(self.sitemap_no_content, self.sitemap_offered),
+            # Испорченные href страницы (D257/D233)
+            'mangled_href_rate': self._rate(sum(self.mangled_href.values()), self.href_total),
+            'mangled_href_kinds': dict(self.mangled_href),
         }
         metrics['alerts'] = self._alerts(metrics)
         return metrics
@@ -275,6 +290,13 @@ class RunMetricsCollector:
         if metrics.get('sitemap_filtered') and not metrics.get('sitemap_queued'):
             alerts.append(f'из карты сайта в очередь добавлено 0 при '
                           f'{metrics["sitemap_filtered"]} отфильтрованных')
+        # D245: карта сайта схлопнулась в один нормализованный ключ;
+        # D120/D219: адреса карты не отдают содержимое (испорчено написание URL).
+        if metrics.get('sitemap_offered'):
+            if (metrics.get('sitemap_dup_skip_rate') or 0) > 0.8:
+                alerts.append(f'sitemap_dup_skip_rate {metrics["sitemap_dup_skip_rate"]} > 0.8')
+            if (metrics.get('sitemap_no_content_rate') or 0) > 0.8:
+                alerts.append(f'sitemap_no_content_rate {metrics["sitemap_no_content_rate"]} > 0.8')
         return alerts
 
     @_safe
@@ -287,3 +309,27 @@ class RunMetricsCollector:
             json.dump(self.to_dict(), fh, ensure_ascii=False, indent=1)
         logger.info(f'Метрики профилирования записаны: {path}')
         return path
+
+    @_safe
+    def record_sitemap_offered(self, offered, dup_skipped):
+        """D245: сколько URL карты сайта дошло до гейтов очереди и сколько из них
+        отбито как дубликаты одного нормализованного ключа."""
+        self.sitemap_offered += int(offered)
+        self.sitemap_dup_skipped += int(dup_skipped)
+
+    @_safe
+    def record_sitemap_no_content(self, url):
+        """D120/D219: адрес из карты сайта не отдал содержимое (кандидат на испорченное
+        написание URL — снятый слеш, снятый локаль-префикс)."""
+        self.sitemap_no_content += 1
+
+    @_safe
+    def record_href_seen(self):
+        """Знаменатель mangled_href_rate: сколько href страницы прошло через санацию."""
+        self.href_total += 1
+
+    @_safe
+    def record_mangled_href(self, kind):
+        """D257/D233: href пришлось чинить — 'whitespace' (пробельные края) либо
+        'glued' (в путь вклеен ещё один абсолютный адрес)."""
+        self.mangled_href[str(kind)] += 1

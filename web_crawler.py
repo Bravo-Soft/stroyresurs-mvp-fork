@@ -2,6 +2,7 @@
 import re
 import os
 import gc
+import gzip
 import time
 import json
 import hashlib
@@ -108,6 +109,32 @@ IMPERSONATE_HEADERS = {
     "Sec-Fetch-User": "?1",
     "Cache-Control": "max-age=0",
 }
+
+# D233: в ПУТЬ ссылки вклеен ещё один абсолютный адрес («…/catalog/https:/example.ru/x»);
+# встречается и с одним слешем после схемы. В query такое легально (редиректоры,
+# share-ссылки), поэтому эвристика применяется только к пути.
+_GLUED_URL_IN_PATH_RE = re.compile(r'(https?:)/{1,3}', re.I)
+
+
+def sanitize_href(href: str) -> str:
+    """D257/D233: приводит значение атрибута href к пригодному для склейки виду —
+    срезает пробельные края и чинит адрес с вклеенным в ПУТЬ абсолютным URL.
+    Возвращает исходное значение, если чинить нечего."""
+    cleaned = (href or '').strip()
+    if not cleaned:
+        return cleaned
+    cut = len(cleaned)
+    for separator in ('?', '#'):
+        position = cleaned.find(separator)
+        if position != -1:
+            cut = min(cut, position)
+    path_part, tail = cleaned[:cut], cleaned[cut:]
+    matches = list(_GLUED_URL_IN_PATH_RE.finditer(path_part))
+    if not matches or matches[-1].start() == 0:
+        return cleaned
+    last = matches[-1]
+    return f"{last.group(1).lower()}//{path_part[last.end():].lstrip('/')}{tail}"
+
 
 @dataclass
 class ParseResult:
@@ -1525,9 +1552,12 @@ class SmartURLNormalizer:
             'region',
         }
         
-        # Пагинационные параметры с ограничением глубины
+        # Пагинационные параметры с ограничением глубины.
+        # D245 (Гомельобои): 'p' из списка убран — в WordPress это идентификатор записи
+        # (?p=5845 — товарный пермалинк), а не номер страницы. Считая его пагинацией,
+        # нормализатор схлопывал 637 товарных URL карты сайта в корень сайта.
         self.pagination_params = {
-            'page': 50, 'p': 50, 'paging': 50, 'offset': 100, 'start': 100
+            'page': 50, 'paging': 50, 'offset': 100, 'start': 100
         }
 
         # Кэш для ускорения нормализации - ключ: нормализованный URL
@@ -1539,6 +1569,10 @@ class SmartURLNormalizer:
         """Нормализация URL с кэшированием по нормализованному виду"""
         if not url:
             return url
+
+        # D257 (Пластруб): хвостовой пробел в href доезжал до запроса и давал 403 —
+        # сервер видел адрес с '%20' на конце. Ключ дедупликации тоже расходился.
+        url = url.strip()
 
         # D98 (АэроБел): где-то в пайплайне html.unescape декодирует «&region» в URL как
         # legacy-сущность &reg; → «®ion» (®=U+00AE, %C2%AE). Сайт таких URL НЕ отдаёт —
@@ -1580,16 +1614,12 @@ class SmartURLNormalizer:
             if path:
                 path = re.sub(r'^/ru(?=/|$)', '', path, flags=re.I)
             if path:
-                # Проверяем, заканчивается ли путь на число
-                if re.search(r'/\d+/?$', path):
-                    # Если URL уже имеет слеш - сохраняем его
-                    if path.endswith('/'):
-                        path = path  # оставляем как есть
-                    else:
-                        path = path + '/'  # добавляем слеш
-                else:
-                    # Для остальных URL - стандартная обработка
-                    path = path.rstrip('/')
+                # D198 (Костромской силикатный): раньше путям, кончающимся цифрами,
+                # принудительно дописывался слеш (/product/102 -> /product/102/).
+                # В роли КЛЮЧА дедупликации обе формы и так схлопываются общим rstrip('/'),
+                # а как база склейки относительных ссылок дописанный слеш давал лишний
+                # сегмент (/product/product/NNN) и 404 на всех карточках товаров.
+                path = path.rstrip('/')
             
             if not path:
                 path = '/'
@@ -1605,15 +1635,10 @@ class SmartURLNormalizer:
                 if key_lower in self.params_to_remove:
                     continue
                     
-                # Обрабатываем пагинацию
-                if key_lower in self.pagination_params:
-                    if values and values[0].isdigit():
-                        page_num = int(values[0])
-                        max_pages = self.pagination_params[key_lower]
-                        if page_num <= max_pages:
-                            filtered_params[key] = values
-                    continue
-                
+                # D245: пагинационный параметр НЕ вырезаем. Молчаливое удаление
+                # схлопывало разные страницы в один ключ, и гейт дублей гасил их все.
+                # Слишком глубокая пагинация отбраковывается вызывающим кодом целым
+                # URL (is_over_pagination_limit), а не подменой адреса.
                 filtered_params[key] = values
             
             # Сортируем параметры
@@ -1643,7 +1668,21 @@ class SmartURLNormalizer:
         except Exception as e:
             log.warning(f"Ошибка нормализации URL {url}: {e}")
             return url
-    
+
+    def is_over_pagination_limit(self, url: str) -> bool:
+        """D245: признак слишком глубокой пагинации (?page=999) — кандидат на отбраковку
+        URL ЦЕЛИКОМ. Прежде нормализатор молча вырезал такой параметр, и адрес схлопывался
+        с первой страницей листинга; теперь параметр сохраняется, а решение об отказе
+        принимает вызывающий код (постановка в очередь). Fail-open: при любой ошибке False."""
+        try:
+            for key, values in parse_qs(urlparse(url).query, keep_blank_values=True).items():
+                limit = self.pagination_params.get(key.lower())
+                if limit is not None and values and values[0].isdigit() and int(values[0]) > limit:
+                    return True
+        except Exception as e:
+            log.debug(f"is_over_pagination_limit: не удалось разобрать {url}: {e}")
+        return False
+
     def extract_canonical_url(self, soup: BeautifulSoup, current_url: str) -> str:
         """Извлечение canonical URL из HTML мета-тегов"""
         try:
@@ -1696,49 +1735,146 @@ class SiteMapParser:
         self.url_normalizer = url_normalizer
         
         
-        # Форматы карт сайта
+        # Форматы карт сайта. D214: после '/sitemap1.xml' была пропущена запятая —
+        # Python склеивал литералы в '/sitemap1.xml/rss.xml', и в списке было 12 путей
+        # вместо 13; отдельно добавлены штатные пути WordPress >= 5.5 и индексов.
         self.sitemap_paths = [
             '/sitemap.xml', '/sitemap/index.xml', '/sitemap_index.xml', '/sitemap',
-            '/sitemap.txt', '/sitemap.html', '/site-map.html', '/sitemap/xml/', '/xml/sitemap.xml', '/sitemap1.xml'
+            '/sitemap.txt', '/sitemap.html', '/site-map.html', '/sitemap/xml/', '/xml/sitemap.xml', '/sitemap1.xml',
+            '/wp-sitemap.xml', '/sitemap-index.xml', '/wp-sitemap-index.xml',
             '/rss.xml', '/feed.xml', '/atom.xml'
         ]
         
         # Кэш для избежания повторной обработки
         self._processed_sitemaps = set()
-        
+
+    # D144/D208: разделы, которые товарных карточек не дают, но в карте сайта
+    # конкурируют за кэп sitemap_max_urls с настоящими карточками.
+    _INFO_PATH_TOKENS = frozenset({
+        'news', 'novosti', 'blog', 'article', 'articles', 'stati', 'press',
+        'about', 'o-kompanii', 'company', 'faq', 'vacancy', 'vakansii',
+        'gallery', 'photo', 'video', 'reviews', 'otzyvy', 'events',
+    })
+
+    @staticmethod
+    def _has_article_slug(path: str) -> bool:
+        """Последний сегмент пути похож на артикул/детальную карточку: содержит цифру."""
+        slug = path.rstrip('/').rsplit('/', 1)[-1].lower()
+        return bool(slug) and bool(re.search(r'\d', slug))
+
+    def _sitemap_rank_key(self, row):
+        """D144/D208: ключ ранжирования кандидатов карты сайта ДО применения кэпа.
+        По возрастанию: приоритет (выше — раньше), не-info раздел, артикульный слаг,
+        глубина пути, сам адрес (детерминизм между запусками)."""
+        url, normalized_url, category, priority = row
+        try:
+            path = urlparse(url).path or '/'
+        except Exception:
+            path = '/'
+        segments = [seg.lower() for seg in path.split('/') if seg]
+        is_info = any(seg in self._INFO_PATH_TOKENS for seg in segments)
+        return (-priority, 1 if is_info else 0,
+                0 if self._has_article_slug(path) else 1, len(segments), url)
+
+
+    # D164/D240: ранжирование источников карт. Товарная карта должна разбираться
+    # первой, карта вложений/новостей — последней.
+    _SITEMAP_GOOD_TOKENS = ('product', 'catalog', 'katalog', 'shop', 'iblock', 'tovar')
+    _SITEMAP_BAD_TOKENS = ('attachment', 'media', 'news', 'blog', 'author', 'tag', 'feed')
+
+    def _is_own_sitemap_host(self, sitemap_url: str, base_url: str) -> bool:
+        """D143: карта принадлежит этому сайту? Равенство доменов считает
+        DomainEquivalencyManager, поэтому домены холдинга из config.equivalent_domains
+        остаются своими. Fail-open: при выключенной эквивалентности сравниваем netloc
+        напрямую (is_main_domain в этом режиме возвращает None и отбросил бы всё)."""
+        try:
+            if self.url_categorizer.is_main_domain(sitemap_url, base_url):
+                return True
+            if not getattr(self.config, 'domain_equivalency_enabled', True):
+                return urlparse(sitemap_url).netloc.lower() == urlparse(base_url).netloc.lower()
+        except Exception:
+            return True
+        return False
+
+    def _sitemap_source_rank(self, sitemap_url: str, base_url: str):
+        """D164/D240: детерминированный порядок карт вместо list(set(...)).
+        По возрастанию: свой хост, товарное имя, не карта вложений/новостей, адрес."""
+        try:
+            name = urlparse(sitemap_url).path.lower()
+            same_host = self.url_categorizer.is_main_domain(sitemap_url, base_url)
+        except Exception:
+            name, same_host = sitemap_url.lower(), False
+        return (0 if same_host else 1,
+                0 if any(token in name for token in self._SITEMAP_GOOD_TOKENS) else 1,
+                1 if any(token in name for token in self._SITEMAP_BAD_TOKENS) else 0,
+                sitemap_url)
+
     async def discover_sitemap_urls(self, base_url: str) -> List[str]:
-        """Обнаружение карт сайта по стандартным путям и через robots.txt"""
+        """Обнаружение карт сайта по стандартным путям и через robots.txt.
+
+        D214: кандидат принимается по фактическому адресу после редиректов.
+        D143: карты на чужом registrable-домене отбрасываются (равенство доменов
+        считает DomainEquivalencyManager, поэтому домены холдинга из
+        config.equivalent_domains остаются разрешёнными).
+        D164/D240: порядок карт детерминированный."""
         sitemap_urls = []
         parsed_base = urlparse(base_url)
-        
+
         # 1. Проверка стандартных путей
         for path in self.sitemap_paths:
             sitemap_url = f"{parsed_base.scheme}://{parsed_base.netloc}{path}"
-            if await self._check_sitemap_exists(sitemap_url):
-                sitemap_urls.append(sitemap_url)
-        
+            effective_url = await self._check_sitemap_exists(sitemap_url)
+            if effective_url:
+                sitemap_urls.append(effective_url)
+
         # 2. Извлечение из robots.txt
         robots_url = f"{parsed_base.scheme}://{parsed_base.netloc}/robots.txt"
         robots_sitemaps = await self._extract_sitemaps_from_robots(robots_url)
         sitemap_urls.extend(robots_sitemaps)
-        
+
         # 3. Поиск ссылок на карту сайта на главной странице
         html_sitemaps = await self._find_sitemap_links_in_html(base_url)
         sitemap_urls.extend(html_sitemaps)
-        
-        # Удаление дубликатов
-        return list(set(sitemap_urls))
-    
-    async def _check_sitemap_exists(self, url: str) -> bool:
-        """Проверка существования карты сайта"""
+
+        # D143: фильтр принадлежности — карта чужого домена (дорвей в robots.txt,
+        # ссылка на сервис-агрегатор) приносит чужие адреса и жжёт товарную квоту
+        own_urls = []
+        for sitemap_url in sitemap_urls:
+            if self._is_own_sitemap_host(sitemap_url, base_url):
+                own_urls.append(sitemap_url)
+            else:
+                log.info(f"Карта сайта на чужом домене отброшена: {sitemap_url}")
+
+        # Удаление дубликатов с сохранением детерминированного порядка
+        unique_urls = list(dict.fromkeys(own_urls))
+        unique_urls.sort(key=lambda u: self._sitemap_source_rank(u, base_url))
+        return unique_urls
+
+    async def _check_sitemap_exists(self, url: str) -> Optional[str]:
+        """Проверка существования карты сайта. D214: возвращает ФАКТИЧЕСКИЙ адрес карты
+        (после редиректов) либо None. Раньше метод отдавал bool по HEAD без редиректов
+        (у aiohttp для HEAD allow_redirects=False по умолчанию), и 301 на живую карту
+        читался как «карты нет»; часть хостеров к тому же отвечает на HEAD 405."""
+        timeout = aiohttp.ClientTimeout(total=self.config.sitemap_timeout_seconds)
         try:
             connector = aiohttp.TCPConnector(ssl=False)
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.head(url, timeout=10) as response:
-                    return response.status == 200
-        except:
-            return False
-    
+                async with session.head(url, timeout=timeout, allow_redirects=True) as response:
+                    if 200 <= response.status < 300:
+                        return str(response.url)
+                    if 300 <= response.status < 400:
+                        location = response.headers.get('Location')
+                        return urljoin(url, location) if location else None
+                    if response.status not in (400, 403, 405, 501):
+                        return None
+                # HEAD не поддержан хостером — пробуем GET
+                async with session.get(url, timeout=timeout, allow_redirects=True) as response:
+                    if 200 <= response.status < 300:
+                        return str(response.url)
+        except Exception as e:
+            log.debug(f"Карта сайта {url} недоступна: {e}")
+        return None
+
     async def _extract_sitemaps_from_robots(self, robots_url: str) -> List[str]:
         """Извлечение карт сайта из robots.txt"""
         try:
@@ -1773,7 +1909,7 @@ class SiteMapParser:
                         
                         for link in soup.find_all('a', href=True):
                             link_text = link.get_text().lower()
-                            href = link['href']
+                            href = sanitize_href(link['href'])  # D257
                             
                             # Проверка по тексту ссылки
                             if any(keyword in link_text for keyword in sitemap_keywords):
@@ -1785,8 +1921,14 @@ class SiteMapParser:
             pass
         return []
     
-    async def parse_sitemap(self, sitemap_url: str, depth: int = 0, max_depth: int = 3) -> List[Tuple[str, str, int]]:
-        """Рекурсивный парсинг карты сайта с ограничением глубины"""
+    async def parse_sitemap(self, sitemap_url: str, depth: int = 0, max_depth: int = 3) -> List[Tuple[str, str, str, int]]:
+        """Рекурсивный парсинг карты сайта с ограничением глубины.
+
+        D120/D219/D198: элемент результата — четвёрка
+        (опубликованный адрес, нормализованный ключ, категория, приоритет).
+        Опубликованный адрес — ровно тот, что стоит в карте сайта; именно он уходит
+        в очередь и на фетч. Нормализованный вид остаётся ТОЛЬКО ключом дедупликации
+        (visited_urls / product_urls / гейт дублей)."""
         if depth > max_depth or sitemap_url in self._processed_sitemaps:
             return []
             
@@ -1799,12 +1941,22 @@ class SiteMapParser:
                 async with session.get(sitemap_url, timeout=10) as response:
                     if response.status != 200:
                         return []
-                    
-                    content = await response.text()
-                    
+
+                    # D196: тело читаем как БАЙТЫ. Раньше .text() всегда декодировал
+                    # ответ как текст, и .gz-карта валила парсер на первом же байте.
+                    raw = await response.read()
+                    content = self._decode_sitemap_body(raw, sitemap_url)
+                    if content is None:
+                        # Битый .gz — та же карта часто лежит и без расширения
+                        if sitemap_url.lower().endswith('.gz'):
+                            log.warning(f"Не удалось распаковать {sitemap_url}, "
+                                        f"пробуем тот же адрес без .gz")
+                            return await self.parse_sitemap(sitemap_url[:-3], depth, max_depth)
+                        return []
+
                     # Определение типа карты сайта по content-type или расширению
                     content_type = response.headers.get('content-type', '').lower()
-                    
+
                     if 'xml' in content_type or sitemap_url.endswith('.xml') or '/sitemap' in sitemap_url.lower():
                         return await self._parse_xml_sitemap(content, sitemap_url, depth, max_depth)
                     elif 'html' in content_type or any(ext in sitemap_url for ext in ['.html', '.htm']):
@@ -1822,7 +1974,45 @@ class SiteMapParser:
         
         return []
     
-    async def _parse_xml_sitemap(self, content: str, sitemap_url: str, depth: int, max_depth: int) -> List[Tuple[str, str, int]]:
+    @staticmethod
+    def _decode_sitemap_body(raw: bytes, sitemap_url: str) -> Optional[str]:
+        """D196: распаковывает gzip по сигнатуре 0x1f 0x8b или расширению .gz и
+        декодирует тело карты сайта. None — тело не читается (битый .gz)."""
+        try:
+            if raw[:2] == b'\x1f\x8b' or sitemap_url.lower().endswith('.gz'):
+                raw = gzip.decompress(raw)
+            return raw.decode('utf-8', errors='replace')
+        except Exception as e:
+            log.warning(f"Не удалось прочитать тело карты сайта {sitemap_url}: {e}")
+            return None
+
+    @staticmethod
+    def _repair_loc(loc: str, sitemap_url: str) -> Optional[str]:
+        """D151: восстанавливает адрес <loc> без хоста по адресу самой карты сайта.
+        Bitrix с пустым SERVER_NAME пишет 'https:///catalog/x/', а часть генераторов —
+        просто '/catalog/x/'; и то и другое даёт пустой netloc, проходит гейт поддоменов
+        и занимает товарную квоту, а гасится молча уже после постановки в очередь.
+        None — адрес неисправим."""
+        try:
+            parsed = urlparse(loc)
+            if parsed.netloc:
+                return loc
+            if not parsed.path:
+                return None
+            return urljoin(sitemap_url, urlunparse(('', '', parsed.path, parsed.params,
+                                                    parsed.query, '')))
+        except Exception:
+            return None
+
+    def _submap_rank(self, loc: str):
+        """D154: при ограничении числа подкарт индекса первыми разбираются товарные
+        (Bitrix нумерует карты по id инфоблока, товарный часто заводится последним)."""
+        name = loc.lower()
+        return (0 if any(token in name for token in self._SITEMAP_GOOD_TOKENS) else 1,
+                1 if any(token in name for token in self._SITEMAP_BAD_TOKENS) else 0,
+                loc)
+
+    async def _parse_xml_sitemap(self, content: str, sitemap_url: str, depth: int, max_depth: int) -> List[Tuple[str, str, str, int]]:
         """Парсинг XML карты сайта (включая sitemap index)"""
         try:
             soup = BeautifulSoup(content, 'xml')
@@ -1831,14 +2021,22 @@ class SiteMapParser:
             # Проверка на sitemap index
             sitemap_tags = soup.find_all('sitemap')
             if sitemap_tags:
-                # Это индексный файл - парсим вложенные карты сайта
-                tasks = []
-                for sitemap_tag in sitemap_tags[:5]:  # Ограничиваем количество вложенных
-                    loc_tag = sitemap_tag.find('loc')
-                    if loc_tag and loc_tag.text:
-                        task = self.parse_sitemap(loc_tag.text, depth + 1, max_depth)
-                        tasks.append(task)
-                
+                # Это индексный файл - парсим вложенные карты сайта.
+                # D154: жёсткий срез [:5] заменён конфиг-параметром (по умолчанию — все);
+                # при действующем лимите первыми берутся товарные подкарты.
+                locs = [tag.find('loc').text.strip() for tag in sitemap_tags
+                        if tag.find('loc') and tag.find('loc').text]
+                limit = self.config.sitemap_max_submaps
+                if limit and len(locs) > limit:
+                    chosen = sorted(locs, key=self._submap_rank)[:limit]
+                    log.info(f"Индекс {sitemap_url}: {len(locs)} карт, разобрано {len(chosen)}, "
+                             f"пропущено {len(locs) - len(chosen)}: "
+                             f"{', '.join(loc for loc in locs if loc not in chosen)[:500]}")
+                else:
+                    chosen = locs
+                    log.info(f"Индекс {sitemap_url}: {len(locs)} карт, разобраны все")
+                tasks = [self.parse_sitemap(loc, depth + 1, max_depth) for loc in chosen]
+
                 if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     for result in results:
@@ -1846,12 +2044,23 @@ class SiteMapParser:
                             all_urls.extend(result)
                 return all_urls
             
-            # Обычная карта сайта с URL
+            # Обычная карта сайта с URL. D144/D208: категоризуем адреса карты (до потолка
+            # сканирования) и режем по кэпу ПОСЛЕ ранжирования — прежде срез
+            # url_tags[:sitemap_max_urls] шёл в порядке документа, до категоризации, и
+            # товарные карточки из хвоста карты не попадали в обход вовсе.
             url_tags = soup.find_all('url')
-            for url_tag in url_tags[:self.config.sitemap_max_urls]:
+            scanned_tags = url_tags[:self.config.sitemap_max_scan_urls]
+            broken_locs = 0
+            for url_tag in scanned_tags:
                 loc_tag = url_tag.find('loc')
                 if loc_tag and loc_tag.text:
                     url = loc_tag.text.strip()
+                    # D151: <loc> без хоста чиним по адресу самой карты ДО категоризации
+                    # и до постановки в очередь; неисправимые отбрасываем
+                    url = self._repair_loc(url, sitemap_url)
+                    if not url:
+                        broken_locs += 1
+                        continue
                     normalized_url = self.url_normalizer.normalize_url(url)
 
                     # Пропускаем URL с не-русскими языковыми префиксами
@@ -1860,11 +2069,26 @@ class SiteMapParser:
 
                     category, priority = self.url_categorizer.categorize_url(url)
                     
-                    # Повышаем приоритет для URL из карты сайта
-                    enhanced_priority = min(priority + 1, 10)
-                    
-                    all_urls.append((normalized_url, category, enhanced_priority))
-            
+                    # Повышаем приоритет для URL из карты сайта. D208: потолок 10 снят —
+                    # он схлопывал товар, категорию и контакты в один приоритет, и
+                    # пересортировка очереди переставала что-либо различать.
+                    enhanced_priority = priority + 1
+
+                    # D120: в очередь уйдёт ОПУБЛИКОВАННЫЙ адрес, нормализованный — ключ
+                    all_urls.append((url, normalized_url, category, enhanced_priority))
+
+            if broken_locs:
+                log.warning(f"Карта сайта {sitemap_url}: отброшено {broken_locs} "
+                            f"неисправимых <loc> (пустой путь)")
+            if len(url_tags) > len(scanned_tags):
+                log.warning(f"Карта сайта {sitemap_url}: {len(url_tags)} адресов, "
+                            f"просканировано {len(scanned_tags)} (потолок sitemap_max_scan_urls)")
+            all_urls.sort(key=self._sitemap_rank_key)
+            if len(all_urls) > self.config.sitemap_max_urls:
+                log.info(f"Карта сайта {sitemap_url}: {len(all_urls)} адресов после "
+                         f"категоризации, в кэп {self.config.sitemap_max_urls} берём лучшие по рангу")
+                all_urls = all_urls[:self.config.sitemap_max_urls]
+
             log.info(f"Извлечено {len(all_urls)} URL из XML карты сайта")
             return all_urls
             
@@ -1872,7 +2096,7 @@ class SiteMapParser:
             log.error(f"Ошибка парсинга XML карты сайта: {e}")
             return []
     
-    async def _parse_html_sitemap(self, content: str, sitemap_url: str) -> List[Tuple[str, str, int]]:
+    async def _parse_html_sitemap(self, content: str, sitemap_url: str) -> List[Tuple[str, str, str, int]]:
         """Парсинг HTML карты сайта"""
         try:
             soup = BeautifulSoup(content, 'html.parser')
@@ -1881,7 +2105,7 @@ class SiteMapParser:
             
             # Ищем все ссылки в HTML
             for link in soup.find_all('a', href=True)[:self.config.sitemap_max_urls]:
-                href = link['href']
+                href = sanitize_href(link['href'])  # D257/D233
                 if href and not href.startswith(('#', 'javascript:', 'mailto:')):
                     full_url = urljoin(base_domain, href)
 
@@ -1891,10 +2115,11 @@ class SiteMapParser:
                     normalized_url = self.url_normalizer.normalize_url(full_url)
                     
                     category, priority = self.url_categorizer.categorize_url(full_url)
-                    enhanced_priority = min(priority + 1, 10)
-                    
-                    all_urls.append((normalized_url, category, enhanced_priority))
-            
+                    # D208: потолок 10 снят (см. _parse_xml_sitemap)
+                    enhanced_priority = priority + 1
+
+                    all_urls.append((full_url, normalized_url, category, enhanced_priority))
+
             log.info(f"Извлечено {len(all_urls)} URL из HTML карты сайта")
             return all_urls
             
@@ -1902,7 +2127,7 @@ class SiteMapParser:
             log.error(f"Ошибка парсинга HTML карты сайта: {e}")
             return []
     
-    async def _parse_text_sitemap(self, content: str, sitemap_url: str) -> List[Tuple[str, str, int]]:
+    async def _parse_text_sitemap(self, content: str, sitemap_url: str) -> List[Tuple[str, str, str, int]]:
         """Парсинг текстовой карты сайта"""
         try:
             all_urls = []
@@ -1920,10 +2145,11 @@ class SiteMapParser:
                     normalized_url = self.url_normalizer.normalize_url(full_url)
                     
                     category, priority = self.url_categorizer.categorize_url(full_url)
-                    enhanced_priority = min(priority + 1, 10)
-                    
-                    all_urls.append((normalized_url, category, enhanced_priority))
-            
+                    # D208: потолок 10 снят (см. _parse_xml_sitemap)
+                    enhanced_priority = priority + 1
+
+                    all_urls.append((full_url, normalized_url, category, enhanced_priority))
+
             log.info(f"Извлечено {len(all_urls)} URL из текстовой карты сайта")
             return all_urls
             
@@ -1984,7 +2210,7 @@ class ProductGridParser:
         
         # Ищем все ссылки внутри элемента сетки
         for link in element.find_all('a', href=True):
-            href = link['href']
+            href = sanitize_href(link['href'])  # D257/D233
             if not href or href.startswith(('#', 'javascript:')):
                 continue
                 
@@ -2763,6 +2989,22 @@ class WebCrawler:
         self._product_text_hash_counts = {}
         self._stale_sitemap_guard_tripped = False
         self.stale_sitemap_dup_threshold = getattr(self.config, 'stale_sitemap_dup_threshold', 10)
+        # P02 U1: учёт товарной квоты. Слот занимается при ПОСТАНОВКЕ URL в очередь и
+        # до сих пор не возвращался ни на одном пути неуспеха — сайт с мёртвой картой
+        # сжигал все 50 слотов, не сохранив ни одной страницы.
+        self._quota_released = set()          # ключи, по которым слот уже возвращён
+        self._product_quota_reused = 0        # сколько раз слот переиспользован
+        self.product_quota_reuse_limit = getattr(self.config, 'product_quota_reuse_limit', 50)
+        self._quota_rejected_urls = []        # товарные адреса, отбитые гейтом квоты
+        self._queue_gate_rejections = {}      # немые отказы гейтов очереди: причина -> счётчик
+        self._sitemap_hard_fail_streak = 0    # подряд идущие жёсткие отказы товарных URL карты
+        self.stale_sitemap_hard_fail_threshold = getattr(
+            self.config, 'stale_sitemap_hard_fail_threshold', 15)
+        # D120 п.7: опубликованные в карте сайта адреса, отличающиеся от своего
+        # нормализованного ключа: {нормализованный ключ: адрес из <loc>}. Нужны, чтобы
+        # при no_content/404 на другом написании того же ключа (напр. бесслешевом
+        # стартовом пути) повторить запрос ровно опубликованным адресом.
+        self._sitemap_published_urls = {}
         # D40: ретраи страниц, не отдавших контент (таймауты медленных сайтов):
         # {normalized_url: (url, depth, category, attempts)}
         self._page_retry_candidates = {}
@@ -2800,7 +3042,17 @@ class WebCrawler:
         if n < self.stale_sitemap_dup_threshold:
             return
         self._stale_sitemap_guard_tripped = True
+        await self._purge_sitemap_tail(
+            queue, f"Протухший sitemap: {n} товарных страниц с одинаковым текстом "
+                   f"(последняя: {url}).")
+
+    async def _purge_sitemap_tail(self, queue: deque, reason: str) -> None:
+        """D36/D225: снимает из очереди необойдённые товарные URL карты сайта (глубина 0)
+        и освобождает их слоты товарной квоты. Вместе с product_urls/visited_urls
+        снимается и схемный ключ D59 RC1 — иначе те же адреса, предложенные ссылками из
+        каталога, отбиваются как «схемный дубль», и освобождённый бюджет некому занять."""
         purged = 0
+        purged_keys = 0
         async with self._queue_lock:
             kept = deque()
             while queue:
@@ -2808,16 +3060,52 @@ class WebCrawler:
                 q_url, q_depth, q_category = item[0], item[1], item[2]
                 if q_category == 'product' and q_depth == 0:
                     norm = self.url_normalizer.normalize_url(q_url)
+                    skey = self._scheme_dedup_key(q_url)
                     async with self._urls_lock:
                         self.product_urls.discard(norm)
                         self.visited_urls.discard(norm)
+                        if skey is not None and skey in self._crawled_scheme_keys:
+                            self._crawled_scheme_keys.discard(skey)
+                            purged_keys += 1
                     purged += 1
                 else:
                     kept.append(item)
             queue.extend(kept)
-        log.warning(f"Протухший sitemap: {n} товарных страниц с одинаковым текстом "
-                    f"(последняя: {url}). Из очереди убрано {purged} товарных URL карты сайта, "
-                    f"бюджет освобождён для ссылок из каталога")
+        log.warning(f"{reason} Из очереди убрано {purged} товарных URL карты сайта "
+                    f"(снято схемных ключей: {purged_keys}), бюджет освобождён для "
+                    f"ссылок из каталога")
+
+    async def _check_hard_fail_sitemap_guard(self, url: str, depth: int, category: str,
+                                             queue: deque) -> None:
+        """P02 U1 п.2: жёсткие отказы (404/410, таймаут) подряд среди товарных URL карты
+        сайта глубины 0. Сторож D36 против них слеп по построению: ему нужен пришедший
+        HTML, а на жёстком отказе parse_result=None и до него управление не доходит."""
+        if self._stale_sitemap_guard_tripped or category != 'product' or depth != 0:
+            return
+        self._sitemap_hard_fail_streak += 1
+        if self._sitemap_hard_fail_streak < self.stale_sitemap_hard_fail_threshold:
+            return
+        self._stale_sitemap_guard_tripped = True
+        await self._purge_sitemap_tail(
+            queue, f"Карта сайта не отдаёт содержимое: {self._sitemap_hard_fail_streak} "
+                   f"товарных адресов подряд без контента (последний: {url}).")
+
+    async def _release_product_quota_slot(self, normalized_url: str, reason: str) -> bool:
+        """P02 U1 п.1: возврат слота товарной квоты на пути неуспеха товарной страницы.
+        Потолок product_quota_reuse_limit обязателен: без него сайт со сплошными 404
+        крутил бы квоту, пока не упрётся в max_pages_per_site."""
+        async with self._urls_lock:
+            if normalized_url not in self.product_urls or normalized_url in self._quota_released:
+                return False
+            if self._product_quota_reused >= self.product_quota_reuse_limit:
+                return False
+            self.product_urls.discard(normalized_url)
+            self._quota_released.add(normalized_url)
+            self._product_quota_reused += 1
+            reused = self._product_quota_reused
+        log.debug(f"Возвращён слот товарной квоты ({reason}): {normalized_url} "
+                  f"[{reused}/{self.product_quota_reuse_limit}]")
+        return True
 
     def _register_page_retry(self, url: str, depth: int, category: str) -> None:
         """D40: запоминает страницу, не отдавшую контент, для повторной попытки.
@@ -2840,6 +3128,12 @@ class WebCrawler:
             self._crawled_scheme_keys.clear()
             self._product_text_hash_counts.clear()
             self._stale_sitemap_guard_tripped = False
+            self._sitemap_published_urls.clear()
+            self._quota_released.clear()
+            self._product_quota_reused = 0
+            self._quota_rejected_urls.clear()
+            self._queue_gate_rejections.clear()
+            self._sitemap_hard_fail_streak = 0
             self._page_retry_candidates.clear()
 
         # Получаем все файлы компании из временного хранилища
@@ -3211,6 +3505,48 @@ class WebCrawler:
                 except Exception as e:
                     log.error(f"Ошибка повторной обработки страницы {url}: {e}")
 
+        # P02 U1 пп.4-5: сводка немых отказов гейтов очереди и страховка на случай,
+        # когда квота потрачена, а товарных страниц не сохранено ни одной.
+        if self._queue_gate_rejections:
+            summary = ', '.join(f"{reason}: {count}"
+                                for reason, count in sorted(self._queue_gate_rejections.items()))
+            log.info(f"Отказы гейтов очереди за компанию — {summary}")
+        if self._product_quota_reused:
+            log.info(f"Слотов товарной квоты возвращено: {self._product_quota_reused} "
+                     f"(потолок {self.product_quota_reuse_limit})")
+        await self._second_pass_for_quota_rejected(company_name, domain_dirs, stored_pages, queue)
+
+    async def _second_pass_for_quota_rejected(self, company_name: str, domain_dirs: Dict[str, str],
+                                              stored_pages: List[Dict], queue: deque) -> None:
+        """P02 U1 п.5: страховка. Если по итогам обхода сохранённых товарных страниц 0,
+        а товарные адреса отбивались гейтом квоты, значит квота была занята адресами, не
+        давшими ни одной страницы. Освобождаем её и проходим по отбитым адресам."""
+        async with self._stats_lock:
+            product_pages = self.stats['product_pages']
+        if product_pages or not self._quota_rejected_urls:
+            return
+
+        async with self._urls_lock:
+            candidates = list(dict.fromkeys(self._quota_rejected_urls))[:self.max_product_pages_per_site]
+            self._quota_rejected_urls.clear()
+            self.product_urls.clear()
+            for candidate in candidates:
+                self.visited_urls.discard(self.url_normalizer.normalize_url(candidate))
+
+        log.warning(f"Товарных страниц не сохранено ни одной, а по квоте было отбито "
+                    f"{len(candidates)} товарных адресов — второй проход по ним")
+        for candidate in candidates:
+            if await self._get_total_pages() >= self.max_pages_per_site:
+                break
+            try:
+                stored_page = await self._process_page_with_storage(
+                    candidate, 1, 'product', company_name, domain_dirs, queue)
+                if stored_page:
+                    stored_pages.append(stored_page)
+                    if self.page_sink is not None:
+                        await self.page_sink.put(stored_page)
+            except Exception as e:
+                log.error(f"Ошибка второго прохода по {candidate}: {e}")
     def _apply_exclude_failopen(self, queue: deque) -> bool:
         """P04 U1 (п. 5): очередь обхода опустела — проверяем, не вырезал ли сайт целиком
         языковой фильтр или глобальный exclude-список. Если да, фильтр отключается для
@@ -3261,7 +3597,47 @@ class WebCrawler:
         async with self._stats_lock:
             return self.stats['total_pages']
 
-    async def _discover_and_parse_sitemap(self, site_url: str) -> List[Tuple[str, str, int]]:
+    @staticmethod
+    def _sitemap_locale_prefix(site_url: str) -> Optional[str]:
+        """D240: локаль-префикс из адреса компании в Site_list ('/ru-ru/', '/ru/').
+        None — адрес без локали, фильтр не применяется."""
+        try:
+            first = (urlparse(site_url).path or '/').strip('/').split('/')[0].lower()
+        except Exception:
+            return None
+        return first if re.fullmatch(r'[a-z]{2}(-[a-z]{2})?', first or '') else None
+
+    @staticmethod
+    def _url_has_locale(url: str, locale_prefix: str) -> bool:
+        """URL принадлежит той же локали (или лежит в корне сайта)."""
+        try:
+            segments = (urlparse(url).path or '/').strip('/').split('/')
+        except Exception:
+            return True
+        first = segments[0].lower() if segments and segments[0] else ''
+        if not first:
+            return True
+        if first == locale_prefix:
+            return True
+        # чужая локаль отсекается, обычный раздел — нет
+        return not re.fullmatch(r'[a-z]{2}(-[a-z]{2})?', first)
+
+    @staticmethod
+    def _merge_sitemap_maps(per_map: List[List[Tuple[str, str, str, int]]], cap: int) -> List[Tuple[str, str, str, int]]:
+        """D144/D240: сводит списки отдельных карт в один, забирая из каждой по кругу,
+        пока не набран кэп. Так одна большая карта не вытесняет остальные целиком."""
+        merged = []
+        index = 0
+        while len(merged) < cap and any(index < len(rows) for rows in per_map):
+            for rows in per_map:
+                if index < len(rows):
+                    merged.append(rows[index])
+                    if len(merged) >= cap:
+                        break
+            index += 1
+        return merged
+
+    async def _discover_and_parse_sitemap(self, site_url: str) -> List[Tuple[str, str, str, int]]:
         """Обнаружение и парсинг карты сайта"""
         if not self.config.sitemap_discovery_enabled:
             return []
@@ -3280,31 +3656,55 @@ class WebCrawler:
                 task = self.sitemap_parser.parse_sitemap(sitemap_url, max_depth=self.config.sitemap_max_depth)
                 tasks.append(task)
             
-            # Ограничиваем время выполнения
+            # Ограничиваем время выполнения. D154: после снятия среза [:5] объём разбора
+            # у сайтов с большими индексами вырос, поэтому потолок вынесен в Config
+            # и поднят консервативно.
             results = await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
-                timeout=30.0
+                timeout=self.config.sitemap_phase_timeout_seconds
             )
-            
-            # Собираем все URL
-            all_urls = []
+
+            # Фильтруем только товарные URL и категории, ПОКАРТОЧНО
+            # (элемент: опубликованный адрес, нормализованный ключ, категория, приоритет)
+            locale_prefix = self._sitemap_locale_prefix(site_url)
+            per_map = []
+            other_urls = []
             for result in results:
-                if isinstance(result, list):
-                    all_urls.extend(result)
-            
-            # Фильтруем только товарные URL и категории
-            filtered_urls = []
-            for url, category, priority in all_urls:
-                if category in ['product', 'category']:
-                    filtered_urls.append((url, category, priority))
-                elif priority >= 7:  # Высокоприоритетные страницы
-                    filtered_urls.append((url, category, priority))
-            
-            # Ограничиваем общее количество (профиль сайта может задать свой лимит)
+                if not isinstance(result, list):
+                    continue
+                kept = []
+                for url, normalized_url, category, priority in result:
+                    # D240: локаль из Site_list — берём только адреса своей локали,
+                    # иначе мультилокальная карта отдаёт кэп чужим языкам
+                    if locale_prefix and not self._url_has_locale(url, locale_prefix):
+                        continue
+                    if category in ['product', 'category'] or priority >= 7:
+                        kept.append((url, normalized_url, category, priority))
+                    else:
+                        other_urls.append((url, normalized_url, category, priority))
+                if kept:
+                    kept.sort(key=self.sitemap_parser._sitemap_rank_key)
+                    per_map.append(kept)
+
+            # Ограничиваем общее количество (профиль сайта может задать свой лимит).
+            # D144/D240: кэп квотируется ПО КАРТАМ, а не по объединённому списку —
+            # иначе одна карта (например, карта вложений) забирала весь лимит, а
+            # товарная не получала ни слота.
             _sitemap_cap = self.config.sitemap_max_urls
             if self.profile is not None and self.profile.crawl.limits.sitemap_urls:
                 _sitemap_cap = self.profile.crawl.limits.sitemap_urls
-            filtered_urls = filtered_urls[:_sitemap_cap]
+            filtered_urls = self._merge_sitemap_maps(per_map, _sitemap_cap)
+
+            # P04 U2 п.7: если товарных адресов в карте не нашлось вовсе, служебные
+            # (роль other) не выбрасываем — ставим их в конец с низким приоритетом,
+            # иначе у сайта не остаётся ни одной точки входа из карты.
+            if other_urls and not any(row[2] == 'product' for row in filtered_urls):
+                other_urls.sort(key=self.sitemap_parser._sitemap_rank_key)
+                addition = other_urls[:max(_sitemap_cap - len(filtered_urls), 0)]
+                if addition:
+                    log.info(f"В карте сайта нет товарных адресов — добавляем {len(addition)} "
+                             f"служебных с низким приоритетом")
+                    filtered_urls.extend(addition)
 
             log.info(f"Отфильтровано {len(filtered_urls)} URL из карты сайта")
             if self.metrics_collector is not None:
@@ -3318,18 +3718,28 @@ class WebCrawler:
         
         return []
     
-    async def _add_sitemap_urls_to_queue(self, queue: deque, sitemap_urls: List[Tuple[str, str, int]], base_url: str):
-        """Добавление URL из карты сайта в очередь краулинга"""
+    async def _add_sitemap_urls_to_queue(self, queue: deque, sitemap_urls: List[Tuple[str, str, str, int]], base_url: str):
+        """Добавление URL из карты сайта в очередь краулинга.
+
+        D120/D219/D198: элемент — (опубликованный адрес, нормализованный ключ, категория,
+        приоритет). В очередь ставится ОПУБЛИКОВАННЫЙ адрес, нормализованный вид служит
+        только ключом дедупликации (visited_urls / product_urls / схемный ключ)."""
         added_count = 0
         skipped_count = 0
         skipped_subdomains = 0
-        
-        # Сортируем URL по приоритету (от высокого к низкому)
-        sitemap_urls.sort(key=lambda x: x[2], reverse=True)
+        skipped_pagination = 0
+        skipped_quota = 0
+        diverged_count = 0
+        diverged_examples = []
 
-        for url, category, priority in sitemap_urls:
-            normalized_url = self.url_normalizer.normalize_url(url)
-            
+        # Сортируем URL по рангу (приоритет, не-info раздел, артикульный слаг, глубина)
+        sitemap_urls.sort(key=self.sitemap_parser._sitemap_rank_key)
+        # D208: блок собирается целиком и кладётся в голову одной операцией. Прежний
+        # appendleft в цикле разворачивал порядок: первым из очереди доставался элемент
+        # с САМЫМ НИЗКИМ рангом, а товарные адреса уезжали в хвост за все служебные.
+        block = []
+
+        for url, normalized_url, category, priority in sitemap_urls:
             # Проверяем основной домен
             if self.config.ignore_subdomains:
                 if self.url_categorizer.is_subdomain(url, base_url):
@@ -3347,6 +3757,13 @@ class WebCrawler:
                 skipped_count += 1
                 continue
 
+            # D245: слишком глубокая пагинация отбраковывается URL ЦЕЛИКОМ (раньше
+            # нормализатор молча вырезал параметр, и адрес схлопывался с листингом).
+            if self.url_normalizer.is_over_pagination_limit(url):
+                log.debug(f"Пропускаем URL глубокой пагинации из карты сайта: {url}")
+                skipped_pagination += 1
+                continue
+
             # Проверяем дублирование
             if normalized_url in self.visited_urls:
                 skipped_count += 1
@@ -3357,7 +3774,11 @@ class WebCrawler:
             # max_product_pages_per_site. Продукты в карте отсортированы первыми по
             # приоритету, поэтому лишние просто пропускаем (контакты/категории идут дальше).
             if category == 'product' and len(self.product_urls) >= self.max_product_pages_per_site:
-                skipped_count += 1
+                # D222/D144: отказ по квоте раньше попадал в счётчик «дубликатов» и был
+                # неотличим от дедупа; теперь считается отдельно и служит входом
+                # страховки «второй проход», если товарных страниц не сохранилось вовсе.
+                skipped_quota += 1
+                self._quota_rejected_urls.append(url)
                 continue
 
             # D59 RC1: схемный дубль http↔https из sitemap (общий набор ключей с гейтом ссылок).
@@ -3371,25 +3792,59 @@ class WebCrawler:
                     self._crawled_scheme_keys.add(skey)
 
             url_depth = self.url_categorizer.calculate_url_depth(url)
-            # Увеличиваем приоритет URL из карты сайта
-            enhanced_priority = min(priority + 3, 10)
+            # Увеличиваем приоритет URL из карты сайта. D208: потолок 10 снят — иначе
+            # товар, категория и контакты получали один и тот же приоритет, и
+            # пересортировка очереди в главном цикле переставала их различать.
+            enhanced_priority = priority + 3
 
-            # Добавляем в начало очереди
-            queue.appendleft((url, 0, category, enhanced_priority))
+            # Блок пойдёт в голову очереди, ОПУБЛИКОВАННЫМ адресом (D120/D219/D198)
+            block.append((url, 0, category, enhanced_priority))
             self.visited_urls.add(normalized_url)
             if category == 'product':
                 self.product_urls.add(normalized_url)
+            # D120 п.7: запоминаем опубликованный адрес, чтобы при no_content на ином
+            # написании того же ключа повторить запрос ровно тем адресом, что в карте
+            # (и чтобы считать долю адресов карты, не отдавших содержимое).
+            self._sitemap_published_urls[normalized_url] = url
+            if url != normalized_url:
+                diverged_count += 1
+                if len(diverged_examples) < 3:
+                    diverged_examples.append(f"{url} != {normalized_url}")
             added_count += 1
-            
+
             # Ограничиваем количество для первого прохода
             if added_count >= self.config.sitemap_initial_batch_size:
                 break
-        
+
+        # D208: extendleft разворачивает вставляемую последовательность, поэтому
+        # подаём её перевёрнутой — порядок ранжирования доживает до popleft.
+        queue.extendleft(reversed(block))
+
         log.info(f"Добавлено {added_count} URL из карты сайта в начало очереди")
+        if block:
+            # D208 п.5: фактический порядок обхода раньше в логе не печатался вовсе
+            log.info(f"Первые адреса очереди из карты сайта: "
+                     f"{', '.join(item[0] for item in block[:5])}")
         if skipped_count > 0:
             log.info(f"Пропущено {skipped_count} дубликатов")
+        if skipped_quota > 0:
+            log.info(f"Пропущено {skipped_quota} товарных URL по квоте "
+                     f"(занято {len(self.product_urls)} из {self.max_product_pages_per_site})")
+        if skipped_pagination > 0:
+            log.info(f"Пропущено {skipped_pagination} URL глубокой пагинации из карты сайта")
         if skipped_subdomains > 0:
             log.info(f"Пропущено {skipped_subdomains} поддоменов из карты сайта")
+        if diverged_count > 0:
+            # D120 п.7б: расхождение «опубликованный адрес / нормализованный ключ» раньше
+            # было невидимым — 404 логировался как обычная сетевая ошибка.
+            log.info(f"Карта сайта: у {diverged_count} адресов опубликованный вид отличается "
+                     f"от нормализованного ключа (в очередь поставлен опубликованный); "
+                     f"примеры: {'; '.join(diverged_examples)}")
+        if self.metrics_collector is not None:
+            self.metrics_collector.record_sitemap_offered(len(sitemap_urls), skipped_count)
+            # P05 U2: «из карты сайта добавлено 0 при N отфильтрованных» — алерт коллектора
+            self.metrics_collector.record_sitemap_queue(
+                added_count, len(sitemap_urls) - added_count)
         return added_count
     
     async def _process_page_with_storage(self, url: str, depth: int, category: str,
@@ -3445,11 +3900,37 @@ class WebCrawler:
                 return None
 
             if not parse_result:
+                # D120 п.7а: адрес, отличающийся от опубликованного в карте сайта, мог
+                # получить 404 именно из-за написания (снятый слеш, снятый /ru). Перед
+                # отбраковкой повторяем запрос ровно опубликованным адресом; запись в
+                # кэше перманентных ошибок относилась к другому адресу — снимаем её.
+                published_url = self._sitemap_published_urls.get(normalized_url)
+                if published_url and published_url != url:
+                    log.warning(f"Нет содержимого по адресу {url}; повтор опубликованным "
+                                f"адресом карты сайта: {published_url}")
+                    async with self._errors_cache_lock:
+                        self.permanent_errors_cache.discard(normalized_url)
+                    retried = await self._fetch_page_content(published_url, category)
+                    if isinstance(retried, list):
+                        retried = retried[0] if retried else None
+                    parse_result = retried
+
+            if not parse_result:
                 log.warning(f"Не удалось получить содержимое страницы: {url}")
+                if normalized_url in self._sitemap_published_urls and self.metrics_collector is not None:
+                    self.metrics_collector.record_sitemap_no_content(url)
+                # P02 U1: страница не получена — слот товарной квоты держать незачем
+                if category == 'product':
+                    await self._release_product_quota_slot(normalized_url, 'нет содержимого')
+                    await self._check_hard_fail_sitemap_guard(url, depth, category, queue)
                 # D40: таймаутнутые целевые страницы не теряем — кладём в очередь ретраев,
                 # она обходится повторно после основного прохода
                 self._register_page_retry(url, depth, category)
                 return None
+
+            # P02 U1: содержимое пришло — серия жёстких отказов карты сайта прервана
+            if category == 'product' and depth == 0:
+                self._sitemap_hard_fail_streak = 0
 
             # 2. ИЗВЛЕЧЕНИЕ ССЫЛОК (ВСЕГДА, независимо от категории и is_processed)
             await self._process_links_from_parse_result(url, parse_result, depth, queue)
@@ -3486,6 +3967,9 @@ class WebCrawler:
             # 5. Проверка размера оригинального HTML
             if len(parse_result.html) < 300:
                 log.info(f"Пропускаем сохранение страницы {url}: размер оригинального HTML менее 300 символов")
+                # P02 U1: страница не сохранена — слот товарной квоты возвращается
+                if category == 'product':
+                    await self._release_product_quota_slot(normalized_url, 'HTML менее 300 символов')
                 return None
 
             # 5а. D36: детект протухшего sitemap — одинаковый видимый текст у товарных страниц
@@ -3648,10 +4132,15 @@ class WebCrawler:
             # согласованный с _should_skip_url (там не-товарные отсекаются при depth > 4).
             non_product_depth_limit = 4 if category in ('contacts', 'distributor') else 2
             if category != 'product' and url_depth > non_product_depth_limit:
+                self._count_queue_gate_rejection('глубина не-товарной страницы')
                 return False
-                
-            # Для товарных страниц ограничиваем количеством
+
+            # Для товарных страниц ограничиваем количеством.
+            # D193/D143/D212: отказ был немым; теперь он считается и попадает в сводку
+            # за компанию, а сам адрес — во вход страховки «второй проход».
             if category == 'product' and len(self.product_urls) >= self.max_product_pages_per_site:
+                self._count_queue_gate_rejection('товарная квота')
+                self._quota_rejected_urls.append(url)
                 return False
 
             # D59 (RC1+C): один товар под несколькими URL (http↔https / алиас пути /
@@ -3773,7 +4262,7 @@ class WebCrawler:
                                  'паспорт', 'сертификат', 'certificate', 'manual', 'Документация', 'сертификаты']
 
             for link in soup.find_all('a', href=True):
-                href = link['href']
+                href = sanitize_href(link['href'])  # D257/D233
                 link_text = link.get_text().lower()
                 
                 if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
@@ -3803,7 +4292,7 @@ class WebCrawler:
             for element in download_elements:
                 parent_link = element.find_parent('a', href=True)
                 if parent_link and parent_link['href']:
-                    href = parent_link['href']
+                    href = sanitize_href(parent_link['href'])  # D257/D233
                     normalized_url = self._normalize_file_url(href, url)
                     
                     # Проверяем основной домен
@@ -3816,7 +4305,7 @@ class WebCrawler:
 
             # Ищем все ссылки на файлы по расширениям
             for link in soup.find_all('a', href=True):
-                href = link['href']
+                href = sanitize_href(link['href'])  # D257/D233
                 if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
                     continue
                 
@@ -3914,7 +4403,18 @@ class WebCrawler:
                 if full not in start_urls:
                     start_urls.append(full)
 
-        return [url for url in start_urls if self._is_valid_url(url)]
+        # D192/D120: жёсткие стартовые пути печатались без завершающего слеша, а часть
+        # сайтов (Bitrix со строгой маршрутизацией, Egger) отдаёт раздел только со слешем.
+        # Даём каждому пути слеш-вариант и ставим его ПЕРЕД бесслешевым: очередь дедупится
+        # по нормализованному ключу, где обе формы совпадают, поэтому обойдён будет первый —
+        # и это должна быть каноническая форма со слешем.
+        expanded_urls = []
+        for url in start_urls:
+            if url != base_url and '?' not in url and '#' not in url and not url.endswith('/'):
+                expanded_urls.append(url + '/')
+            expanded_urls.append(url)
+
+        return [url for url in expanded_urls if self._is_valid_url(url)]
 
     async def _should_skip_url(self, url: str, depth: int, company_name: str) -> bool:
         """Проверка, нужно ли пропустить URL"""
@@ -4966,10 +5466,21 @@ class WebCrawler:
 
             # Извлекаем все ссылки со страницы
             for link in soup.find_all('a', href=True):
-                href = link['href']
+                raw_href = link['href']
+                # D257/D233: чиним href ДО склейки — пробельные края (403 на «испорченном
+                # адресе», а не «доступ запрещён») и вклеенный в путь абсолютный URL
+                # (иначе глубина считается по мангленному пути и шлюз очереди выбрасывает
+                # всю навигацию сайта).
+                href = sanitize_href(raw_href)
+                if self.metrics_collector is not None and href != raw_href:
+                    kind = 'whitespace' if href == raw_href.strip() else 'glued'
+                    log.debug(f"Исправлен href ({kind}): {raw_href!r} -> {href!r} на {current_url}")
+                    self.metrics_collector.record_mangled_href(kind)
+                if self.metrics_collector is not None:
+                    self.metrics_collector.record_href_seen()
                 if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
                     continue
-                    
+
                 full_url = urljoin(current_url, href)
 
                 # Нормализуем URL с сохранением протокола текущей страницы
@@ -5084,13 +5595,22 @@ class WebCrawler:
         
         # Для не-товарных страниц ограничиваем глубину
         if category != 'product' and url_depth > 2:
+            self._count_queue_gate_rejection('глубина не-товарной страницы')
             return False
-            
+
         # Для товарных страниц ограничиваем количеством
         if category == 'product' and len(self.product_urls) >= self.max_product_pages_per_site:
+            self._count_queue_gate_rejection('товарная квота')
+            self._quota_rejected_urls.append(url)
             return False
-            
+
         return True
+
+    def _count_queue_gate_rejection(self, reason: str) -> None:
+        """D193/D143/D212: гейты очереди отказывали немым return False. Копим причины
+        отказа, чтобы после обхода компании увидеть их сводкой (лог одной строкой на
+        каждый отказ утопил бы всё остальное)."""
+        self._queue_gate_rejections[reason] = self._queue_gate_rejections.get(reason, 0) + 1
 
     def _count_elements(self, soup: BeautifulSoup) -> Dict[str, int]:
         """Подсчет элементов на странице"""
