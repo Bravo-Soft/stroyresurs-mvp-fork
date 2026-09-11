@@ -72,6 +72,14 @@ class FileConverter:
         """Настройка логирования"""
         log.setLevel(logging.INFO)
         
+        # Конвертер создаётся на каждую компанию, а логгер модульный и общий: без снятия
+        # прежних хендлеров они копились от компании к компании. На 466-й компании прогона
+        # каждая строка писалась в лог 464 раза (file_conversion.log распух до 2.9 ГБ),
+        # и столько же дескрипторов файла оставались открытыми при лимите процесса 1024.
+        for handler in log.handlers[:]:
+            log.removeHandler(handler)
+            handler.close()
+
         # Форматтер
         formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

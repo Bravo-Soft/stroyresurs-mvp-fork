@@ -101,6 +101,13 @@ class Config:
     request_delay: float = 0.3  
     max_pagination_depth: int = 40  
     max_playwright_retries: int = 3
+    # D101: сторож зависаний. Меряется ПРОСТОЙ (время без единой записи в лог), а не общее
+    # время компании: крупные сайты честно обрабатываются до нескольких суток, и дедлайн на
+    # компанию резал бы их. Порог 30 мин обоснован замерами: самая длинная пауза здоровой
+    # системы — 560 с (ожидание LLM), p99.99 пауз = 335 с, самый долгий одиночный блокирующий
+    # вызов — запрос к LLM с таймаутом 900 с. Простой сверх порога = зависание: компания
+    # бросается, пул браузеров пересоздаётся, прогон идёт дальше. 0 отключает сторож.
+    company_idle_timeout_seconds: int = 1800
     memory_check_interval_pages: int = 50  
     memory_cleanup_threshold_mb: int = 20000  # порог RSS до очистки; держать НИЖЕ mem_limit контейнера (~24 ГБ)
     max_concurrent_contexts: int = 25
@@ -115,6 +122,10 @@ class Config:
     warmup_delay_seconds: float = 1.0        # пауза между прогревом главной и повтором цели
     http_min_content: int = 800              # минимум символов HTML, чтобы счесть HTTP-ответ достаточным
     js_render_text_threshold: int = 300      # порог текста для needs_javascript
+    # Гейт «оболочки» товарной страницы: минимум видимого текста, ниже которого HTTP-ответ
+    # считается пустой оболочкой и страница эскалируется в Playwright. Обоснование порога —
+    # в data_island.looks_like_product_shell. 0 отключает гейт (прежнее поведение).
+    product_min_text: int = 1000
 
     # Stealth Playwright-контекст (обход детекта автоматизации антибот-системами).
     stealth_context_enabled: bool = True     # реалистичный контекст вместо голого new_context()
@@ -349,6 +360,10 @@ class Config:
         # Рычаг конкуренции краула. Окружение = 14 vCPU / 53 ГБ (не полный Threadripper); выбран бюджет 1/2 ≈
         # 7 CPU / 26 ГБ (mem_limit mvp ~24 ГБ) -> дефолт = 20 (кормит 3 слота LLM с запасом). Больше — через env.
         config.max_concurrent_pages = int(os.getenv('MAX_CONCURRENT_PAGES', config.max_concurrent_pages))
+        # D101: порог простоя для сторожа зависаний (сек). 0 отключает сторож.
+        config.company_idle_timeout_seconds = int(os.getenv('COMPANY_IDLE_TIMEOUT_SECONDS', config.company_idle_timeout_seconds))
+        # Гейт «оболочки» товарной страницы (симв. видимого текста). 0 отключает.
+        config.product_min_text = int(os.getenv('PRODUCT_MIN_TEXT', config.product_min_text))
 
         # Настройки потоковой обработки страниц
         config.pipeline_streaming_enabled = os.getenv('PIPELINE_STREAMING_ENABLED', str(config.pipeline_streaming_enabled)).lower() == 'true'

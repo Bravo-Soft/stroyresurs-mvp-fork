@@ -9,6 +9,8 @@ from config import Config
 from kafka_manager import KafkaTaskManager, TaskMessage, TaskStatus
 from checkpoint_manager import CheckpointManager
 from graph_db_uploader import GraphDBFatalError
+from activity_heartbeat import get_heartbeat
+from web_crawler import read_memory_usage_mb
 
 log = logging.getLogger("pipeline_orchestrator")
 
@@ -23,6 +25,13 @@ class PipelineState(Enum):
 class PipelineOrchestrator:
     """Оркестратор для управления переключением между regular и urgent задачами"""
     
+    # D101: как часто сторож проверяет пульс активности.
+    WATCHDOG_POLL_SECONDS = 30
+    # D101: сколько ждать фактической отмены зависшей компании, прежде чем бросить задачу как есть.
+    CANCEL_GRACE_SECONDS = 120
+    # D101: потолок на пересоздание пула браузеров после брошенной компании.
+    RECYCLE_TIMEOUT_SECONDS = 180
+
     def __init__(self, config: Config, kafka_manager: KafkaTaskManager):
         self.config = config
         self.kafka_manager = kafka_manager         
@@ -90,8 +99,13 @@ class PipelineOrchestrator:
                 
                 self.state = PipelineState.PROCESSING_REGULAR
                 
-                # Обработка компании (может выбросить GraphDBFatalError)
-                result = await monitoring_system.process_company(company)
+                # Обработка компании под сторожем (может выбросить GraphDBFatalError)
+                result = await self._process_company_watchdogged(monitoring_system, company)
+
+                if result is None:
+                    # D101: компания брошена по простою — переходим к следующей
+                    self.current_regular_index += 1
+                    continue
 
                 if result.get('status') == 'graph_db_fatal_error':
                     # Бэкенд недоступен: индекс не двигаем — компания будет повторена после восстановления
@@ -108,7 +122,9 @@ class PipelineOrchestrator:
                     await self.checkpoint_manager.clear_checkpoint()
                 else:
                     log.warning(f"Компания {company['original_name']} обработана с ошибками")
-                
+
+                await self._recycle_browser_pool_if_memory_high(monitoring_system)
+
                 # Пауза между компаниями (если настроено)
                 if self.current_regular_index < len(companies):
                     await asyncio.sleep(self.config.graph_db_delay_between_companies)    
@@ -133,6 +149,94 @@ class PipelineOrchestrator:
         self.state = PipelineState.IDLE
         log.info("Пайплайн завершил работу")
     
+    async def _process_company_watchdogged(self, monitoring_system, company_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Обработка компании под сторожем зависаний (D101).
+
+        Зависание на одной компании раньше вешало весь прогон навсегда: краш процесса
+        chromium оставлял Playwright-вызовы без ответа, семафор пула не возвращался,
+        и пайплайн засыпал с 0% CPU (прогоны 19.08 «Ладога НПО» и 21.08 «РОВЕН»).
+
+        Меряется ПРОСТОЙ, а не общее время компании: крупные сайты честно обрабатываются
+        до нескольких суток, и дедлайн на компанию резал бы их. Пока система пишет в лог —
+        компания работает сколько нужно; молчание дольше config.company_idle_timeout_seconds
+        означает зависание: задача отменяется, пул браузеров пересоздаётся, прогон идёт дальше.
+
+        Возвращает результат process_company либо None, если компания брошена по простою.
+        Исключения самой обработки пробрасываются как раньше.
+        """
+        idle_limit = self.config.company_idle_timeout_seconds
+        if not idle_limit:
+            return await monitoring_system.process_company(company_data)
+
+        heartbeat = get_heartbeat()
+        if not heartbeat.is_installed():
+            # Пульс не подключён (логирование настроено мимо main.setup): он никогда не
+            # обновится, и сторож зарубил бы любую живую компанию. Работаем без сторожа.
+            log.error("Пульс активности не подключён — сторож зависаний выключен для этого прогона")
+            return await monitoring_system.process_company(company_data)
+
+        name = company_data.get('original_name')
+        heartbeat.touch()  # не наследуем простой, накопившийся до старта компании
+        task = asyncio.ensure_future(monitoring_system.process_company(company_data))
+
+        # asyncio.wait не отменяет задачу по таймауту и не бросает её исключение —
+        # используем его как «подождать не дольше X», а решение принимаем по пульсу.
+        while True:
+            _, pending = await asyncio.wait({task}, timeout=self.WATCHDOG_POLL_SECONDS)
+            if not pending:
+                return task.result()
+            idle = heartbeat.idle_seconds()
+            if idle >= idle_limit:
+                break
+
+        log.critical(f"Компания {name}: нет активности {idle:.0f} с (порог {idle_limit} с) — "
+                     f"считаем зависанием, бросаем и идём дальше")
+        task.cancel()
+        _, still_pending = await asyncio.wait({task}, timeout=self.CANCEL_GRACE_SECONDS)
+        if still_pending:
+            # Отмена не прошла (например, cleanup Playwright на умершем браузере тоже
+            # не возвращается). Бросаем задачу как есть — прогон обязан идти дальше.
+            log.error(f"Зависшая задача {name} не отменилась за {self.CANCEL_GRACE_SECONDS} с — оставляем её висеть")
+        else:
+            log.info(f"Зависшая задача {name} отменена")
+
+        await self._recycle_browser_pool(monitoring_system)
+        return None
+
+    async def _recycle_browser_pool(self, monitoring_system):
+        """
+        D101: пересоздание пула браузеров после брошенной компании.
+        Без этого следующая компания стартует на мёртвом браузере и с семафором,
+        разрешения которого удерживает брошенная задача. Fail-open: если пересоздать
+        не удалось, прогон продолжается (компании будут падать с ошибкой, а не молча висеть).
+        """
+        try:
+            await asyncio.wait_for(
+                monitoring_system.crawler.browser_pool.recycle(),
+                timeout=self.RECYCLE_TIMEOUT_SECONDS
+            )
+        except Exception as e:
+            log.error(f"Не удалось пересоздать пул браузеров: {type(e).__name__}: {e}")
+
+    async def _recycle_browser_pool_if_memory_high(self, monitoring_system):
+        """Пересоздание пула браузеров, когда память контейнера подошла к лимиту.
+
+        Chromium живёт один на весь прогон (initialize/close вызываются по разу),
+        и внутрикраульная очистка до его памяти не дотягивается — она чистит только
+        питоновские структуры. Прогон 26.08-01.09 так и умер: OOM-киллер на 685-й
+        компании из 1452. Граница между компаниями — безопасная точка: контексты
+        уже возвращены в пул, ронять нечего.
+        """
+        memory_mb = read_memory_usage_mb()
+        if memory_mb <= self.config.memory_cleanup_threshold_mb:
+            return
+
+        log.warning(f"Память контейнера {memory_mb:.0f}MB превысила порог "
+                    f"{self.config.memory_cleanup_threshold_mb}MB — пересоздаём пул браузеров")
+        await self._recycle_browser_pool(monitoring_system)
+        log.info(f"Память контейнера после пересоздания пула: {read_memory_usage_mb():.0f}MB")
+
     async def _check_and_process_urgent_tasks(self, monitoring_system):
         """Проверка и обработка urgent задач – если есть, обрабатываем все."""
         try:
@@ -182,8 +286,12 @@ class PipelineOrchestrator:
                     f"Начата обработка компании: {urgent_task.company_data.get('original_name')}",
                     progress=0.0
                 )
-                # Обрабатываем компанию
-                result = await monitoring_system.process_company(urgent_task.company_data)
+                # Обрабатываем компанию под тем же сторожем, что и регулярную (D101)
+                result = await self._process_company_watchdogged(monitoring_system, urgent_task.company_data)
+                timed_out = result is None
+                if timed_out:
+                    result = {'status': 'error',
+                              'error': f'зависание: нет активности дольше {self.config.company_idle_timeout_seconds} с'}
                 # Отправляем финальный статус
                 if result.get('status') == 'success':
                     await self.kafka_manager.send_task_status(
@@ -202,7 +310,11 @@ class PipelineOrchestrator:
                         progress=100.0
                     )
                     log.error(f"URGENT задача {urgent_task.task_id} завершена с ошибкой")
-                    await self._retry_failed_urgent_task(urgent_task)
+                    if timed_out:
+                        # D101: повтор зависшей компании снова упрётся в сторож — только зря сожжёт ещё один порог простоя
+                        log.error(f"URGENT задача {urgent_task.task_id} брошена по простою, повтор не назначаем")
+                    else:
+                        await self._retry_failed_urgent_task(urgent_task)
                     if result.get('status') == 'graph_db_fatal_error':
                         # Бэкенд недоступен — нет смысла обрабатывать остальные urgent задачи
                         log.critical("Фатальная ошибка Graph DB при urgent задаче: останавливаем обработку urgent очереди")

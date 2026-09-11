@@ -953,7 +953,7 @@ class AITunnelClient:
 
     Manufacturer (только для справки): {manufacturer}
     Base domain: {base_domain}
-    Текст: {text[:100000]}
+    Текст: {text[:120000]}
 
     "step_1_page_classification" (объект): классификация страницы. ТОЧНО посчитай технические
     характеристики и реши, продуктовая ли страница.

@@ -27,6 +27,7 @@ from graph_db_uploader import GraphDBUploader, GraphDBFatalError
 from file_converter import FileConverter 
 from kafka_manager import TaskMessage, KafkaTaskManager, TaskType, TaskStatus
 from pipeline_orchestrator import PipelineOrchestrator
+import activity_heartbeat
 # from site_profiler import SiteProfiler
 from text_extractor import html_to_markdown
 from processing_time_tracker import ProcessingTimeTracker
@@ -2447,8 +2448,11 @@ class MonitoringSystem:
                 exclude_product_cards=True
             )
             
-            # Запускаем конвертацию
-            success = converter.run_conversion()
+            # Запускаем конвертацию. run_conversion блокирующий (ThreadPoolExecutor +
+            # soffice): вызванный из корутины напрямую, он замораживал весь event loop, и
+            # сторож простоя D101 — корутина того же цикла — на всей стадии конвертации не
+            # получал управления. Так прогон замер на 14 ч (25.08 15:39 -> 26.08 05:43).
+            success = await asyncio.to_thread(converter.run_conversion)
 
             # Счётчики и тайминги конвертации (лист 2 + лист «Статистика по времени обработки»)
             _conv_results = getattr(converter, 'last_results', []) or []
@@ -3059,6 +3063,8 @@ async def main():
             logging.StreamHandler()
         ]
     )
+    # D101: пульс активности — по нему сторож зависаний отличает работу от простоя
+    activity_heartbeat.install()
     
     log.info("Запуск системы мониторинга с приоритетной обработкой urgent задач")
     

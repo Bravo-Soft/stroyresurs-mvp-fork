@@ -34,7 +34,8 @@ from config import Config
 from product_utils import sanitize_filename
 from temp_storage_manager import TempStorageManager
 from domain_equivalency import DomainEquivalencyManager
-from data_island import needs_javascript, has_product_island, is_unrendered_store_listing
+from data_island import (needs_javascript, has_product_island, is_unrendered_store_listing,
+                         looks_like_product_shell)
 
 # Профили сайтов (mvp/profiles/*.yaml): пер-сайтовые стратегии краулинга.
 # Импорт защищён (fail-open): без пакета/зависимостей краулер работает как раньше.
@@ -46,6 +47,48 @@ except Exception:
     HostThrottle = None
 
 log = logging.getLogger("crawler")
+
+# Память, которую считает лимит контейнера (mem_limit). Внутри контейнера
+# /sys/fs/cgroup примонтирован на его собственный scope, поэтому эти файлы
+# описывают именно контейнер, а не хост.
+_CGROUP_MEMORY_CURRENT = "/sys/fs/cgroup/memory.current"
+_CGROUP_MEMORY_STAT = "/sys/fs/cgroup/memory.stat"
+
+# Очистка не возвращает память Chromium, поэтому сразу после неё порог обычно
+# остаётся пробитым: без паузы сторож молотил бы на каждой проверке.
+MEMORY_CLEANUP_COOLDOWN_SECONDS = 300
+
+
+def read_memory_usage_mb() -> float:
+    """Потребление памяти всем контейнером, в МБ.
+
+    psutil.Process().memory_info().rss видит только сам питон, а под mem_limit
+    попадают и процессы Chromium/Playwright. Из-за этого сторож не сработал ни
+    разу за весь лог, пока контейнер рос до 23.6 ГиБ и его не убил OOM-киллер
+    (прогон 26.08-01.09, компания 685 из 1452).
+
+    Страничный кэш вычитаем: он вытесняется без OOM, иначе порог пробивала бы
+    обычная запись документов. shmem (tmpfs/shm) учтён внутри file, но не
+    вытесняется, поэтому его возвращаем обратно.
+
+    Fail-open: вне контейнера или на cgroup v1 файлов нет — откатываемся на RSS
+    процесса, то есть на прежнее поведение.
+    """
+    try:
+        with open(_CGROUP_MEMORY_CURRENT) as f:
+            current = int(f.read().strip())
+        page_cache = shmem = 0
+        with open(_CGROUP_MEMORY_STAT) as f:
+            for line in f:
+                key, _, value = line.partition(" ")
+                if key == "file":
+                    page_cache = int(value)
+                elif key == "shmem":
+                    shmem = int(value)
+        return max(current - (page_cache - shmem), 0) / 1024 / 1024
+    except Exception:
+        return psutil.Process().memory_info().rss / 1024 / 1024
+
 
 PERMANENT_ERRORS = [
     400, 401, 402, 403, 404, 405, 406, 407, 409, 410, 
@@ -88,6 +131,11 @@ class HttpFetchResult:
 class BrowserPool:
     """Пул браузеров для эффективного управления ресурсами Playwright"""
     
+    # D101: потолок на закрытие контекста/браузера. Если процесс chromium умер,
+    # Playwright-вызовы не возвращаются никогда — без этого потолка семафор пула
+    # оставался захваченным навсегда и весь краул вставал в вечное ожидание.
+    CLOSE_TIMEOUT = 30
+
     def __init__(self, headless: bool = True, max_concurrent_contexts: int = 20,
                  stealth_enabled: bool = False, stealth_user_agent: Optional[str] = None):
         self.headless = headless
@@ -150,18 +198,41 @@ class BrowserPool:
         """
         Закрывает контекст и освобождает семафор.
         Название метода сохранено, хотя теперь принимает context.
+        D101: закрытие под таймаутом — семафор освобождается в любом случае.
         """
         try:
-            await context.close()
+            await asyncio.wait_for(context.close(), timeout=self.CLOSE_TIMEOUT)
+        except Exception as e:
+            log.warning(f"Контекст браузера не закрылся ({type(e).__name__}); семафор освобождаем принудительно")
         finally:
             self._context_semaphore.release()
             
     async def close(self):
-        """Закрытие браузера и остановка Playwright."""
+        """Закрытие браузера и остановка Playwright (под таймаутом — см. D101)."""
         if self._browser:
-            await self._browser.close()
+            try:
+                await asyncio.wait_for(self._browser.close(), timeout=self.CLOSE_TIMEOUT)
+            except Exception as e:
+                log.warning(f"Браузер не закрылся штатно: {type(e).__name__}")
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await asyncio.wait_for(self._playwright.stop(), timeout=self.CLOSE_TIMEOUT)
+            except Exception as e:
+                log.warning(f"Playwright не остановился штатно: {type(e).__name__}")
+        self._browser = None
+        self._playwright = None
+
+    async def recycle(self):
+        """
+        D101: пересоздание пула после аварийного таймаута компании.
+        Старый браузер закрывается под таймаутом, семафор создаётся заново (разрешения,
+        захваченные брошенными задачами, прощаются), затем поднимается новый браузер.
+        Объект пула тот же — все ссылки на него (DynamicContentExtractor и пр.) остаются валидными.
+        """
+        await self.close()
+        self._context_semaphore = asyncio.Semaphore(self.max_concurrent_contexts)
+        await self.initialize()
+        log.info("Пул браузеров пересоздан")
 
 class DynamicContentExtractor:
     """
@@ -797,6 +868,11 @@ class URLCategorizer:
         
         url_lower = url.lower()
         text_lower = link_text.lower()
+        # D123: ключевые слова ищем в ПУТИ, а не в полном URL. Поддомены краулер и так не
+        # обходит, поэтому хост одинаков для всех страниц сайта — слово внутри доменного
+        # имени красит сайт целиком в одну категорию (floordealer.ru -> 'dealer': все 420
+        # страниц Beaulieu of America ушли в distributor, product_pages=0).
+        path_lower = parsed.path.lower() + (('?' + parsed.query.lower()) if parsed.query else '')
 
         # D69: пер-доменное исключение разделов (скоуплено по netloc, НЕ глобально).
         # Пустой словарь для прочих доменов => цикл ничего не делает, регресса нет.
@@ -853,7 +929,7 @@ class URLCategorizer:
         if self._exclude_patterns_re.search(url_lower):
             # D37: разделы дилеров часто живут под исключаемыми сегментами
             # (/about/predstavitelstva, /info/gde-kupit) — их не исключаем
-            if any(k in url_lower or k in text_lower for k in self.distributor_keywords):
+            if any(k in path_lower or k in text_lower for k in self.distributor_keywords):
                 return 'distributor', self.priority_levels['distributor']
             return 'excluded2', 0
         
@@ -864,15 +940,15 @@ class URLCategorizer:
             return 'main_page', self.priority_levels['main_page']
         
         # Проверка на контакты
-        if any(keyword in url_lower or keyword in text_lower for keyword in self.contact_keywords):
+        if any(keyword in path_lower or keyword in text_lower for keyword in self.contact_keywords):
             return 'contacts', self.priority_levels['contacts']
         
         # Проверка на дистрибьюторов
-        if any(keyword in url_lower or keyword in text_lower for keyword in self.distributor_keywords):
+        if any(keyword in path_lower or keyword in text_lower for keyword in self.distributor_keywords):
             return 'distributor', self.priority_levels['distributor']
         
         # Проверка на прайс-листы
-        if any(keyword in url_lower or keyword in text_lower for keyword in self.price_list_keywords):
+        if any(keyword in path_lower or keyword in text_lower for keyword in self.price_list_keywords):
             return 'price_list', self.priority_levels['price_list']
         
         # Проверка на товары (антипаттерн профиля запрещает классификацию «товар»)
@@ -880,7 +956,7 @@ class URLCategorizer:
             return 'product', self.priority_levels['product']
         
         # Проверка на категории
-        if (any(keyword in url_lower or keyword in text_lower for keyword in self.category_keywords) or
+        if (any(keyword in path_lower or keyword in text_lower for keyword in self.category_keywords) or
             any(re.search(pattern, url_lower) for pattern in [
                 r'/catalog/', r'/category/', r'/collection/', r'/series/',
                 r'/каталог/', r'/серия/', r'/katalog/', r'/products/'
@@ -916,8 +992,9 @@ class URLCategorizer:
         """Определение товарного URL с улучшенной эвристикой"""
         url_lower = url.lower()
         
-        # Явное исключение для контактов
-        if any(keyword in url_lower for keyword in self.contact_keywords):
+        # Явное исключение для контактов (D123: по пути, иначе слово из домена
+        # запрещает товарную классификацию всему сайту)
+        if any(keyword in urlparse(url).path.lower() for keyword in self.contact_keywords):
             return False
 
         # Явные служебные/корзинные/листинговые страницы интернет-магазинов и 1С-Bitrix — это НЕ товары
@@ -2282,6 +2359,7 @@ class WebCrawler:
         # Счетчики для мониторинга памяти
         self._pages_processed_since_last_check = 0
         self._last_memory_check = time.time()        
+        self._last_memory_cleanup = 0.0
 
     @staticmethod
     def _soft404_text_signature(html: str) -> str:
@@ -2404,28 +2482,37 @@ class WebCrawler:
     async def _check_memory_usage(self):
         """Проверка использования памяти и принудительная очистка при необходимости"""
         try:
-            process = psutil.Process()
-            memory_mb = process.memory_info().rss / 1024 / 1024
-            
-            if memory_mb > self.config.memory_cleanup_threshold_mb:
-                log.warning(f"Потребление памяти {memory_mb:.2f}MB превышает порог {self.config.memory_cleanup_threshold_mb}MB. Выполняем очистку.")
-                
-                # Принудительный сбор мусора
-                gc.collect()
-                
-                async with self._urls_lock:
-                    self.visited_urls.clear()
-                    self.processed_urls.clear()
-                    self.product_urls.clear()
-                    self._crawled_scheme_keys.clear()
+            memory_mb = read_memory_usage_mb()
+            if memory_mb <= self.config.memory_cleanup_threshold_mb:
+                return
 
-                # Дополнительная очистка если память все еще высокая
-                if process.memory_info().rss / 1024 / 1024 > self.config.memory_cleanup_threshold_mb:
-                    self.permanent_errors_cache.clear()
-                    gc.collect()
-                    
-                log.info(f"Очистка памяти завершена. Текущее потребление: {process.memory_info().rss / 1024 / 1024:.2f}MB")
-                
+            now = time.time()
+            if now - self._last_memory_cleanup < MEMORY_CLEANUP_COOLDOWN_SECONDS:
+                return
+            self._last_memory_cleanup = now
+
+            # Питоновский RSS печатаем рядом: он показывает, чья это память —
+            # питона или Chromium (по нему решать, что чинить дальше).
+            rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
+            log.warning(f"Потребление памяти контейнером {memory_mb:.2f}MB (питон {rss_mb:.2f}MB) "
+                        f"превышает порог {self.config.memory_cleanup_threshold_mb}MB. Выполняем очистку.")
+
+            # Принудительный сбор мусора
+            gc.collect()
+
+            async with self._urls_lock:
+                self.visited_urls.clear()
+                self.processed_urls.clear()
+                self.product_urls.clear()
+                self._crawled_scheme_keys.clear()
+
+            # Дополнительная очистка если память все еще высокая
+            if read_memory_usage_mb() > self.config.memory_cleanup_threshold_mb:
+                self.permanent_errors_cache.clear()
+                gc.collect()
+
+            log.info(f"Очистка памяти завершена. Текущее потребление: {read_memory_usage_mb():.2f}MB")
+
         except Exception as e:
             log.warning(f"Ошибка проверки памяти: {e}")
 
@@ -3601,7 +3688,7 @@ class WebCrawler:
                 aiohttp_parsed = None
                 aiohttp_content = None
                 if not force_browser:
-                    http_html = await self._http_first_get(url)
+                    http_html = await self._http_first_get(url, expect_product=True)
                     if http_html:
                         log.info(f"HTTP-first отдал товарную страницу без браузера ({len(http_html)} симв): {url}")
                         self._census_fetch(url, category, 'http_first')
@@ -3618,7 +3705,13 @@ class WebCrawler:
                     # JSON-LD/__NEXT__/__NUXT__ — needs_javascript учитывает оба сигнала),
                     # запускать Playwright не нужно. needs_javascript строит собственный
                     # временный soup и не мутирует aiohttp_parsed.
-                    if not needs_javascript(aiohttp_content) and not is_unrendered_store_listing(aiohttp_content):
+                    # Гейт оболочки повторяется и здесь: иначе эскалация из _http_first_get
+                    # обесценивается — aiohttp принесёт тот же пустой HTML, и мы вернём его,
+                    # так и не дойдя до Playwright.
+                    _min_text = self._product_shell_min_text()
+                    _shell = bool(_min_text) and looks_like_product_shell(aiohttp_content, min_text=_min_text)
+                    if (not _shell and not needs_javascript(aiohttp_content)
+                            and not is_unrendered_store_listing(aiohttp_content)):
                         log.debug(f"data-island: контент товара уже в HTML, пропускаем Playwright: {url}")
                         self._census_fetch(url, category, 'aiohttp')
                         return aiohttp_parsed
@@ -4092,7 +4185,11 @@ class WebCrawler:
             finally:
                 await sess.close()
 
-    async def _http_first_get(self, url: str) -> Optional[str]:
+    def _product_shell_min_text(self) -> int:
+        """Порог гейта «оболочки» товарной страницы (0 = гейт выключен)."""
+        return getattr(self.config, 'product_min_text', 1000)
+
+    async def _http_first_get(self, url: str, *, expect_product: bool = False) -> Optional[str]:
         """
         Лестница эскалации на уровне HTTP (без Playwright):
           1) HTTP-impersonate -> 2) при challenge: cookie-warmup -> повтор.
@@ -4125,6 +4222,15 @@ class WebCrawler:
         # иначе целый раздел каталога теряется (D96). Проверка до needs_javascript и
         # фолбэка has_product_island (иначе объёмный текст листинга их обманывает).
         if is_unrendered_store_listing(res.html):
+            return None
+        # Товарная страница-«оболочка»: разметка есть, видимого текста почти нет — контент
+        # дорисовывает JS. needs_javascript такое пропускает (ему нужен ещё признак SPA),
+        # поэтому HTTP-first отдавал страницу без товара и LLM отвергал её как Trash_418#.
+        # Отдаём None -> лестница идёт на aiohttp/Playwright; если и там пусто, вызывающий
+        # код всё равно сохранит то, что получил (поведение fail-open не меняется).
+        min_text = self._product_shell_min_text()
+        if expect_product and min_text and looks_like_product_shell(res.html, min_text=min_text):
+            log.debug(f"HTTP-first: товарная страница похожа на оболочку, эскалируем в браузер: {url}")
             return None
         min_content = getattr(self.config, 'http_min_content', 800)
         # Контент пришёл и его достаточно / data-island / не нужен JS -> отдаём HTML

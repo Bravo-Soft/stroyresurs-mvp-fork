@@ -257,6 +257,40 @@ def needs_javascript(html: str, *, text_threshold: int = 300,
         return True
 
 
+def looks_like_product_shell(html: str, *, min_text: int = 1000,
+                             soup: Optional[BeautifulSoup] = None) -> bool:
+    """
+    True -> товарная страница пришла «оболочкой»: разметка на месте, а видимого текста
+    почти нет, значит контент дорисовывает JS -> нужен Playwright.
+
+    Зачем отдельно от needs_javascript: тот требует ЕЩЁ и признак SPA (пустой #root/#app
+    либо бандлы), которого на серверных CMS нет, — поэтому оболочки таких сайтов он
+    пропускал, и HTTP-first отдавал страницу без товара. Прогон 20-21.08: 2333 товарные
+    страницы ушли без браузера против 287 через него.
+
+    Порог 1000 обоснован тем же прогоном: у 46 компаний, давших карточки, минимум
+    видимого текста товарной страницы = 1307 симв. (медиана 5211); у компаний, потерявших
+    товары на этом гейте, — 287..903 (АргументПласт: HTML 47 КБ при 776 симв. текста).
+    """
+    if not html:
+        return True
+    try:
+        soup = soup or BeautifulSoup(html, "html.parser")
+        # Данные товара уже в разметке (JSON-LD/микроразметка) -> рендер не нужен
+        if has_product_island(html, soup):
+            return False
+        body = soup.body
+        if body is None:
+            return True
+        for tag in body(["script", "style", "noscript", "template"]):
+            tag.extract()
+        return len(body.get_text(strip=True)) < min_text
+    except Exception as e:
+        # Fail-open: при ошибке разбора не эскалируем, остаётся прежнее поведение
+        log.debug(f"looks_like_product_shell: ошибка анализа HTML: {e}")
+        return False
+
+
 def is_unrendered_store_listing(html: str) -> bool:
     """True для Tilda store-ЛИСТИНГА (каталога), плитки товаров которого рисуются JS.
 
