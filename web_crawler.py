@@ -3448,8 +3448,10 @@ class WebCrawler:
         processed_count = 0
         active_tasks = set()
         
-        while ((queue or active_tasks) or self._apply_exclude_failopen(queue)) \
-                and await self._get_total_pages() < self.max_pages_per_site:
+        # Ревью слияния F7: бюджет страниц проверяется ДО предохранителя фильтров, иначе
+        # при исчерпанном лимите он зря возвращает отложенные URL в очередь.
+        while await self._get_total_pages() < self.max_pages_per_site \
+                and ((queue or active_tasks) or self._apply_exclude_failopen(queue)):
             # Сортируем очередь по приоритету
             async with self._queue_lock:
                 queue_list = list(queue)
@@ -3698,6 +3700,9 @@ class WebCrawler:
             # P04 U2 п.7: если товарных адресов в карте не нашлось вовсе, служебные
             # (роль other) не выбрасываем — ставим их в конец с низким приоритетом,
             # иначе у сайта не остаётся ни одной точки входа из карты.
+            # Ревью слияния F4: вырезанное exclude-списком (excluded2) в резерв не берём —
+            # гейт очереди его не остановит, а бюджет страниц уйдёт на исключённые разделы.
+            other_urls = [row for row in other_urls if not row[2].startswith('excluded')]
             if other_urls and not any(row[2] == 'product' for row in filtered_urls):
                 other_urls.sort(key=self.sitemap_parser._sitemap_rank_key)
                 addition = other_urls[:max(_sitemap_cap - len(filtered_urls), 0)]
@@ -3726,6 +3731,7 @@ class WebCrawler:
         только ключом дедупликации (visited_urls / product_urls / схемный ключ)."""
         added_count = 0
         skipped_count = 0
+        skipped_dup = 0     # F9: только дубли нормализованного/схемного ключа (метрика D245)
         skipped_subdomains = 0
         skipped_pagination = 0
         skipped_quota = 0
@@ -3767,6 +3773,7 @@ class WebCrawler:
             # Проверяем дублирование
             if normalized_url in self.visited_urls:
                 skipped_count += 1
+                skipped_dup += 1
                 continue
 
             # Лимит продуктовых страниц действует и на URL из карты сайта: иначе
@@ -3788,6 +3795,7 @@ class WebCrawler:
                     if skey in self._crawled_scheme_keys:
                         log.info(f"D59 RC1: схемный дубль из sitemap (ключ {skey}): {url}")
                         skipped_count += 1
+                        skipped_dup += 1
                         continue
                     self._crawled_scheme_keys.add(skey)
 
@@ -3841,7 +3849,8 @@ class WebCrawler:
                      f"от нормализованного ключа (в очередь поставлен опубликованный); "
                      f"примеры: {'; '.join(diverged_examples)}")
         if self.metrics_collector is not None:
-            self.metrics_collector.record_sitemap_offered(len(sitemap_urls), skipped_count)
+            # F9: в метрику D245 идут только дубли ключа, не поддомены/локали
+            self.metrics_collector.record_sitemap_offered(len(sitemap_urls), skipped_dup)
             # P05 U2: «из карты сайта добавлено 0 при N отфильтрованных» — алерт коллектора
             self.metrics_collector.record_sitemap_queue(
                 added_count, len(sitemap_urls) - added_count)
@@ -3891,7 +3900,9 @@ class WebCrawler:
                         # Извлекаем ссылки из каждой вкладки
                         await self._process_links_from_parse_result(tab_url, single_result, depth, queue)
                     # Если категория подходит для сохранения - сохраняем вкладку
-                    if category in ('product', 'contacts', 'distributor', 'main_page'):
+                    # (F10: тот же набор ролей, что target_categories, включая category/price_list)
+                    if category in ('product', 'contacts', 'distributor', 'main_page',
+                                    'category', 'price_list'):
                         await self._save_single_page(
                             url, tab_normalized, single_result, depth, category,
                             company_name, domain_dirs, stored_pages, queue,
@@ -4370,9 +4381,17 @@ class WebCrawler:
     def _get_start_urls(self, site_url: str) -> List[str]:
         """Генерация стартовых URL"""
         parsed = urlparse(site_url)
-        # Путь из Site_list сохраняется (dkc.ru/ru/): угаданные разделы строятся от него,
-        # иначе база обхода снова схлопывается к корню с языковым редиректом (D140).
-        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+        root_url = f"{parsed.scheme}://{parsed.netloc}"
+        # Языковой префикс из Site_list сохраняется (dkc.ru/ru/): угаданные разделы строятся
+        # от него, иначе база обхода снова схлопывается к корню с языковым редиректом (D140).
+        # Ревью слияния F2: рабочий URL может принести и случайный путь после 301
+        # (/index.php, /home/) — базой разделов служит только локаль, иначе корень сайта.
+        first_segment = next((seg for seg in parsed.path.split('/') if seg), '')
+        is_locale = bool(self.url_categorizer.detect_locale_prefix(site_url)) or \
+            first_segment.lower().replace('_', '-').split('-')[0] in ('ru', 'rus')
+        locale_prefix = first_segment if is_locale else None
+        base_url = f"{root_url}/{locale_prefix}" if locale_prefix else root_url
+        site_path = parsed.path.rstrip('/')
         
         start_urls = [
             base_url,  # Главная страница
@@ -4392,14 +4411,19 @@ class WebCrawler:
             f"{base_url}/price",       # Прайс-листы
             f"{base_url}/tseny"       # Прайс-листы
         ]
+        if base_url != root_url:
+            start_urls.insert(2, f"{root_url}/")  # корень сайта не теряем при базе с локалью
+        if site_path and not locale_prefix:
+            # адрес с путём (из Site_list или после редиректа) — точка входа, не база разделов
+            start_urls.insert(0, f"{root_url}{site_path}/")
 
-        # Доп. стартовые точки из профиля сайта (карта разделов sections).
+        # Доп. стартовые точки из профиля сайта (карта разделов sections) — пути корне-относительные.
         if self.profile is not None:
             sec = self.profile.sections
             for path in (sec.start_urls + sec.catalog_roots + sec.contacts_urls +
                          sec.distributor_urls + sec.certificates_urls + sec.documents_urls +
                          sec.instructions_urls + sec.price_list_urls):
-                full = path if path.startswith('http') else urljoin(base_url + '/', path.lstrip('/'))
+                full = path if path.startswith('http') else urljoin(root_url + '/', path.lstrip('/'))
                 if full not in start_urls:
                     start_urls.append(full)
 
@@ -5266,7 +5290,11 @@ class WebCrawler:
             
             canonical_url = self.url_normalizer.extract_canonical_url(soup, url)            
             
-            effective_url = canonical_url if canonical_url != url else url            
+            # P01 U1 / ревью слияния F5: canonical — только ключ дедупа. Базой склейки
+            # относительных ссылок и определения типа страницы остаётся фактический адрес:
+            # нормализованный canonical терял '/ru' и завершающий слеш (D41 против D198/D120),
+            # а canonical на корень красил любую страницу в main_page (D278).
+            effective_url = url
             
             content_type = self._detect_content_type(soup, effective_url)            
             

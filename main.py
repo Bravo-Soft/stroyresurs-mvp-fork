@@ -676,6 +676,9 @@ class MonitoringSystem:
             return {
                 'status': 'success',
                 'crawl_data': crawl_result,
+                # P05 U2 / ревью слияния F1: гейт D167 в process_company читает working_url
+                # из этого словаря, а не из вложенного crawl_data
+                'working_url': crawl_result.get('working_url'),
                 'products_count': len(crawl_result.get('products', [])),
                 'files_count': len(crawl_result.get('downloaded_files', [])),
                 'stored_pages': crawl_result.get('stored_pages', [])

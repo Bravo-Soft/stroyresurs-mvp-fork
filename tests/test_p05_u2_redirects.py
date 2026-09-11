@@ -146,20 +146,43 @@ def test_probe_headers_are_ru_desktop(manager):
 
 # ==================== Путь Site_list в стартовых URL ====================
 
-def test_start_urls_keep_sitelist_path():
+def _bare_crawler(profile=None):
     crawler = WebCrawler.__new__(WebCrawler)
-    crawler.profile = None
-    urls = WebCrawler._get_start_urls(crawler, 'https://www.dkc.ru/ru/')
+    crawler.profile = profile
+    crawler.url_categorizer = URLCategorizer(Config())
+    return crawler
+
+
+def test_start_urls_keep_sitelist_path():
+    urls = WebCrawler._get_start_urls(_bare_crawler(), 'https://www.dkc.ru/ru/')
     assert urls[0] == 'https://www.dkc.ru/ru'
     assert 'https://www.dkc.ru/ru/catalog' in urls
+    # ревью слияния F2: корень сайта при базе с локалью не теряется
+    assert 'https://www.dkc.ru/' in urls
 
 
 def test_start_urls_without_path_unchanged():
-    crawler = WebCrawler.__new__(WebCrawler)
-    crawler.profile = None
-    urls = WebCrawler._get_start_urls(crawler, 'https://a.ru/')
+    urls = WebCrawler._get_start_urls(_bare_crawler(), 'https://a.ru/')
     assert urls[0] == 'https://a.ru'
     assert 'https://a.ru/catalog' in urls
+
+
+def test_start_urls_redirect_path_is_entry_point_not_base():
+    """Ревью слияния F2: рабочий URL после 301 на /home/ — точка входа, а не база разделов."""
+    urls = WebCrawler._get_start_urls(_bare_crawler(), 'https://a.ru/home/')
+    assert urls[0] == 'https://a.ru/home/'
+    assert 'https://a.ru/catalog' in urls and 'https://a.ru/home/catalog' not in urls
+    assert 'https://a.ru' in urls
+
+
+def test_start_urls_profile_sections_are_root_relative():
+    """Ревью слияния F2: пути секций профиля клеятся от корня даже при базе с локалью."""
+    from site_profiles.models import SiteProfile
+    profile = SiteProfile(domain='a.ru')
+    profile.sections.catalog_roots = ['/produkcija/']
+    urls = WebCrawler._get_start_urls(_bare_crawler(profile), 'https://a.ru/ru/')
+    assert 'https://a.ru/produkcija/' in urls
+    assert 'https://a.ru/ru/produkcija/' not in urls
 
 
 # ==================== canonical с чужим хостом ====================
