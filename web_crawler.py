@@ -33,7 +33,7 @@ except Exception:
 from config import Config
 from product_utils import sanitize_filename
 from temp_storage_manager import TempStorageManager
-from domain_equivalency import DomainEquivalencyManager
+from domain_equivalency import DomainEquivalencyManager, hosts_equivalent
 from data_island import (needs_javascript, has_product_island, is_unrendered_store_listing,
                          looks_like_product_shell)
 
@@ -1253,22 +1253,38 @@ class SmartURLNormalizer:
                 # Если URL относительный, преобразуем в абсолютный
                 if not canonical_url.startswith(('http://', 'https://')):
                     canonical_url = urljoin(current_url, canonical_url)
-                return self.normalize_url(canonical_url)
-            
+                if self._canonical_is_same_site(canonical_url, current_url):
+                    return self.normalize_url(canonical_url)
+
             # Ищем og:url
             og_url = soup.find('meta', property='og:url')
             if og_url and og_url.get('content'):
                 og_url_content = og_url['content']
                 if not og_url_content.startswith(('http://', 'https://')):
                     og_url_content = urljoin(current_url, og_url_content)
-                return self.normalize_url(og_url_content)
-            
+                if self._canonical_is_same_site(og_url_content, current_url):
+                    return self.normalize_url(og_url_content)
+
             # Возвращаем нормализованный текущий URL как fallback
             return self.normalize_url(current_url)
             
         except Exception as e:
             log.warning(f"Ошибка извлечения canonical URL: {e}")
             return self.normalize_url(current_url)
+
+    def _canonical_is_same_site(self, candidate_url: str, current_url: str) -> bool:
+        """Годится ли canonical/og:url как база склейки ссылок. Пустой хост или хост,
+        неэквивалентный текущему (зеркало, домен группы), базу подменять не должен: иначе
+        относительные ссылки страницы резолвятся в чужой хост и гибнут на гейте периметра
+        (D182, D272)."""
+        netloc = urlparse(candidate_url).netloc
+        if not netloc:
+            return False
+        if hosts_equivalent(netloc, urlparse(current_url).netloc):
+            return True
+        log.debug(f"canonical/og:url {candidate_url} с неэквивалентным хостом отброшен "
+                  f"для {current_url}")
+        return False
 
 class SiteMapParser:
     """Парсер карт сайта для извлечения товарных URL"""
@@ -2575,7 +2591,11 @@ class WebCrawler:
 
         # Сбрасываем статистику для нового сайта
         await self._reset_stats()
-        
+        # Машинный статус выбора базы обхода (parked_domain / redirect_shim / hoster_stub /
+        # http_only / no_host) — пишется после сброса, чтобы не быть затёртым (P05 U2).
+        if self.site_status:
+            self.stats['site_status'] = self.site_status
+
         stored_pages = []  # Список сохраненных страниц
         
         try:
@@ -2645,13 +2665,18 @@ class WebCrawler:
 
     async def _get_working_url(self, url: str) -> str:
         """Получение рабочего URL с проверкой доступности и учетом эквивалентности доменов"""
+        self.site_status = None
         if not self.config.domain_equivalency_enabled or not self.config.treat_http_https_as_same:
             return url
-            
+
         try:
             # Используем DomainEquivalencyManager для поиска рабочего URL
             working_url = await self.url_categorizer.domain_equivalency.find_working_url(url)
-            
+            self.site_status = getattr(
+                self.url_categorizer.domain_equivalency, 'last_site_status', None)
+            if self.site_status:
+                log.warning(f"Статус выбора базы обхода для {url}: {self.site_status}")
+
             if working_url != url:
                 log.info(f"Используется рабочий URL: {working_url} вместо {url}")
             
@@ -3418,7 +3443,9 @@ class WebCrawler:
     def _get_start_urls(self, site_url: str) -> List[str]:
         """Генерация стартовых URL"""
         parsed = urlparse(site_url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        # Путь из Site_list сохраняется (dkc.ru/ru/): угаданные разделы строятся от него,
+        # иначе база обхода снова схлопывается к корню с языковым редиректом (D140).
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
         
         start_urls = [
             base_url,  # Главная страница
@@ -3777,6 +3804,13 @@ class WebCrawler:
                 if result is not None:
                     content, _, final_url = result
                     if content:
+                        # Сверка хоста после навигации, как в товарной ветке: JS-редиректор
+                        # уводил браузер на чужой сайт, и тот сохранялся под адресом
+                        # компании — вплоть до карточки чужой организации (D238).
+                        if final_url and final_url != url and not self.url_categorizer.is_main_domain(
+                                final_url, self.current_base_url):
+                            log.warning(f"Редирект на неэквивалентный домен: {url} -> {final_url}, пропускаем")
+                            return None
                         self._census_fetch(url, category, 'playwright')
                         return await self._parse_content(content, final_url or url)
                 if self.metrics_collector is not None:

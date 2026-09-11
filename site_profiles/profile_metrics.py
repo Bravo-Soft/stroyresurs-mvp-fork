@@ -55,6 +55,12 @@ class RunMetricsCollector:
         self.card_specs = []                    # число числовых ТХ у товаров, прошедших гейт >=3
         self.gate_specs = []                    # то же у всех товаров, дошедших до гейта
         self.output = {}                        # срез CompanyStatistics
+        # P05 U2: периметр обхода. Если база уехала на зеркало/поддомен, гейт периметра
+        # молча съедает почти все найденные ссылки и все URL из карты сайта.
+        self.links_found = 0                    # найдено ссылок на страницах
+        self.links_skipped_perimeter = 0        # из них отброшено гейтом периметра
+        self.sitemap_queued = None              # поставлено в очередь из карты сайта
+        self.sitemap_filtered = None            # отфильтровано из карты сайта
 
     # ---------- хуки краулера ----------
 
@@ -82,6 +88,20 @@ class RunMetricsCollector:
     @_safe
     def record_sitemap(self, url_count):
         self.sitemap_url_count = int(url_count)
+
+    @_safe
+    def record_link_gate(self, found, skipped):
+        """Ссылки страницы: сколько найдено и сколько отброшено гейтом периметра.
+        Вызов ставит P05 U3 (_extract_links) — здесь счётчик и алерт (P05 U2)."""
+        self.links_found += int(found or 0)
+        self.links_skipped_perimeter += int(skipped or 0)
+
+    @_safe
+    def record_sitemap_queue(self, queued, filtered):
+        """Итог постановки URL из карты сайта в очередь. Вызов ставит полоса A
+        (_add_sitemap_urls_to_queue) — здесь счётчик и алерт (P05 U2)."""
+        self.sitemap_queued = (self.sitemap_queued or 0) + int(queued or 0)
+        self.sitemap_filtered = (self.sitemap_filtered or 0) + int(filtered or 0)
 
     @_safe
     def record_document_files(self, section, count):
@@ -191,6 +211,11 @@ class RunMetricsCollector:
             'company_document_files': dict(self.document_files),
             'limits_used': dict(self.limits) or None,
             'output': dict(self.output),
+            # Периметр обхода (P05 U2)
+            'links_found': self.links_found,
+            'links_skipped_perimeter': self.links_skipped_perimeter,
+            'sitemap_queued': self.sitemap_queued,
+            'sitemap_filtered': self.sitemap_filtered,
         }
         metrics['alerts'] = self._alerts(metrics)
         return metrics
@@ -230,6 +255,14 @@ class RunMetricsCollector:
         for category in ('contacts', 'distributor'):
             if not metrics.get('pages_by_category', {}).get(category):
                 alerts.append(f'секция {category}: 0 страниц')
+        # P05 U2: база обхода уехала на зеркало/поддомен — ссылки и карта сайта гибнут на
+        # гейте периметра, компания даёт молчаливый ноль.
+        found, skipped = metrics.get('links_found') or 0, metrics.get('links_skipped_perimeter') or 0
+        if found and skipped / found > 0.8:
+            alerts.append(f'гейт периметра отбросил {skipped} из {found} найденных ссылок (>80%)')
+        if metrics.get('sitemap_filtered') and not metrics.get('sitemap_queued'):
+            alerts.append(f'из карты сайта в очередь добавлено 0 при '
+                          f'{metrics["sitemap_filtered"]} отфильтрованных')
         return alerts
 
     @_safe

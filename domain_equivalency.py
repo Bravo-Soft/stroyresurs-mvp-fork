@@ -26,6 +26,13 @@ HttpAnswer = namedtuple('HttpAnswer', 'status body final_url error tls_error')
 CandidateProbe = namedtuple('CandidateProbe', 'ok url reason tls_error responded site_status')
 
 _A_HREF_RE = re.compile(r'<a\s[^>]*href\s*=\s*["\']([^"\']+)["\']', re.I)
+# Мобильные зеркала: m.<домен> и т.п. — тот же сайт, но базой обхода должна оставаться
+# десктопная форма (D272: на мобильном зеркале canonical и карта сайта ведут на апекс).
+_MOBILE_PREFIXES = ('m.', 'mobile.', 'touch.')
+_META_REFRESH_RE = re.compile(r'<meta[^>]+http-equiv\s*=\s*["\']?refresh["\']?[^>]*>', re.I)
+_META_REFRESH_URL_RE = re.compile(r'url\s*=\s*["\']?([^"\'>;\s]+)', re.I)
+_SCRIPT_RE = re.compile(r'<script\b[^>]*>(.*?)</script>', re.I | re.S)
+_JS_REDIRECT_RE = re.compile(r'location\s*(?:\.\s*(?:replace|assign)\s*\(|\.\s*href\s*=|\s*=)', re.I)
 
 
 def strip_www(host: str) -> str:
@@ -35,9 +42,57 @@ def strip_www(host: str) -> str:
     return host[4:] if host.startswith('www.') else host
 
 
+def desktop_host(host: str) -> str:
+    """Десктопная форма хоста: срезает мобильный префикс m./mobile./touch."""
+    host = strip_www(host)
+    for prefix in _MOBILE_PREFIXES:
+        if host.startswith(prefix):
+            return host[len(prefix):]
+    return host
+
+
+def is_mobile_mirror(host: str, base_host: str) -> bool:
+    """host — мобильное зеркало base_host (m.rmz.by при базе rmz.by)."""
+    host, base_host = strip_www(host), strip_www(base_host)
+    return host != base_host and desktop_host(host) == desktop_host(base_host)
+
+
 def hosts_equivalent(host1: str, host2: str) -> bool:
-    """Хосты одного сайта: апекс и www-форма."""
-    return strip_www(host1) == strip_www(host2) and bool(strip_www(host1))
+    """Хосты одного сайта: апекс, www-форма и мобильное зеркало."""
+    return desktop_host(host1) == desktop_host(host2) and bool(desktop_host(host1))
+
+
+def registrable_domain(host: str) -> str:
+    """Регистрируемый домен: два последних уровня (example.ru у shop.example.ru).
+    Публичные суффиксы второго уровня (com.ru и т.п.) не разбираются — для списка
+    компаний (.ru/.by/.com) этого достаточно."""
+    parts = [p for p in strip_www(host).split('.') if p]
+    return '.'.join(parts[-2:]) if len(parts) >= 2 else (parts[0] if parts else '')
+
+
+def same_registrable_domain(url1: str, url2: str) -> bool:
+    """Оба адреса принадлежат одному registrable-домену (www/поддомен/мобильное зеркало)."""
+    domain = registrable_domain(urlparse(url1 or '').netloc)
+    return bool(domain) and domain == registrable_domain(urlparse(url2 or '').netloc)
+
+
+def redirect_shim_target(html: str, max_len: int) -> Optional[str]:
+    """Редирект-шим: короткое тело, вся задача которого — увести на другой адрес
+    (<meta http-equiv="Refresh"> либо единственный <script> с location=/location.replace/
+    setTimeout). Возвращает адрес назначения ('' если он не распознан) либо None, если
+    это не шим (D232 parkgroup.ru, D238 tormax.ru)."""
+    body = html or ''
+    if len(body) > max_len:
+        return None
+    meta = _META_REFRESH_RE.search(body)
+    if meta:
+        target = _META_REFRESH_URL_RE.search(meta.group(0))
+        return target.group(1) if target else ''
+    scripts = _SCRIPT_RE.findall(body)
+    if len(scripts) == 1 and _JS_REDIRECT_RE.search(scripts[0]):
+        target = re.search(r'["\'](https?://[^"\']+)["\']', scripts[0])
+        return target.group(1) if target else ''
+    return None
 
 
 def normalize_site_url(raw) -> str:
@@ -210,6 +265,9 @@ class DomainEquivalencyManager:
           комбинации схема x www;
         - кандидат подтверждается ТОЛЬКО ответом 200 с содержательным телом без маркеров
           заглушки хостера; 206 на наш Range перепроверяется запросом без Range;
+        - конечный URL после редиректов принимается только при эквивалентном хосте (апекс/www;
+          мобильное зеркало m./mobile./touch. схлопывается к десктопной форме), смена хоста —
+          в INFO, база обхода остаётся на домене компании;
         - сначала все кандидаты с проверкой TLS; отпавшие ИМЕННО по сертификату
           перепроверяются вторым проходом без проверки TLS (с пометкой «TLS-имя не совпало»),
           чтобы сайт с истёкшим сертификатом на своём домене не потерялся, но и не перебивал
@@ -305,13 +363,45 @@ class DomainEquivalencyManager:
             log.info(f"Кандидат {variant}: статус {answer.status} — не подтверждён{tls_note}")
             return CandidateProbe(False, variant, f'статус {answer.status}', False, True, None)
 
+        requested_host = urlparse(variant).netloc
+        final_host = urlparse(answer.final_url or variant).netloc
+        if final_host and not hosts_equivalent(final_host, requested_host):
+            # Редирект увёл на чужой хост: парковка хостера или сайт-редиректор. Базой обхода
+            # такой адрес не становится, обход остаётся на домене компании (D167).
+            site_status = self._foreign_host_status(answer.final_url)
+            log.info(f"Кандидат {variant}: редирект сменил хост на {final_host} "
+                     f"({site_status}) — кандидат не подтверждён{tls_note}")
+            return CandidateProbe(False, variant, f'редирект на чужой хост {final_host}',
+                                  False, True, site_status)
+
         reason, site_status = self._content_verdict(answer.body, variant)
         if reason:
             log.info(f"Кандидат {variant}: 200, но {reason} — не подтверждён{tls_note}")
             return CandidateProbe(False, variant, reason, False, True, site_status)
 
+        chosen = answer.final_url or variant
+        if final_host and is_mobile_mirror(final_host, requested_host):
+            # UA-зависимый 301 на мобильное зеркало: контент тот же, но у зеркала canonical и
+            # карта сайта ведут на апекс — базой обхода оставляем десктопную форму (D272).
+            log.info(f"Кандидат {variant}: сайт увёл пробу на мобильное зеркало {final_host} — "
+                     f"базой обхода остаётся {variant}")
+            chosen = variant
+
         log.info(f"Кандидат {variant}: 200, тело {len(answer.body)} симв. — подтверждён{tls_note}")
-        return CandidateProbe(True, answer.final_url or variant, '', False, True, None)
+        return CandidateProbe(True, chosen, '', False, True, None)
+
+    def _foreign_host_status(self, final_url: str) -> str:
+        """Куда увёл редирект: припаркованный домен (хост хостера или путь /parking) или
+        просто чужой хост."""
+        parsed = urlparse(final_url or '')
+        host = strip_www(parsed.netloc)
+        if '/parking' in (parsed.path or '').lower():
+            return 'parked_domain'
+        for hoster in (getattr(self.config, 'parking_hoster_domains', None) or []):
+            hoster = strip_www(hoster)
+            if hoster and (host == hoster or host.endswith('.' + hoster)):
+                return 'parked_domain'
+        return 'foreign_host'
 
     def _content_verdict(self, body: str, variant: str):
         """Гейт содержательности кандидата. Возвращает (причина отказа, машинный статус);
@@ -319,6 +409,13 @@ class DomainEquivalencyManager:
         marker = self._hoster_stub_marker(body)
         if marker:
             return f'тело — заглушка/панель хостера (маркер «{marker}»)', 'hoster_stub'
+        shim_target = redirect_shim_target(
+            body, getattr(self.config, 'working_url_shim_max_len', 2000))
+        if shim_target is not None:
+            # Цель шима на чужом домене автоматически не обходится: нужен актуальный адрес
+            # в Site_list (D232, D238).
+            return (f'страница является редирект-шимом на {shim_target or "другой адрес"}',
+                    'redirect_shim')
         min_content = getattr(self.config, 'working_url_min_content', 300)
         if len(body or '') < min_content:
             return f'тело {len(body or "")} симв. короче порога {min_content}', None
@@ -338,7 +435,9 @@ class DomainEquivalencyManager:
         """Один HTTP-запрос кандидата: сначала браузерный TLS-отпечаток (curl_cffi
         impersonate) — сайты с фильтрацией по TLS-fingerprint режут «голый» aiohttp;
         aiohttp остаётся фолбэком, когда curl_cffi недоступен или не дошёл до ответа."""
-        headers = {"Range": "bytes=0-0"} if use_range else {}
+        headers = self._probe_headers()
+        if use_range:
+            headers["Range"] = "bytes=0-0"
         answer = await self._probe_variant_impersonate(variant, headers, verify_tls)
         if answer is not None and (answer.status is not None or answer.tls_error):
             return answer
@@ -346,6 +445,16 @@ class DomainEquivalencyManager:
             log.info(f"Кандидат {variant}: impersonate-проба не дошла до ответа ({answer.error}), "
                      f"пробуем aiohttp")
         return await self._probe_variant_aiohttp(variant, headers, verify_tls)
+
+    def _probe_headers(self) -> dict:
+        """Заголовки пробы: без явного русского языка и десктопного клиента сайт уводит
+        пробу на англоязычный микросайт (D140) или на мобильное зеркало (D272) —
+        curl_cffi impersonate=chrome шлёт свой дефолтный en-US."""
+        headers = {'Accept-Language': 'ru-RU,ru;q=0.9', 'sec-ch-ua-mobile': '?0'}
+        user_agent = getattr(self.config, 'stealth_user_agent', None)
+        if user_agent:
+            headers['User-Agent'] = user_agent
+        return headers
 
     async def _probe_variant_impersonate(self, variant: str, headers: dict,
                                          verify_tls: bool) -> Optional[HttpAnswer]:

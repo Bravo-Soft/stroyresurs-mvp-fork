@@ -311,6 +311,16 @@ class Config:
         "apache2 ubuntu default page",    # дефолтный vhost apache
     ])
 
+    # Редиректы и смена хоста при выборе базы обхода (P05 U2).
+    working_url_shim_max_len: int = 2000  # тело короче — ищем в нём редирект-шим (meta refresh
+                                          # или единственный <script> с location); длина шимов
+                                          # не измерена, порог взят с запасом к 189 б parkgroup
+    # Домены хостеров: конечный хост редиректа в этом списке (или путь /parking) — припаркованный
+    # домен, а не переезд сайта (D167 vh444.timeweb.ru/parking).
+    parking_hoster_domains: list = field(default_factory=lambda: [
+        "timeweb.ru", "timeweb.cloud", "reg.ru", "beget.com", "beget.ru",
+    ])
+
     # Профилирование сайтов (декларативные YAML-профили + перепись/метрики).
     # Пер-доменные словари выше (ajax_product_tabs_domains, bitrix_offers_domains,
     # exclude_url_patterns_by_domain, strict_www_domains, equivalent_domains) —
