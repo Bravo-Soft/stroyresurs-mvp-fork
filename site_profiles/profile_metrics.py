@@ -61,6 +61,7 @@ class RunMetricsCollector:
         self.links_skipped_perimeter = 0        # из них отброшено гейтом периметра
         self.sitemap_queued = None              # поставлено в очередь из карты сайта
         self.sitemap_filtered = None            # отфильтровано из карты сайта
+        self.url_filters = {}                   # доли отсева URL фильтрами категоризатора (P04 U1)
 
     # ---------- хуки краулера ----------
 
@@ -102,6 +103,12 @@ class RunMetricsCollector:
         (_add_sitemap_urls_to_queue) — здесь счётчик и алерт (P05 U2)."""
         self.sitemap_queued = (self.sitemap_queued or 0) + int(queued or 0)
         self.sitemap_filtered = (self.sitemap_filtered or 0) + int(filtered or 0)
+
+    @_safe
+    def record_url_filters(self, stats):
+        """Доли URL, отсеянных языковым фильтром и глобальным exclude-списком (P04 U1):
+        по ним видно «фильтр съел сайт» без чтения логов."""
+        self.url_filters = dict(stats or {})
 
     @_safe
     def record_document_files(self, section, count):
@@ -216,6 +223,11 @@ class RunMetricsCollector:
             'links_skipped_perimeter': self.links_skipped_perimeter,
             'sitemap_queued': self.sitemap_queued,
             'sitemap_filtered': self.sitemap_filtered,
+            # Фильтры категоризатора URL (P04 U1): доля отсева по домену и факт
+            # срабатывания предохранителя «фильтр съел сайт»
+            'excluded2_rate': self.url_filters.get('excluded2_rate'),
+            'lang_excluded_rate': self.url_filters.get('lang_excluded_rate'),
+            'url_filters': dict(self.url_filters) or None,
         }
         metrics['alerts'] = self._alerts(metrics)
         return metrics
