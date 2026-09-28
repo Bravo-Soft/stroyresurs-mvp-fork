@@ -266,7 +266,18 @@ class BrowserPool:
             log.warning(f"Контекст браузера не закрылся ({type(e).__name__}); семафор освобождаем принудительно")
         finally:
             self._context_semaphore.release()
-            
+
+    async def close_page(self, page) -> None:
+        """Закрытие страницы под таймаутом — тот же класс, что context/browser (D101).
+        page.close() у зависшего рендерера не возвращается никогда: задача страницы
+        жила вечно, а главный цикл обхода ждал её в gather до сторожа (termal.biz,
+        стенд 28.09.2026 — три задачи стояли в finally динамического экстрактора)."""
+        try:
+            await asyncio.wait_for(page.close(), timeout=self.CLOSE_TIMEOUT)
+        except Exception as e:
+            log.warning(f"Страница браузера не закрылась ({type(e).__name__}); "
+                        f"продолжаем — контекст закроется под своим таймаутом")
+
     async def close(self):
         """Закрытие браузера и остановка Playwright (под таймаутом — см. D101)."""
         if self._browser:
@@ -341,7 +352,7 @@ class DynamicContentExtractor:
             return []
         finally:
             if page:
-                await page.close()
+                await self.browser_pool.close_page(page)
             await self.browser_pool.return_browser(context)
 
     async def _has_tabs(self, page) -> bool:
@@ -492,7 +503,7 @@ class DynamicContentExtractor:
             return None
         finally:
             if page:
-                await page.close()
+                await self.browser_pool.close_page(page)
             await self.browser_pool.return_browser(context)
 
     async def _process_accordions(self, page):
@@ -4658,7 +4669,7 @@ class WebCrawler:
             log.error(f"Ошибка скачивания файлов с {site_url}: {e}")
         finally:
             if page:
-                await page.close()
+                await self.browser_pool.close_page(page)
             if context:
                 await self.browser_pool.return_browser(context)
         return downloaded_files
@@ -5306,7 +5317,7 @@ class WebCrawler:
             return None, False, None
         finally:
             if page:
-                await page.close()
+                await self.browser_pool.close_page(page)
             if context:
                 await self.browser_pool.return_browser(context)
 
