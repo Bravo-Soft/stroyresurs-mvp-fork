@@ -61,6 +61,22 @@ class ProfileResolver:
         self._aliases = None        # alias-domain -> SiteProfile
         self._suffixes = None       # list[('.hms.ru', SiteProfile)]
         self.load_errors = {}       # файл -> список ошибок валидации (для диагностики)
+        self._fingerprint = None    # (name, mtime_ns, size) для hot-reload из Диспетчерской
+
+    def _directory_fingerprint(self):
+        """Лёгкий отпечаток YAML-профилей без чтения их содержимого."""
+        if not self.profiles_dir.is_dir():
+            return ()
+        rows = []
+        for path in self.profiles_dir.glob("*.yaml"):
+            if path.name.startswith("_"):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            rows.append((path.name, stat.st_mtime_ns, stat.st_size))
+        return tuple(sorted(rows))
 
     def _ensure_loaded(self):
         if self._profiles is not None:
@@ -121,7 +137,20 @@ class ProfileResolver:
         """Сбросить кэш (тесты, точечное пере-профилирование)."""
         self._profiles = self._aliases = self._suffixes = None
         self.load_errors = {}
+        self._fingerprint = None
 
+    def reload_if_changed(self):
+        """Сбросить кэш только после изменения YAML на диске."""
+        current = self._directory_fingerprint()
+        if self._fingerprint is None:
+            self._fingerprint = current
+            return False
+        if current == self._fingerprint:
+            return False
+        self.reload()
+        self._fingerprint = current
+        logger.info("Каталог профилей изменён — кэш профилей будет перечитан")
+        return True
 
 _resolver = None
 

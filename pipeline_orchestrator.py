@@ -11,6 +11,7 @@ from checkpoint_manager import CheckpointManager
 from graph_db_uploader import GraphDBFatalError
 from activity_heartbeat import get_heartbeat
 from web_crawler import read_memory_usage_mb
+import pipeline_control
 
 log = logging.getLogger("pipeline_orchestrator")
 
@@ -44,6 +45,7 @@ class PipelineOrchestrator:
         # Флаги управления
         self._running = False
         self._urgent_queue_size = 0
+        self.stopped_by_admin = False
         
     async def initialize(self):
         """Инициализация оркестратора"""
@@ -61,7 +63,7 @@ class PipelineOrchestrator:
         # KafkaManager закрывается в main, здесь не закрываем
         log.info("PipelineOrchestrator остановлен")
     
-    async def run_with_priority(self, monitoring_system, companies: list):
+    async def run_with_priority(self, monitoring_system, companies: list, mode: str = "full"):
         """
         Запуск мониторинга с приоритетной обработкой urgent задач
         
@@ -72,8 +74,15 @@ class PipelineOrchestrator:
         self._running = True
         self.regular_companies = companies
         self.current_regular_index = 0
+        self.stopped_by_admin = False
         run_results = []
-        
+
+        if mode not in ("full", "urgent-only"):
+            raise ValueError(f"Неизвестный режим пайплайна: {mode}")
+        if mode == "urgent-only":
+            await self._serve_urgent_only(monitoring_system)
+            return
+
         log.info(f"Запуск пайплайна с приоритетной обработкой urgent задач")
         log.info(f"Всего компаний для обработки: {len(companies)}")
         
@@ -89,10 +98,15 @@ class PipelineOrchestrator:
         
         # Основной цикл
         while self._running and self.current_regular_index < len(companies):
+            company_for_checkpoint = companies[self.current_regular_index]
+            if await self._stop_if_requested(monitoring_system, company_for_checkpoint):
+                break
             try:
                 # Проверяем urgent задачи перед каждой компанией
                 await self._check_and_process_urgent_tasks(monitoring_system)
-                
+                if not self._running:
+                    break
+
                 # Обрабатываем регулярную компанию
                 company = companies[self.current_regular_index]
                 log.info(f"Обработка регулярной компании {self.current_regular_index+1}/{len(companies)}: {company['original_name']}")
@@ -146,9 +160,47 @@ class PipelineOrchestrator:
             except Exception as e:
                 log.error(f"Не удалось сформировать итоговый отчёт мониторинга: {e}")
         
-        self.state = PipelineState.IDLE
+        if not self.stopped_by_admin:
+            self.state = PipelineState.IDLE
         log.info("Пайплайн завершил работу")
-    
+
+    async def _stop_if_requested(self, monitoring_system, company=None):
+        """Остановить прогон на границе компаний по команде Диспетчерской."""
+        if not pipeline_control.stop_requested(self.config.logs_dir):
+            return False
+        if company is not None:
+            await self.checkpoint_manager.save_checkpoint(
+                company_data=company,
+                processed_urls=monitoring_system._global_processed_urls,
+                stage="stopped_by_admin",
+                progress={"status": "stopped_by_admin",
+                          "current_company_index": self.current_regular_index,
+                          "total_companies": len(self.regular_companies)})
+        self.stopped_by_admin = True
+        self._running = False
+        self.state = PipelineState.STOPPED
+        log.info("Получена команда мягкой остановки Диспетчерской")
+        return True
+
+    async def _serve_urgent_only(self, monitoring_system):
+        """Постоянно обслуживать очередь urgent_tasks до команды мягкой остановки."""
+        self.state = PipelineState.PROCESSING_URGENT
+        log.info("Пайплайн запущен в режиме только срочных задач")
+        while self._running:
+            if await self._stop_if_requested(monitoring_system):
+                break
+            try:
+                task = await self.kafka_manager.get_urgent_task()
+                if task:
+                    await self._process_all_urgent_tasks(monitoring_system, task)
+                else:
+                    await asyncio.sleep(self.config.kafka_check_urgent_interval)
+            except Exception as e:
+                log.error(f"Ошибка обслуживания urgent очереди: {e}")
+                await asyncio.sleep(self.config.kafka_check_urgent_interval)
+        if not self.stopped_by_admin:
+            self.state = PipelineState.IDLE
+
     async def _process_company_watchdogged(self, monitoring_system, company_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Обработка компании под сторожем зависаний (D101).
@@ -277,6 +329,9 @@ class PipelineOrchestrator:
 
         # Обрабатываем все собранные задачи
         for urgent_task in tasks_to_process:
+            if not self._running or await self._stop_if_requested(
+                    monitoring_system, urgent_task.company_data):
+                break
             try:
                 log.info(f"Начало обработки URGENT задачи: {urgent_task.task_id}")
                 # Отправляем статус "в обработке"
@@ -358,6 +413,9 @@ class PipelineOrchestrator:
     
     async def _restore_state(self, monitoring_system):
         """Восстановление состояния из чекпоинта"""
+        if pipeline_control.ignore_checkpoint():
+            log.info("Восстановление из чекпоинта отключено для этого запуска")
+            return
         checkpoint_data = await self.checkpoint_manager.load_checkpoint()
         
         if checkpoint_data:

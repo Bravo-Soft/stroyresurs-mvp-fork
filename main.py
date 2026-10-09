@@ -8,6 +8,7 @@ import os
 import re
 import json
 import time
+import sys
 import traceback
 import aiofiles
 from urllib.parse import urlparse
@@ -506,6 +507,35 @@ class MonitoringSystem:
         os.makedirs(self.config.product_cards_dir, exist_ok=True)
 
     def read_company_list(self) -> List[Dict[str, str]]:
+        if self.config.site_list_dsn:
+            try:
+                from site_list_db import SiteListUnavailable, fetch_all
+                rows = fetch_all(self.config.site_list_dsn)
+            except SiteListUnavailable as e:
+                log.error("Ошибка чтения списка компаний из PostgreSQL: %s", e)
+                return []
+
+            companies = []
+            for row in rows:
+                original_name = row.get("name", "")
+                website = normalize_site_url(row.get("website", ""))
+                if not website:
+                    log.error("Адрес компании «%s» не содержит хоста (%r) — компания пропущена, краул невозможен",
+                              original_name, row.get("website"))
+                    continue
+
+                manufacturer_id = str(row.get("company_id") or f"company_{len(companies)}")
+                safe_name = sanitize_company_name(original_name)
+                companies.append({
+                    "original_name": original_name,
+                    "safe_name": safe_name,
+                    "website": website,
+                    "folder_name": safe_name,
+                    "company_id": manufacturer_id,
+                    "generated_company_id": f"company_{len(companies)}"
+                })
+            return companies
+
         try:
             df = pd.read_excel(self.config.excel_path)
             companies = []
@@ -918,7 +948,9 @@ class MonitoringSystem:
             # возьмёт свой дефолт — mvp/profiles рядом с пакетом site_profiles.
             profiles_dir = (self.config.profiles_dir
                             if os.path.isdir(self.config.profiles_dir) else None)
-            profile = get_resolver(profiles_dir).resolve(company_data['website'])
+            resolver = get_resolver(profiles_dir)
+            resolver.reload_if_changed()
+            profile = resolver.resolve(company_data['website'])
             domain = profile.domain
             if profile.is_default():
                 log.info(f"Профиль сайта для {domain}: отсутствует — generic-поведение")
@@ -3129,6 +3161,14 @@ async def main():
     )
     # D101: пульс активности — по нему сторож зависаний отличает работу от простоя
     activity_heartbeat.install()
+    from run_recorder import RunRecorder
+    import pipeline_control
+    mode = "urgent-only" if ("--urgent-only" in sys.argv or
+                             os.getenv("PIPELINE_MODE") == "urgent-only") else "full"
+    selected_company_ids = pipeline_control.company_ids_from_env()
+    run_recorder = RunRecorder(config.logs_dir)
+    run_recorder.install_heartbeat()
+    run_failed = False
     
     log.info("Запуск системы мониторинга с приоритетной обработкой urgent задач")
     
@@ -3148,17 +3188,77 @@ async def main():
         companies = monitoring_system.read_company_list()
         log.info(f"Найдено {len(companies)} компаний для обработки")
         
-        if not companies:
+        if not companies and mode != "urgent-only":
             log.error("Не найдено компаний для обработки")
             return
-        
-        await pipeline_orchestrator.run_with_priority(monitoring_system, companies)
+
+        if mode == "urgent-only":
+            companies = []
+        elif selected_company_ids is not None:
+            selected = set(selected_company_ids)
+            companies = [company for company in companies
+                         if str(company.get("company_id")) in selected]
+            missing = selected - {str(company.get("company_id")) for company in companies}
+            if missing:
+                log.warning("В COMPANY_IDS не найдены id: %s", ", ".join(sorted(missing)))
+
+        run_recorder.start(mode, len(companies) if mode == "full" else None,
+                           selected_company_ids, resume=not pipeline_control.ignore_checkpoint())
+        original_process_company = monitoring_system.process_company
+
+        async def recorded_process_company(company_data, force_restart=False):
+            kind = ("urgent" if pipeline_orchestrator.state.value == "processing_urgent"
+                    else "regular")
+            index = (pipeline_orchestrator.current_regular_index + 1
+                     if kind == "regular" else None)
+            total = len(companies) if kind == "regular" else None
+            run_recorder.company_started(company_data, index=index, total=total, kind=kind)
+            try:
+                result = await original_process_company(company_data, force_restart=force_restart)
+            except asyncio.CancelledError:
+                run_recorder.company_finished(
+                    company_data, {"status": "abandoned_idle",
+                                   "errors": ["Компания отменена сторожем простоя"]},
+                    monitoring_system.processing_tracker, kind)
+                raise
+            except Exception as exc:
+                run_recorder.company_finished(
+                    company_data, {"status": "critical_error", "errors": [str(exc)]},
+                    monitoring_system.processing_tracker, kind)
+                raise
+            run_recorder.company_finished(company_data, result,
+                                          monitoring_system.processing_tracker, kind)
+            if pipeline_control.stop_requested(config.logs_dir):
+                await monitoring_system.checkpoint_manager.save_checkpoint(
+                    company_data=company_data,
+                    processed_urls=monitoring_system._global_processed_urls,
+                    stage="stopped_by_admin",
+                    progress={"status": "stopped_by_admin",
+                              "current_company_index": pipeline_orchestrator.current_regular_index,
+                              "total_companies": len(companies)},
+                    company_stats=result.get("company_statistics"))
+                pipeline_orchestrator.stopped_by_admin = True
+                pipeline_orchestrator._running = False
+                log.info("Получена команда мягкой остановки; прогон завершится после компании")
+            return result
+
+        monitoring_system.process_company = recorded_process_company
+        await pipeline_orchestrator.run_with_priority(monitoring_system, companies, mode=mode)
         
         log.info("Мониторинг успешно завершен")
         
     except Exception as e:
+        run_failed = True
         log.error(f"Критическая ошибка в системе мониторинга: {e}")
     finally:
+        if run_recorder.started:
+            run_recorder.finish(
+                getattr(monitoring_system, "statistics", None),
+                getattr(monitoring_system, "processing_tracker", None),
+                aborted=run_failed or getattr(pipeline_orchestrator, "stopped_by_admin", False),
+                aborted_by=("stopped_by_admin"
+                            if getattr(pipeline_orchestrator, "stopped_by_admin", False) else None))
+        run_recorder.uninstall_heartbeat()
         await pipeline_orchestrator.shutdown()
         await monitoring_system.close()
         await kafka_manager.close()

@@ -223,6 +223,8 @@ _MODEL_TUNING = {
     # gemma4 — прод с 2026-07-27 (полный прогон 1142 стр. + A/B: Анализ системы/_gemma4_test/REPORT.md).
     # effort=None (не-reasoning модель, reasoning_effort не слать), robust=True (оборачивает в ```json).
     "gemma4:31b":             {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": True},
+    # прод с 2026-09-29: локальная gemma4-31b (vLLM за LiteLLM, см. config.ollama_*) — тюнинг как у gemma4:31b.
+    "gemma4-31b":             {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": True},
     "gpt-oss:120b":           {"effort": "low",  "thinking_off": False, "num_ctx": None,  "robust": True},
     "gpt-oss:20b":            {"effort": "low",  "thinking_off": False, "num_ctx": None,  "robust": True},
     "qwen3-coder-next":       {"effort": None,   "thinking_off": False, "num_ctx": 32768, "robust": False},
@@ -257,7 +259,7 @@ def _payload_tuning(model: str) -> dict:
 # Модели, у которых единый вызов (single_1call) даёт корректный финальный JSON (отчёт A/B §4).
 # Для остальных (deepseek-v3.2/v4-flash, qwen, minimax) наивное объединение промптов ломает вывод
 # (модель печатает промежуточную step_-структуру) → используем 2-вызовную SGR.
-_SINGLE_CALL_MODELS = {"gemini-3-flash-preview", "glm-5.2", "gemma4:31b"}
+_SINGLE_CALL_MODELS = {"gemini-3-flash-preview", "glm-5.2", "gemma4:31b", "gemma4-31b"}
 
 # D78: детерминированная нормализация латинских (машинных) ключей характеристик в русские.
 # Сайты вида ekontaktor.ru (Next.js) отдают в разметке англ-блок data-props; извлечение иногда
@@ -389,6 +391,9 @@ class AITunnelClient:
                     # Таймаут поднят с дефолтных 300с: на страницах-гигантах gemma4 генерирует
                     # >300с; обрыв клиента оставляет «осиротевшую» генерацию, занимающую слот
                     # аккаунта Ollama (полный прогон 27.07: 39 стр. душили слоты ретраями).
+                    # Не передаём timeout в JSON: LiteLLM использует его как таймаут
+                    # генерации и перекрывает настройку шлюза (80с вместо 600с).
+                    # Здесь задаётся только таймаут ожидания HTTP-ответа клиентом.
                     timeout = aiohttp.ClientTimeout(total=900)
                     async with aiohttp.ClientSession(timeout=timeout) as session:
                         async with session.post(self.api_url, headers=self.headers, json=data) as response:
@@ -895,7 +900,6 @@ class AITunnelClient:
                         ],
                         "temperature": 0.2,
                         "reasoning_effort": _effort_for_model(self.model),
-                        "timeout": 120,
                         "response_format": {"type": "json_object"}
                     }
                 
@@ -1047,6 +1051,9 @@ class AITunnelClient:
     {{"source_heading": "...", "semantic_route": "<одно из: description, applications, advantages, instructions_manuals, exploitation, storage, security_measures, complectation, compatibility, dimensions, weight, specifications, additional_info>", "routed_text": "<текст секции как есть>"}}.
     Область применения → applications; преимущества → advantages; комплектация/упаковка → complectation;
     совместимость → compatibility; хранение → storage; эксплуатация → exploitation; меры безопасности → security_measures.
+    СОСТАВ товара (из каких веществ/материалов он изготовлен: «Состав», «Состав смеси», «Химический состав» и т.п.)
+    → specifications (в spec_items: ключ как в источнике, иначе «Состав»; значение дословно); «Состав» со списком
+    ПОСТАВЛЯЕМЫХ предметов/узлов (комплект) → complectation.
     Не уверен → additional_info.
     СРОК СЛУЖБЫ, срок/гарантийный срок ГАРАНТИИ и обозначения нормативов (ГОСТ …, ГОСТ Р …, ТУ …) —
     ТЕРЯТЬ ЗАПРЕЩЕНО (D15), даже если они даны ОТДЕЛЬНЫМИ СТРОКАМИ после таблицы характеристик без
@@ -1149,7 +1156,6 @@ class AITunnelClient:
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": _temp,
-                "timeout": 80,
                 "response_format": {"type": "json_object"}
             }
             data.update(_payload_tuning(self.model))
@@ -1328,7 +1334,6 @@ class AITunnelClient:
 
     1. Запрещённые ключи (НЕ класть в specifications):
     - Назначение → applications
-    - Состав (ингредиенты) → description или additional_info
     - Применение / Способ применения → instructions_manuals
     - Рекомендации (по применению) → instructions_manuals
     - Инструкции (пошаговый способ применения) → instructions_manuals; наименования и ссылки на документы/сертификаты → ИГНОРИРОВАТЬ ПОЛНОСТЬЮ (см. раздел «ДОКУМЕНТЫ/ССЫЛКИ» ниже)
@@ -1344,6 +1349,17 @@ class AITunnelClient:
     ВНИМАНИЕ: «Количество в 1 м^2», «в 1 м^3», «на 1 м.пог», «толщина (стенки)», «теплопроводность» и т.п.,
     а также ВЕС/МАССА и ГАБАРИТНЫЕ РАЗМЕРЫ товара — это технические характеристики, они ОСТАЮТСЯ в specifications
     (НЕ путать с количеством в упаковке/на поддоне и тарой — они → complectation).
+    СОСТАВ ТОВАРА → specifications (требование заказчика 2026-09-29). Сведения о том, ИЗ КАКИХ ВЕЩЕСТВ И
+    МАТЕРИАЛОВ изготовлен товар (компоненты, сырьё, вяжущее, наполнители, добавки, волокна, химический состав),
+    обозначенные в источнике как состав («Состав», «Состав смеси», «Состав ворса», «Химический состав»,
+    «Фракционный состав», «Состав: …», вкладка/заголовок «Состав»), — это ТЕХНИЧЕСКАЯ ХАРАКТЕРИСТИКА.
+    Помещай их в specifications: ключ — как в источнике (состав дан заголовком/вкладкой «Состав» — ключ «Состав»),
+    значение — ДОСЛОВНО, без пересказа и сокращений (пункты списка — одной строкой через «; »); таблицу состава —
+    по общим правилам таблиц (п.2–3a). Терять состав ЗАПРЕЩЕНО, даже если в нём нет чисел; в description и
+    additional_info его НЕ клади и НЕ дублируй.
+    НЕ путай с КОМПЛЕКТОМ: перечень ПОСТАВЛЯЕМЫХ предметов и узлов («Состав комплекта», «Комплект поставки»,
+    «Состав»/«Состав оборудования» со списком деталей, принадлежностей, крепежа, агрегатов — часто со «шт.»)
+    → complectation.
 
     2. Для spec_items (простые пары ключ-значение):
     - Если ключ не запрещён, добавить в specifications как {key: value}.
@@ -1727,7 +1743,6 @@ class AITunnelClient:
                     {"role": "user", "content": user_prompt}
                 ],
                 "temperature": _temp,
-                "timeout": 80,
                 "response_format": {"type": "json_object"}
             }
             data.update(_payload_tuning(self.model))
@@ -1816,7 +1831,6 @@ class AITunnelClient:
             ],
             "temperature": 0.0,
             "reasoning_effort": _effort_for_model(self.model),
-            "timeout": 150,
             "response_format": {"type": "json_object"},
         }
         result, token_usage = await self._make_request_with_retry(data)

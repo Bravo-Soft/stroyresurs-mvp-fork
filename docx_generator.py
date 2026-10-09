@@ -52,6 +52,10 @@ _UNICODE_FRACTIONS = {
 }
 _FRACTION_CHARS = ''.join(_UNICODE_FRACTIONS.keys())
 
+# Содержимое пустой строки карточки — 5 пробелов: у заказчика совсем пустые строки RTF
+# схлопываются (требование заказчика 2026-09-29). См. DOCXGenerator._fill_empty_lines.
+_EMPTY_LINE = ' ' * 5
+
 
 def _literal_superscripts_to_caret(text: str) -> str:
     """Литеральные надстрочные символы (³, ⁻¹ …) → КАРЕТНАЯ степень (^3, ^-1).
@@ -342,6 +346,9 @@ class DOCXGenerator:
             source_url = product_data.get('source_url', '')
             if source_url:
                 self._add_source_url(doc, source_url)
+
+            # Пустые строки — по 5 пробелов (у заказчика пустые строки схлопываются)
+            self._fill_empty_lines(doc)
 
             product_id = product_data.get('product_id', 'unknown')
 
@@ -1608,6 +1615,21 @@ class DOCXGenerator:
         url_run = url_paragraph.add_run(f"URL страницы: {source_url}")
         url_run.font.name = 'Calibri'
         url_run.font.size = Pt(12)
+
+    def _fill_empty_lines(self, doc: Document) -> None:
+        """Каждая пустая строка карточки — 5 пробелов (_EMPTY_LINE): у заказчика пустые строки
+        схлопываются. Пустой абзац-разделитель получает run из 5 пробелов; пустая строка внутри
+        многострочного абзаца (между разрывами строки — «Инструкции по применению» и т. п.) —
+        тоже. Число и места пустых строк не меняются. Ячейки таблиц не трогаем: doc.paragraphs
+        их не содержит."""
+        for paragraph in doc.paragraphs:
+            if not paragraph.text:
+                paragraph.add_run(_EMPTY_LINE)
+                continue
+            for run in paragraph.runs:
+                if '\n' in run.text:
+                    run.text = '\n'.join(line if line.strip() else _EMPTY_LINE
+                                         for line in run.text.split('\n'))
 
     # -------------------------------------------------------------------------
     # СОХРАНЕНИЕ И КОНВЕРТАЦИЯ

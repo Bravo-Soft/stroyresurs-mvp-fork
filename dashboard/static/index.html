@@ -1,0 +1,1205 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Стройресурс — Диспетчерская</title>
+<!--
+  Тонкий UI (§2 спецификации): одна статическая страница, vanilla JS, без SPA-фреймворка
+  и сборки. Вся логика — на сервере; страница только вызывает /api/v1/* (§4).
+  Пять экранов (§3): Обзор, Прогон, Компания, Настройки, Журнал.
+-->
+<style>
+  :root {
+    --bg:#f4f6f9; --surface:#fff; --surface2:#eaeef4; --ink:#1b2430; --soft:#4a5568;
+    --faint:#7b8794; --line:#d5dce5; --accent:#c94f0e; --accent-soft:#fbede3;
+    --ok:#1e7a46; --ok-soft:#e2f2e8; --warn:#9a6b0a; --warn-soft:#f7efd9;
+    --danger:#b02e2e; --danger-soft:#f9e7e7; --steel:#3d5a80; --steel-soft:#e4eaf2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#141a22; --surface:#1c242f; --surface2:#232d3a; --ink:#e6ebf1; --soft:#adb9c6;
+      --faint:#7b8794; --line:#33404f; --accent:#e8722e; --accent-soft:#3a2717;
+      --ok:#4caf79; --ok-soft:#1b2f24; --warn:#d9a83f; --warn-soft:#332b17;
+      --danger:#e06a6a; --danger-soft:#362020; --steel:#8fb0d9; --steel-soft:#26303e;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 "Segoe UI",system-ui,sans-serif; }
+  header { background:var(--surface); border-bottom:1px solid var(--line); padding:12px 20px;
+           display:flex; gap:16px; align-items:center; flex-wrap:wrap; position:sticky; top:0; z-index:10; }
+  header h1 { font-size:17px; margin:0; font-weight:700; white-space:nowrap; }
+  nav { display:flex; gap:4px; flex-wrap:wrap; }
+  nav button { background:none; border:1px solid transparent; border-radius:6px; padding:6px 12px;
+               font:inherit; color:var(--soft); cursor:pointer; }
+  nav button:hover { background:var(--surface2); }
+  nav button.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .spacer { flex:1; }
+  main { padding:20px; max-width:1400px; margin:0 auto; }
+  .screen { display:none; }
+  .screen.active { display:block; }
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:10px;
+          padding:16px 18px; margin-bottom:16px; }
+  .card > h2 { font-size:15px; margin:0 0 12px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .card > h2 .sub { font-weight:400; color:var(--faint); font-size:13px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); }
+  .tile { background:var(--surface2); border-radius:8px; padding:10px 12px; }
+  .tile .k { font-size:11.5px; text-transform:uppercase; letter-spacing:.07em; color:var(--faint); }
+  .tile .v { font-size:21px; font-weight:700; margin-top:2px; }
+  .tile .n { font-size:12px; color:var(--soft); }
+  /* «Последний результат»: одинаковые плитки, длинный текстовый статус и run_id не вылезают */
+  .grid.even { grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); grid-auto-rows:1fr; }
+  .grid.even .tile { min-width:0; }
+  .grid.even .tile .v.text { font-size:16px; line-height:1.3; margin-top:5px; overflow-wrap:anywhere; }
+  .grid.even .tile .n { overflow-wrap:anywhere; }
+  button.act { background:var(--accent); color:#fff; border:none; border-radius:6px;
+               padding:8px 15px; font:inherit; font-weight:600; cursor:pointer; }
+  button.act:disabled { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:var(--surface2); color:var(--ink); border:1px solid var(--line);
+                 border-radius:6px; padding:7px 13px; font:inherit; cursor:pointer; }
+  button.ghost:disabled { opacity:.45; cursor:not-allowed; }
+  button.danger { background:var(--danger); color:#fff; border:none; border-radius:6px;
+                  padding:8px 15px; font:inherit; font-weight:600; cursor:pointer; }
+  input, select, textarea { font:inherit; padding:6px 9px; border:1px solid var(--line);
+          border-radius:6px; background:var(--surface); color:var(--ink); }
+  input[type=checkbox] { padding:0; }
+  table { border-collapse:collapse; width:100%; font-size:13.5px; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { background:var(--surface2); font-size:11.5px; text-transform:uppercase;
+       letter-spacing:.06em; color:var(--soft); white-space:nowrap; position:sticky; top:0; }
+  tr:last-child td { border-bottom:none; }
+  .scroll { overflow:auto; max-height:460px; border:1px solid var(--line); border-radius:8px; }
+  .pill { display:inline-block; font-size:11.5px; font-weight:600; padding:2px 9px;
+          border-radius:999px; white-space:nowrap; }
+  .pill.ok { background:var(--ok-soft); color:var(--ok); }
+  .pill.warn { background:var(--warn-soft); color:var(--warn); }
+  .pill.danger { background:var(--danger-soft); color:var(--danger); }
+  .pill.steel { background:var(--steel-soft); color:var(--steel); }
+  .muted { color:var(--faint); }
+  .mono, pre, code { font-family:Consolas,"JetBrains Mono",monospace; font-size:12.5px; }
+  pre { background:var(--surface2); border-radius:8px; padding:12px; overflow:auto;
+        max-height:420px; margin:0; white-space:pre-wrap; word-break:break-word; }
+  .msg { padding:9px 12px; border-radius:7px; margin:10px 0; font-size:13.5px; }
+  .msg.ok { background:var(--ok-soft); color:var(--ok); }
+  .msg.err { background:var(--danger-soft); color:var(--danger); }
+  .msg.info { background:var(--steel-soft); color:var(--steel); }
+  dialog { border:1px solid var(--line); border-radius:12px; background:var(--surface);
+           color:var(--ink); padding:0; max-width:620px; width:92%; }
+  dialog::backdrop { background:rgba(0,0,0,.45); }
+  .dlg-head { padding:14px 18px; border-bottom:1px solid var(--line); font-weight:700; }
+  .dlg-body { padding:16px 18px; max-height:60vh; overflow:auto; }
+  .dlg-foot { padding:12px 18px; border-top:1px solid var(--line); display:flex; gap:10px;
+              justify-content:flex-end; }
+  .chk-list { max-height:260px; overflow:auto; border:1px solid var(--line); border-radius:8px;
+              padding:6px 10px; }
+  .chk-list label { display:block; padding:3px 0; font-size:13.5px; cursor:pointer; }
+  fieldset { border:1px solid var(--line); border-radius:8px; margin:0 0 14px; padding:12px 14px; }
+  legend { font-size:12px; text-transform:uppercase; letter-spacing:.07em; color:var(--soft);
+           font-weight:600; padding:0 6px; }
+  .set-row { display:grid; grid-template-columns:minmax(220px,1fr) minmax(200px,1.2fr) auto;
+             gap:10px; align-items:center; padding:6px 0; border-bottom:1px solid var(--line); }
+  .set-row:last-child { border-bottom:none; }
+  .set-row .nm { font-family:Consolas,monospace; font-size:12.5px; }
+  .set-row .nt { font-size:11.5px; color:var(--faint); }
+  .yaml-edit { width:100%; min-height:340px; resize:vertical; white-space:pre; box-sizing:border-box;
+               font-family:Consolas,"JetBrains Mono",monospace; font-size:12.5px; line-height:1.45;
+               tab-size:2; }
+  details.hint > summary { cursor:pointer; color:var(--soft); font-size:13px; }
+  .login { max-width:420px; margin:12vh auto; }
+</style>
+</head>
+<body>
+
+<div id="login" class="login">
+  <div class="card">
+    <h2>Диспетчерская Стройресурса</h2>
+    <p class="muted" style="font-size:13.5px">Введите токен оператора (переменная окружения
+      <code>DASHBOARD_TOKEN</code> на сервере панели).</p>
+    <div class="row">
+      <input type="password" id="token-input" placeholder="Токен" style="flex:1" autocomplete="off">
+      <button class="act" onclick="login()">Войти</button>
+    </div>
+    <div id="login-msg"></div>
+  </div>
+</div>
+
+<div id="app" hidden>
+<header>
+  <h1>Диспетчерская</h1>
+  <nav>
+    <button data-screen="overview" class="active">Обзор</button>
+    <button data-screen="run">Прогон</button>
+    <button data-screen="company">Компания</button>
+    <button data-screen="settings">Настройки</button>
+    <button data-screen="log">Журнал</button>
+  </nav>
+  <span class="spacer"></span>
+  <span id="hdr-state" class="pill steel">—</span>
+  <button class="ghost" onclick="logout()">Выйти</button>
+</header>
+
+<main>
+
+<!-- ============================ ОБЗОР ============================ -->
+<section id="s-overview" class="screen active">
+  <div class="card">
+    <h2>Состояние пайплайна <span class="sub" id="ov-updated"></span></h2>
+    <div id="ov-status" class="row"><span class="muted">Загрузка…</span></div>
+    <div class="row" style="margin-top:14px">
+      <button class="act" id="btn-start" onclick="openStart()">▶ Старт</button>
+      <button class="ghost" id="btn-stop" onclick="doStop(false)">■ Остановить мягко</button>
+      <button class="ghost" id="btn-kill" onclick="doStop(true)">✕ Жёстко</button>
+      <button class="ghost" id="btn-restart" onclick="doRestart()">↻ Перезапустить</button>
+      <span class="muted" id="ov-checkpoint"></span>
+    </div>
+    <div id="ov-msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Метрики последнего прогона <span class="sub" id="ov-run-id"></span></h2>
+    <div class="grid" id="ov-tiles"><span class="muted">Загрузка…</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Время по модулям <span class="sub">чистое время единицы обработки, медиана</span></h2>
+    <div class="scroll"><table id="ov-modules"><tbody></tbody></table></div>
+  </div>
+
+  <div class="card">
+    <h2>Здоровье системы <span class="sub" id="ov-health-ts"></span></h2>
+    <div class="row" id="ov-health"><span class="muted">Загрузка…</span></div>
+    <div class="row" id="ov-indicators" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <h2>Алерты профилей <span class="sub">baseline по доменам</span></h2>
+    <div id="ov-profiles"><span class="muted">Загрузка…</span></div>
+  </div>
+</section>
+
+<!-- ============================ ПРОГОН ============================ -->
+<section id="s-run" class="screen">
+  <div class="card">
+    <h2>Очередь компаний <span class="sub" id="run-id-label"></span></h2>
+    <div class="row" style="margin-bottom:10px">
+      <select id="run-picker" onchange="loadRunCompanies()"></select>
+      <label class="muted"><input type="checkbox" id="run-auto" checked> автообновление</label>
+      <span class="spacer"></span>
+      <input type="search" id="run-filter" placeholder="Фильтр по названию" oninput="renderRunCompanies()">
+    </div>
+    <div class="scroll"><table id="run-table">
+      <thead><tr><th>Компания</th><th>Тип</th><th>Статус</th><th>Время</th>
+        <th>Товары</th><th>Страницы</th><th>Ошибки</th><th></th></tr></thead>
+      <tbody></tbody></table></div>
+  </div>
+
+  <div class="card">
+    <h2>Запустить компанию по id <span class="sub">срочная задача в очередь urgent_tasks</span></h2>
+    <div class="row">
+      <input list="company-ids" id="crawl-id" placeholder="ID производителя" style="min-width:230px">
+      <datalist id="company-ids"></datalist>
+      <button class="act" onclick="doCrawl()">Краулить сейчас</button>
+      <span class="muted">Компания вклинивается в идущий прогон между компаниями.</span>
+    </div>
+    <div id="crawl-msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Ошибки по блокам пайплайна</h2>
+    <div class="scroll"><table id="err-table">
+      <thead><tr><th>Блок</th><th>Ошибок</th><th>В ретраях, с</th><th>Примеры</th></tr></thead>
+      <tbody></tbody></table></div>
+  </div>
+
+  <div class="card">
+    <h2>Хвост лога</h2>
+    <div class="row" style="margin-bottom:8px">
+      <select id="log-source" onchange="loadLogTail()">
+        <option value="monitoring">monitoring.log (пайплайн)</option>
+        <option value="stdout">stdout процесса (трейсбеки)</option>
+      </select>
+      <button class="ghost" onclick="loadLogTail()">Обновить</button>
+      <label class="muted"><input type="checkbox" id="log-auto"> автообновление</label>
+      <span class="muted mono" id="log-path"></span>
+    </div>
+    <pre id="log-pre">—</pre>
+  </div>
+</section>
+
+<!-- ============================ КОМПАНИЯ ============================ -->
+<section id="s-company" class="screen">
+  <div class="card">
+    <h2>Карточка компании</h2>
+    <div class="row">
+      <input list="company-ids" id="card-id" placeholder="ID производителя" style="min-width:230px">
+      <button class="act" onclick="loadCard()">Показать</button>
+    </div>
+    <div id="card-msg"></div>
+  </div>
+  <div id="card-body"></div>
+</section>
+
+<!-- ============================ НАСТРОЙКИ ============================ -->
+<section id="s-settings" class="screen">
+  <div class="card">
+    <h2>Настройки пайплайна <span class="sub">env-белый список</span></h2>
+    <div class="msg info">Изменения сохраняются в файл переопределений и применяются
+      <b>при следующем старте</b> пайплайна. К бегущему прогону они не применяются никогда.
+      Секреты не отображаются — только «задано / не задано».</div>
+    <div id="set-form"><span class="muted">Загрузка…</span></div>
+    <div class="row" style="margin-top:14px">
+      <button class="act" onclick="saveSettings()">Сохранить</button>
+      <button class="ghost" onclick="loadSettings()">Отменить изменения</button>
+      <span class="muted mono" id="set-path"></span>
+    </div>
+    <div id="set-msg"></div>
+  </div>
+</section>
+
+<!-- ============================ ЖУРНАЛ ============================ -->
+<section id="s-log" class="screen">
+  <div class="card">
+    <h2>История прогонов</h2>
+    <div class="scroll"><table id="runs-table">
+      <thead><tr><th>Прогон</th><th>Состояние</th><th>Начат</th><th>Завершён</th>
+        <th>Компании</th><th>Товары</th><th>Медиана, с</th><th>Стоимость, ₽</th><th></th></tr></thead>
+      <tbody></tbody></table></div>
+  </div>
+  <div class="card">
+    <h2>Журнал операций <span class="sub">append-only, из UI не очищается</span></h2>
+    <div class="scroll"><table id="journal-table">
+      <thead><tr><th>Время</th><th>Действие</th><th>Источник</th><th>Компания</th>
+        <th>Итог</th><th>Детали</th></tr></thead>
+      <tbody></tbody></table></div>
+  </div>
+</section>
+
+</main>
+</div>
+
+<!-- ============================ ДИАЛОГИ ============================ -->
+<dialog id="dlg-start">
+  <div class="dlg-head">Запуск прогона</div>
+  <div class="dlg-body">
+    <div class="row" style="margin-bottom:12px">
+      <label><input type="radio" name="st-mode" value="full" checked> Полный прогон</label>
+      <label><input type="radio" name="st-mode" value="urgent-only"> Только срочные задачи</label>
+    </div>
+    <label style="display:block;margin-bottom:12px">
+      <input type="checkbox" id="st-resume" checked>
+      Продолжить с чекпоинта (иначе прогон начнётся с начала списка)
+    </label>
+    <div id="st-subset">
+      <div class="row" style="margin-bottom:8px">
+        <b style="font-size:13.5px">Подмножество компаний</b>
+        <span class="muted" id="st-count"></span>
+        <span class="spacer"></span>
+        <button class="ghost" onclick="setAllCompanies(true)">Все</button>
+        <button class="ghost" onclick="setAllCompanies(false)">Снять</button>
+      </div>
+      <input type="search" id="st-filter" placeholder="Поиск по названию или сайту"
+             oninput="renderChooser()" style="width:100%;margin-bottom:8px">
+      <div class="chk-list" id="st-list"><span class="muted">Загрузка ситлиста…</span></div>
+      <p class="muted" style="font-size:12.5px;margin:8px 0 0">
+        Ничего не отмечено — обрабатываются все компании ситлиста.</p>
+    </div>
+  </div>
+  <div class="dlg-foot">
+    <button class="ghost" onclick="document.getElementById('dlg-start').close()">Отмена</button>
+    <button class="act" onclick="doStart()">Запустить</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-purge">
+  <div class="dlg-head">Очистка данных компании</div>
+  <div class="dlg-body" id="purge-body"></div>
+  <div class="dlg-foot">
+    <button class="ghost" onclick="document.getElementById('dlg-purge').close()">Отмена</button>
+    <button class="danger" id="purge-go" onclick="doPurge()" disabled>Удалить</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-profile-del">
+  <div class="dlg-head">Удаление профиля сайта</div>
+  <div class="dlg-body" id="pf-del-body"></div>
+  <div class="dlg-foot">
+    <button class="ghost" onclick="document.getElementById('dlg-profile-del').close()">Отмена</button>
+    <button class="danger" id="pf-del-go" onclick="doProfileDelete()" disabled>Удалить</button>
+  </div>
+</dialog>
+
+<script>
+'use strict';
+const API = '/api/v1';
+let TOKEN = localStorage.getItem('dispatcher_token') || '';
+let SITE_LIST = [];        // ситлист для чекбоксов и datalist
+let RUN_ROWS = [];         // строки текущего прогона (для фильтра без перезапроса)
+let PURGE_CTX = null;      // контекст открытого диалога очистки
+let PROFILE_CTX = null;    // открытый редактор профиля сайта: {domain, version, exists}
+let TIMER = null;
+
+// ------------------------------ инфраструктура ------------------------------
+
+async function api(path, opts) {
+  const options = Object.assign({headers: {}}, opts || {});
+  options.headers['Authorization'] = 'Bearer ' + TOKEN;
+  if (options.body) options.headers['Content-Type'] = 'application/json';
+  const resp = await fetch(API + path, options);
+  const text = await resp.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) { data = {detail: text}; }
+  if (resp.status === 401) { logout('Токен отклонён.'); throw new Error('401'); }
+  if (!resp.ok) {
+    // detail может быть объектом {detail, errors} (валидация профиля) — текст и данные врозь
+    const d = data && data.detail;
+    const err = new Error((d && typeof d === 'object' ? d.detail : d) || ('HTTP ' + resp.status));
+    err.status = resp.status; err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+function el(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function msg(id, text, kind) {
+  el(id).innerHTML = text ? `<div class="msg ${kind || 'info'}">${esc(text)}</div>` : '';
+}
+function fmtSec(s) {
+  if (s === null || s === undefined) return '—';
+  if (s < 60) return Math.round(s) + ' с';
+  if (s < 3600) return Math.round(s / 60) + ' мин';
+  return (s / 3600).toFixed(1) + ' ч';
+}
+function fmtTs(ts) { return ts ? String(ts).replace('T', ' ').slice(0, 19) : '—'; }
+function fmtBytes(b) {
+  if (!b) return '0';
+  const u = ['Б', 'КБ', 'МБ', 'ГБ']; let i = 0; let v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i ? 1 : 0) + ' ' + u[i];
+}
+function num(v) { return (v === null || v === undefined) ? '—' : v; }
+
+// ------------------------------ вход ------------------------------
+
+async function login() {
+  TOKEN = el('token-input').value.trim();
+  if (!TOKEN) { msg('login-msg', 'Введите токен.', 'err'); return; }
+  try {
+    await api('/status');
+    localStorage.setItem('dispatcher_token', TOKEN);
+    el('login').hidden = true;
+    el('app').hidden = false;
+    boot();
+  } catch (e) {
+    msg('login-msg', 'Не удалось войти: ' + e.message, 'err');
+  }
+}
+function logout(reason) {
+  localStorage.removeItem('dispatcher_token');
+  TOKEN = '';
+  if (TIMER) clearInterval(TIMER);
+  el('app').hidden = true;
+  el('login').hidden = false;
+  msg('login-msg', reason || '', reason ? 'err' : 'info');
+}
+el('token-input').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+
+// ------------------------------ навигация ------------------------------
+
+document.querySelectorAll('nav button').forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.screen').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    el('s-' + b.dataset.screen).classList.add('active');
+    refreshScreen(b.dataset.screen);
+  };
+});
+function activeScreen() {
+  const b = document.querySelector('nav button.active');
+  return b ? b.dataset.screen : 'overview';
+}
+function refreshScreen(name) {
+  if (name === 'overview') { loadStatus(); loadSummary(); loadHealth(); loadCheckpoint(); }
+  if (name === 'run') { loadRuns(true); loadErrors(); loadLogTail(); }
+  if (name === 'settings') loadSettings();
+  if (name === 'log') { loadRunsTable(); loadJournal(); }
+}
+
+// ------------------------------ Обзор ------------------------------
+
+async function loadStatus() {
+  let s;
+  try { s = await api('/status'); } catch (e) { msg('ov-msg', e.message, 'err'); return; }
+  const kind = {running: 'ok', stopped: 'steel', stalled: 'danger'}[s.state] || 'steel';
+  const label = {running: 'работает', stopped: 'остановлен', stalled: 'завис'}[s.state] || s.state;
+  el('hdr-state').className = 'pill ' + kind;
+  el('hdr-state').textContent = label;
+  el('ov-updated').textContent = 'обновлено ' + fmtTs(s.checked_at);
+
+  const p = s.progress;
+  const cur = s.current_company;
+  const parts = [
+    `<span class="pill ${kind}">${esc(label)}</span>`,
+    s.process.pid ? `<span class="muted mono">PID ${s.process.pid}${s.process.managed ? '' : ' (вне панели)'}</span>` : '',
+    s.process.exit_code !== undefined && s.process.exit_code !== null
+      ? `<span class="pill ${s.process.exit_code === 0 ? 'ok' : 'danger'}">код выхода ${s.process.exit_code}</span>` : '',
+    p ? `<span>компания <b>${p.done}</b> из <b>${p.total}</b>${p.percent !== null ? ' (' + p.percent + '%)' : ''}</span>` : '',
+    cur ? `<span>сейчас: <b>${esc(cur.name)}</b> <span class="muted mono">${esc(cur.company_id)}</span></span>` : '',
+    s.kind === 'urgent' ? '<span class="pill warn">срочная</span>' : '',
+    s.heartbeat_age_seconds !== null && s.heartbeat_age_seconds !== undefined
+      ? `<span class="muted">heartbeat ${fmtSec(s.heartbeat_age_seconds)} назад</span>` : '',
+    s.restart && s.restart.pending ? '<span class="pill warn">перезапуск запланирован</span>' : '',
+    s.restart && s.restart.error ? `<span class="pill danger">ошибка перезапуска: ${esc(s.restart.error)}</span>` : '',
+  ].filter(Boolean);
+  el('ov-status').innerHTML = parts.join(' ');
+
+  const running = s.state !== 'stopped';
+  el('btn-start').disabled = running;
+  el('btn-stop').disabled = !running;
+  el('btn-kill').disabled = !running;
+
+  if (s.watchdog && s.watchdog.last_event) {
+    const w = s.watchdog.last_event;
+    msg('ov-msg', `Сторож зафиксировал зависание прогона ${w.run_id} (компания «${w.company}»). `
+      + `Алерт: ${w.alert_sent ? 'отправлен' : w.alert_detail}. `
+      + `Авторестарт: ${w.autorestarted ? 'выполнен' : 'выключен'}.`, 'err');
+  }
+}
+
+async function loadCheckpoint() {
+  try {
+    const c = await api('/checkpoint');
+    el('ov-checkpoint').textContent = c.exists
+      ? `Чекпоинт: «${c.company || '—'}», этап ${c.stage || '—'} (${fmtTs(c.timestamp)})`
+      : 'Чекпоинта нет — рестарт начнётся с начала списка.';
+  } catch (e) { el('ov-checkpoint').textContent = ''; }
+}
+
+async function loadSummary() {
+  let m;
+  try { m = await api('/metrics/summary'); } catch (e) {
+    el('ov-tiles').innerHTML = `<span class="muted">${esc(e.message)}</span>`; return;
+  }
+  if (!m.available) {
+    el('ov-run-id').textContent = '';
+    el('ov-tiles').innerHTML = `<span class="muted">${esc(m.detail)}</span>`;
+    el('ov-modules').querySelector('tbody').innerHTML = '';
+    el('ov-profiles').innerHTML = '<span class="muted">нет данных</span>';
+    return;
+  }
+  el('ov-run-id').textContent = `${m.run_id} · ${m.state}`;
+  const c = m.companies || {}, z = m.zero_companies || {}, e24 = m.errors_last_24h || {};
+  const tiles = [
+    ['Обработано компаний', `${num(c.done)}${c.total ? ' / ' + c.total : ''}`,
+      `успешно ${num(c.success)}, с ошибками ${num(c.failed)}`],
+    ['Нулевых компаний', z.percent === null || z.percent === undefined ? '—' : z.percent + '%',
+      `${num(z.count)} шт. — завершились без товаров`],
+    ['Медианное время сайта', fmtSec(m.median_company_seconds), 'по завершённым компаниям'],
+    ['Ошибки за сутки', num(e24.errors), `компаний с ошибками: ${num(e24.companies_failed)}`],
+    ['Товаров', num(m.products_total), `страниц: ${num((m.pages || {}).total)}`],
+    ['Страница «скачано → данные»', fmtSec((m.page_pipeline_seconds_estimate || {}).sum),
+      'сумма медиан краул + текст + ИИ'],
+    ['ИИ-модуль', m.ai_module ? fmtSec(m.ai_module.median_call_seconds) : '—',
+      m.ai_module ? `вызовов ${m.ai_module.calls}, всего ${fmtSec(m.ai_module.total_seconds)}` : 'нет данных'],
+  ];
+  el('ov-tiles').innerHTML = tiles.map(t =>
+    `<div class="tile"><div class="k">${esc(t[0])}</div><div class="v">${esc(t[1])}</div>
+     <div class="n">${esc(t[2])}</div></div>`).join('');
+
+  const tb = el('ov-modules').querySelector('tbody');
+  tb.innerHTML = (m.modules || []).length
+    ? '<tr><th>Модуль</th><th>Медиана, с</th><th>Вызовов</th><th>Всего, с</th><th>В ретраях, с</th></tr>'
+      + m.modules.map(x => `<tr><td>${esc(x.label)}</td><td>${num(x.median)}</td>
+         <td>${num(x.count)}</td><td>${num(x.total)}</td><td>${num(x.retry)}</td></tr>`).join('')
+    : '<tr><td class="muted">нет данных о таймингах</td></tr>';
+
+  const pa = m.profile_alerts || {};
+  el('ov-profiles').innerHTML = !pa.available
+    ? `<span class="muted">${esc(pa.detail || 'нет данных')}</span>`
+    : (pa.alerts && pa.alerts.length
+        ? pa.alerts.map(a => `<div><span class="pill warn">${esc(a.domain)}</span>
+            <span class="muted">${esc(JSON.stringify(a.alerts).slice(0, 200))}</span></div>`).join('')
+        : '<span class="muted">алертов нет</span>');
+}
+
+async function loadHealth() {
+  let h;
+  try { h = await api('/health'); } catch (e) {
+    el('ov-health').innerHTML = `<span class="muted">${esc(e.message)}</span>`; return;
+  }
+  el('ov-health-ts').textContent = 'проверено ' + fmtTs(h.checked_at);
+  const labels = {graph_db: 'Graph DB', bot: 'Бот Пачки', kafka: 'Kafka', llm: 'LLM-шлюз'};
+  el('ov-health').innerHTML = Object.keys(labels).map(k => {
+    const s = h.services[k] || {};
+    const cls = s.ok === true ? 'ok' : s.ok === false ? 'danger' : 'steel';
+    return `<span class="pill ${cls}" title="${esc(s.target || '')} — ${esc(s.detail || '')}">
+      ${esc(labels[k])}: ${s.ok === true ? 'жив' : s.ok === false ? 'недоступен' : 'не настроен'}</span>`;
+  }).join(' ');
+  const i = h.indicators || {};
+  el('ov-indicators').innerHTML = [
+    ['Очередь выгрузки в граф', i.graph_db_pending],
+    ['Дампы ошибок LLM', i.sgr_error_dumps],
+    ['Недоступные сайты', i.unavailable_sites],
+  ].map(x => `<span class="pill ${x[1] ? 'warn' : 'steel'}">${esc(x[0])}: ${num(x[1])}</span>`).join(' ');
+}
+
+// ------------------------------ управление ------------------------------
+
+async function openStart() {
+  el('dlg-start').showModal();
+  if (!SITE_LIST.length) await loadSiteList();
+  renderChooser();
+}
+
+async function loadSiteList() {
+  try {
+    const r = await api('/companies');
+    SITE_LIST = r.companies || [];
+    const dl = el('company-ids');
+    dl.innerHTML = SITE_LIST.map(c =>
+      `<option value="${esc(c.company_id)}">${esc(c.name)}</option>`).join('');
+  } catch (e) {
+    el('st-list').innerHTML = `<span class="muted">Ситлист недоступен: ${esc(e.message)}</span>`;
+  }
+}
+
+function renderChooser() {
+  if (!SITE_LIST.length) return;
+  const q = el('st-filter').value.trim().toLowerCase();
+  const checked = new Set(selectedCompanyIds());
+  const rows = SITE_LIST.filter(c => !q
+    || c.name.toLowerCase().includes(q) || c.website.toLowerCase().includes(q));
+  el('st-list').innerHTML = rows.map(c =>
+    `<label><input type="checkbox" value="${esc(c.company_id)}" ${checked.has(c.company_id) ? 'checked' : ''}
+      onchange="updateChooserCount()"> ${esc(c.name || c.company_id)}
+      <span class="muted mono">${esc(c.website)}</span></label>`).join('')
+    || '<span class="muted">ничего не найдено</span>';
+  updateChooserCount();
+}
+function selectedCompanyIds() {
+  return Array.from(el('st-list').querySelectorAll('input:checked')).map(i => i.value);
+}
+function setAllCompanies(on) {
+  el('st-list').querySelectorAll('input[type=checkbox]').forEach(i => { i.checked = on; });
+  updateChooserCount();
+}
+function updateChooserCount() {
+  const n = selectedCompanyIds().length;
+  el('st-count').textContent = n ? `отмечено ${n}` : 'отмечены все';
+}
+
+async function doStart() {
+  const mode = document.querySelector('input[name=st-mode]:checked').value;
+  const ids = selectedCompanyIds();
+  const body = {mode: mode, resume: el('st-resume').checked,
+                company_ids: ids.length ? ids : null};
+  try {
+    const r = await api('/pipeline/start', {method: 'POST', body: JSON.stringify(body)});
+    el('dlg-start').close();
+    msg('ov-msg', `Пайплайн запущен (PID ${r.pid}, режим ${r.mode}).`, 'ok');
+  } catch (e) { msg('ov-msg', 'Старт не выполнен: ' + e.message, 'err'); }
+  loadStatus();
+}
+
+async function doStop(force) {
+  if (force && !confirm('Жёсткая остановка снимет дерево процессов немедленно.\n'
+      + 'Незавершённая компания будет переобработана целиком. Продолжить?')) return;
+  try {
+    const r = await api('/pipeline/stop', {method: 'POST', body: JSON.stringify({force: !!force})});
+    msg('ov-msg', r.detail, force ? 'err' : 'ok');
+  } catch (e) { msg('ov-msg', 'Остановка не выполнена: ' + e.message, 'err'); }
+  loadStatus();
+}
+
+async function doRestart() {
+  try {
+    const r = await api('/pipeline/restart', {method: 'POST', body: JSON.stringify({mode: 'full'})});
+    msg('ov-msg', r.detail || 'Пайплайн перезапущен.', 'ok');
+  } catch (e) { msg('ov-msg', 'Перезапуск не выполнен: ' + e.message, 'err'); }
+  loadStatus();
+}
+
+// ------------------------------ Прогон ------------------------------
+
+async function loadRuns(selectLatest) {
+  try {
+    const r = await api('/runs?limit=100');
+    const picker = el('run-picker');
+    const current = picker.value;
+    picker.innerHTML = (r.runs || []).map(x =>
+      `<option value="${esc(x.run_id)}">${esc(x.run_id)} — ${esc(x.state)}</option>`).join('');
+    if (selectLatest || !current) picker.selectedIndex = 0;
+    else picker.value = current;
+    loadRunCompanies();
+  } catch (e) { /* fail-open */ }
+}
+
+async function loadRunCompanies() {
+  const runId = el('run-picker').value;
+  el('run-id-label').textContent = runId || '';
+  try {
+    const r = await api('/metrics/companies' + (runId ? '?run_id=' + encodeURIComponent(runId) : ''));
+    RUN_ROWS = r.companies || [];
+    renderRunCompanies();
+  } catch (e) { RUN_ROWS = []; renderRunCompanies(); }
+}
+
+function renderRunCompanies() {
+  const q = el('run-filter').value.trim().toLowerCase();
+  const rows = RUN_ROWS.filter(c => !q || (c.name || '').toLowerCase().includes(q));
+  const tb = el('run-table').querySelector('tbody');
+  if (!rows.length) { tb.innerHTML = '<tr><td colspan="8" class="muted">нет записей</td></tr>'; return; }
+  tb.innerHTML = rows.map(c => {
+    const st = c.status === 'success'
+      ? (c.zero ? '<span class="pill warn">ноль товаров</span>' : '<span class="pill ok">готово</span>')
+      : `<span class="pill danger">${esc(c.status)}</span>`;
+    const pages = (c.pages.product || 0) + (c.pages.company || 0) + (c.pages.distributor || 0);
+    return `<tr>
+      <td><b>${esc(c.name)}</b><br><span class="muted mono">${esc(c.company_id)}</span></td>
+      <td>${c.kind === 'urgent' ? '<span class="pill warn">срочная</span>' : 'обычная'}</td>
+      <td>${st}</td><td>${fmtSec(c.duration_seconds)}</td>
+      <td>${c.products}</td><td>${pages}</td>
+      <td>${c.errors.length ? `<span class="pill danger" title="${esc(c.errors.join(' | '))}">${c.errors.length}</span>` : '—'}</td>
+      <td><button class="ghost" onclick="openCard('${esc(c.company_id)}')">Карточка</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadErrors() {
+  const runId = el('run-picker').value;
+  try {
+    const r = await api('/errors' + (runId ? '?run_id=' + encodeURIComponent(runId) : ''));
+    const rows = Object.keys(r.modules || {}).map(k => Object.assign({key: k}, r.modules[k]))
+      .filter(m => m.errors || m.retry_seconds);
+    const tb = el('err-table').querySelector('tbody');
+    tb.innerHTML = rows.length ? rows.map(m => `<tr>
+        <td>${esc(m.label)}</td>
+        <td>${m.errors ? `<span class="pill danger">${m.errors}</span>` : '—'}</td>
+        <td>${m.retry_seconds || '—'}</td>
+        <td class="muted">${esc((m.samples || []).join(' • ')) || '—'}</td></tr>`).join('')
+      : '<tr><td colspan="4" class="muted">ошибок нет</td></tr>';
+  } catch (e) { /* fail-open */ }
+}
+
+async function loadLogTail() {
+  try {
+    const r = await api(`/logs/tail?lines=300&source=${encodeURIComponent(el('log-source').value)}`);
+    el('log-path').textContent = r.path || '';
+    el('log-pre').textContent = (r.lines || []).join('\n') || (r.detail || '—');
+    el('log-pre').scrollTop = el('log-pre').scrollHeight;
+  } catch (e) { el('log-pre').textContent = e.message; }
+}
+
+async function doCrawl() {
+  const id = el('crawl-id').value.trim();
+  if (!id) { msg('crawl-msg', 'Укажите id компании.', 'err'); return; }
+  try {
+    const r = await api(`/companies/${encodeURIComponent(id)}/crawl`, {method: 'POST'});
+    msg('crawl-msg', `Задача поставлена в очередь: ${r.task_id}`, 'ok');
+  } catch (e) { msg('crawl-msg', e.message, 'err'); }
+}
+
+// ------------------------------ Компания ------------------------------
+
+function openCard(id) {
+  document.querySelector('nav button[data-screen=company]').click();
+  el('card-id').value = id;
+  loadCard();
+}
+
+async function loadCard() {
+  const id = el('card-id').value.trim();
+  if (!id) { msg('card-msg', 'Укажите id компании.', 'err'); return; }
+  msg('card-msg', '');
+  el('card-body').innerHTML = '<div class="card"><span class="muted">Загрузка…</span></div>';
+  let c;
+  try { c = await api('/companies/' + encodeURIComponent(id)); }
+  catch (e) { el('card-body').innerHTML = ''; msg('card-msg', e.message, 'err'); return; }
+
+  const lr = c.last_result, pr = c.profile || {};
+  const lrHtml = lr ? `
+    <div class="grid even">
+      <div class="tile"><div class="k">Статус</div><div class="v text">${esc(lr.status)}</div>
+        <div class="n">${fmtTs(lr.ts)} · ${esc(lr.run_id)}</div></div>
+      <div class="tile"><div class="k">Товары</div><div class="v">${lr.products}</div>
+        <div class="n">карточек: ${lr.cards_generated}</div></div>
+      <div class="tile"><div class="k">Страницы</div>
+        <div class="v">${lr.pages.product + lr.pages.company + lr.pages.distributor}</div>
+        <div class="n">товар ${lr.pages.product} · компания ${lr.pages.company} · поставщики ${lr.pages.distributor}</div></div>
+      <div class="tile"><div class="k">Поставщики</div><div class="v">${lr.distributors}</div>
+        <div class="n">файлов скачано в прогоне: ${lr.files_downloaded}</div></div>
+      <div class="tile"><div class="k">Время</div><div class="v">${fmtSec(lr.duration_seconds)}</div>
+        <div class="n">выгрузка в граф: ${lr.graph_db_uploaded ? 'да' : 'нет'}</div></div>
+    </div>
+    ${Object.keys(lr.modules || {}).length ? `<div class="scroll" style="margin-top:12px"><table>
+      <thead><tr><th>Модуль</th><th>Вызовов</th><th>Медиана, с</th><th>Всего, с</th><th>Ретраи, с</th></tr></thead>
+      <tbody>${Object.keys(lr.modules).map(k => `<tr><td>${esc(k)}</td>
+        <td>${num(lr.modules[k].count)}</td><td>${num(lr.modules[k].median)}</td>
+        <td>${num(lr.modules[k].total)}</td><td>${num(lr.modules[k].retry)}</td></tr>`).join('')}
+      </tbody></table></div>` : ''}
+    ${lr.errors.length ? `<div class="msg err">Ошибки: ${esc(lr.errors.join(' • '))}</div>` : ''}`
+    : '<span class="muted">Компания ещё не обрабатывалась ни в одном прогоне.</span>';
+
+  // Документы — четыре группы по папкам компании на диске (Documents, Certificates,
+  // Instructions, Price_lists): именно их пайплайн выгружает в граф как файлы компании.
+  const docs = c.documents || {};
+  const docsHtml = docs.available
+    ? `<div class="grid">${(docs.groups || []).map(g =>
+        `<div class="tile"><div class="k">${esc(g.label)}</div><div class="v">${g.files}</div>
+         <div class="n mono">${esc(g.folder)}/</div></div>`).join('')}</div>
+       <div class="muted" style="margin-top:8px">всего файлов: ${docs.total} ·
+         <span class="mono">${esc(docs.path || '')}</span></div>`
+    : `<span class="muted">Каталог компании на диске отсутствует${docs.path ? ': ' : ''}
+       <span class="mono">${esc(docs.path || '')}</span></span>`;
+
+  el('card-body').innerHTML = `
+    <div class="card">
+      <h2>${esc(c.name || c.company_id)}
+        <span class="sub mono">${esc(c.company_id)}</span>
+        ${c.busy ? '<span class="pill warn">обрабатывается сейчас</span>' : ''}
+        ${c.in_site_list ? '' : '<span class="pill warn">нет в ситлисте</span>'}</h2>
+      <div class="row">
+        <a href="${esc(c.website || '#')}" target="_blank" rel="noopener">${esc(c.website || '—')}</a>
+        <span class="pill ${pr.exists ? 'ok' : 'steel'}">
+          профиль сайта: ${pr.available ? (pr.exists ? 'есть' : 'нет') : 'каталог профилей отсутствует'}</span>
+        ${pr.draft_exists ? '<span class="pill warn">есть черновик переписи</span>' : ''}
+        <span class="muted mono">каталог: ${esc(c.safe_name || '')}</span>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="act" onclick="crawlFromCard('${esc(c.company_id)}')">Краулить сейчас</button>
+        <button class="ghost" onclick="toggleProfileEditor('${esc(pr.domain || '')}')"
+          ${pr.domain ? '' : 'disabled'}>Профиль сайта</button>
+        <button class="danger" onclick="openPurge('${esc(c.company_id)}')"
+          ${c.busy ? 'disabled' : ''}>Очистить данные…</button>
+      </div>
+      <div id="card-action-msg"></div>
+    </div>
+    <div id="profile-editor"></div>
+    <div class="card"><h2>Последний результат</h2>${lrHtml}</div>
+    <div class="card"><h2>Документы <span class="sub">файлы компании на диске по группам</span></h2>${docsHtml}</div>
+    <div class="card"><h2>Сводка графа <span class="sub">через backend /api/companies/get</span></h2>
+      <div id="card-graph"><span class="muted">Запрашиваю у backend…</span></div></div>
+    <div class="card"><h2>История обработок</h2>
+      <div class="scroll"><table><thead><tr><th>Когда</th><th>Прогон</th><th>Тип</th>
+        <th>Статус</th><th>Время</th><th>Товары</th><th>Ошибки</th></tr></thead>
+        <tbody>${(c.history || []).map(h => `<tr><td>${fmtTs(h.ts)}</td>
+          <td class="mono">${esc(h.run_id)}</td><td>${esc(h.kind)}</td><td>${esc(h.status)}</td>
+          <td>${fmtSec(h.duration_seconds)}</td><td>${h.products}</td><td>${h.errors}</td></tr>`).join('')
+          || '<tr><td colspan="7" class="muted">нет записей</td></tr>'}</tbody></table></div>
+    </div>`;
+
+  loadCardGraph(c.company_id);
+}
+
+// Сводка графа идёт отдельным запросом: backend отвечает ~15 с, и ждать его
+// всей карточкой нельзя. Недоступность backend не ломает экран (§2).
+async function loadCardGraph(id) {
+  let g;
+  try { g = await api(`/companies/${encodeURIComponent(id)}/graph`); }
+  catch (e) { g = {available: false, detail: e.message}; }
+  const box = el('card-graph');
+  if (!box) return;
+  box.innerHTML = !g.available
+    ? `<span class="muted">Graph DB недоступна: ${esc(g.detail || '')}</span>`
+    : !g.found
+      ? '<span class="muted">В графе данных по этой компании нет.</span>'
+      : `<div class="grid">
+          <div class="tile"><div class="k">Товаров в графе</div><div class="v">${g.products}</div></div>
+          <div class="tile"><div class="k">Поставщиков</div><div class="v">${g.distributors}</div></div>
+          <div class="tile"><div class="k">Файлов</div><div class="v">${g.files}</div></div>
+          <div class="tile"><div class="k">Последняя загрузка</div>
+            <div class="v" style="font-size:15px">${esc(g.last_upload || '—')}</div></div>
+        </div>`;
+}
+
+async function crawlFromCard(id) {
+  try {
+    const r = await api(`/companies/${encodeURIComponent(id)}/crawl`, {method: 'POST'});
+    msg('card-action-msg', `Задача поставлена в очередь: ${r.task_id}`, 'ok');
+  } catch (e) { msg('card-action-msg', e.message, 'err'); }
+}
+
+// ------------------------------ очистка ------------------------------
+
+async function openPurge(id) {
+  PURGE_CTX = {company_id: id, sources: ['temp', 'documents']};
+  el('purge-go').disabled = true;
+  el('purge-body').innerHTML = '<span class="muted">Считаю, что будет удалено…</span>';
+  el('dlg-purge').showModal();
+  await renderPurge();
+}
+
+// Dry-run идёт в два захода: файловые источники считаются мгновенно, а счётчик
+// объектов графа требует запроса к backend (~15 с). Считать их вместе означало бы
+// держать оператора перед пустым диалогом всё это время.
+async function renderPurge() {
+  let d;
+  try {
+    d = await api(`/companies/${encodeURIComponent(PURGE_CTX.company_id)}/purge/dry-run`,
+      {method: 'POST', body: JSON.stringify({sources: ['temp', 'documents']})});
+  } catch (e) {
+    el('purge-body').innerHTML = `<div class="msg err">${esc(e.message)}</div>`; return;
+  }
+  d.sources.graph = {available: null, pending: true, supported: false};
+  PURGE_CTX.dry = d;
+  const s = d.sources;
+  const row = (key, title, risk, body, disabled) => `
+    <label style="display:block;padding:8px 0;border-bottom:1px solid var(--line)">
+      <input type="checkbox" class="purge-src" value="${key}"
+        ${PURGE_CTX.sources.includes(key) ? 'checked' : ''} ${disabled ? 'disabled' : ''}
+        onchange="onPurgeSourceChange()">
+      <b>${title}</b> <span class="pill ${risk[1]}">${risk[0]}</span><br>
+      <span class="muted" style="margin-left:22px">${body}</span>
+    </label>`;
+
+  el('purge-body').innerHTML = `
+    <p>Компания <b>${esc(d.name)}</b> <span class="mono muted">${esc(d.company_id)}</span></p>
+    ${d.busy ? '<div class="msg err">Компания обрабатывается пайплайном — очистка будет отклонена.</div>' : ''}
+    ${row('temp', 'Временное хранилище', ['низкий риск', 'ok'],
+      `${s.temp.files} файлов, ${fmtBytes(s.temp.bytes)}<br><span class="mono">${esc(s.temp.path)}</span>`)}
+    ${row('documents', 'Документы', ['средний риск', 'warn'],
+      `${s.documents.files} файлов, ${fmtBytes(s.documents.bytes)}<br><span class="mono">${esc(s.documents.path)}</span>`)}
+    ${row('graph', 'Графовая БД', ['высокий риск', 'danger'],
+      '<span id="purge-graph">Считаю объекты в графе…</span>', true)}
+    <div class="msg info" style="margin-top:14px">${esc(d.protected.detail)}</div>
+    <p style="margin-bottom:6px">Для подтверждения введите id компании
+      <span class="mono">${esc(d.company_id)}</span>:</p>
+    <input id="purge-confirm" style="width:100%" placeholder="id компании" autocomplete="off"
+      oninput="onPurgeConfirm()">`;
+  onPurgeSourceChange();
+  loadPurgeGraph();
+}
+
+async function loadPurgeGraph() {
+  const id = PURGE_CTX.company_id;
+  let g;
+  try {
+    const d = await api(`/companies/${encodeURIComponent(id)}/purge/dry-run`,
+      {method: 'POST', body: JSON.stringify({sources: ['graph']})});
+    g = d.sources.graph;
+  } catch (e) { g = {available: false, supported: false, detail: e.message}; }
+  if (!PURGE_CTX || PURGE_CTX.company_id !== id) return;   // диалог уже закрыт/сменён
+  PURGE_CTX.dry.sources.graph = g;
+  const box = el('purge-graph');
+  if (!box) return;
+  box.innerHTML = !g.available
+    ? `недоступна: ${esc(g.detail || '')}`
+    : g.supported
+      ? `${g.objects} объектов, последняя загрузка ${esc(g.last_upload || '—')}`
+      : `${g.objects} объектов в графе. <b>Удаление недоступно:</b> эндпоинта удаления
+         на backend пока нет (открытый вопрос 11.1 спецификации).`;
+  const chk = document.querySelector('.purge-src[value=graph]');
+  if (chk) chk.disabled = !g.supported;
+}
+
+function onPurgeSourceChange() {
+  PURGE_CTX.sources = Array.from(document.querySelectorAll('.purge-src:checked')).map(i => i.value);
+  onPurgeConfirm();
+}
+function onPurgeConfirm() {
+  const input = el('purge-confirm');
+  el('purge-go').disabled = !(input && input.value.trim() === PURGE_CTX.company_id
+    && PURGE_CTX.sources.length && !(PURGE_CTX.dry && PURGE_CTX.dry.busy));
+}
+
+async function doPurge() {
+  const body = {sources: PURGE_CTX.sources, confirm_company_id: el('purge-confirm').value.trim()};
+  try {
+    const r = await api(`/companies/${encodeURIComponent(PURGE_CTX.company_id)}/purge`,
+      {method: 'POST', body: JSON.stringify(body)});
+    const lines = Object.keys(r.sources).map(k => {
+      const v = r.sources[k];
+      if (k === 'graph') return `граф: ${v.supported ? ('удалено ' + v.deleted) : v.detail}`;
+      return `${k}: удалено ${v.deleted_files} файлов (${fmtBytes(v.deleted_bytes)})`;
+    });
+    el('dlg-purge').close();
+    msg('card-action-msg', 'Очистка выполнена. ' + lines.join('; '), 'ok');
+    loadCard();
+  } catch (e) {
+    el('purge-body').insertAdjacentHTML('afterbegin', `<div class="msg err">${esc(e.message)}</div>`);
+  }
+}
+
+// ------------------------------ профиль сайта ------------------------------
+// Сырой YAML + серверная валидация (site_profiles.profile_from_dict). Экран «Компания»
+// не поллится, поэтому текст в редакторе никто не затирает. После сохранения/удаления
+// карточка перерисовывается (пилюля «профиль сайта»), редактор открывается заново.
+
+const PROFILE_STUB = d => `domain: ${d}\nprofile_version: 1\nsource: manual\nnotes: []\n`;
+
+function toggleProfileEditor(domain) {
+  if (PROFILE_CTX && el('profile-editor').innerHTML) {
+    el('profile-editor').innerHTML = ''; PROFILE_CTX = null; return;
+  }
+  openProfileEditor(domain);
+}
+
+async function openProfileEditor(domain) {
+  el('profile-editor').innerHTML = '<div class="card"><span class="muted">Загрузка профиля…</span></div>';
+  let p;
+  try { p = await api('/profiles/' + encodeURIComponent(domain)); }
+  catch (e) { el('profile-editor').innerHTML = ''; msg('card-action-msg', e.message, 'err'); return; }
+  PROFILE_CTX = {domain: domain, version: p.version, exists: p.exists};
+  renderProfileEditor(p);
+}
+
+function profileErrorsHtml(errors) {
+  return `<div class="msg err">Ошибки профиля:<ul style="margin:6px 0 0 18px">
+    ${errors.map(e => `<li>${esc(e)}</li>`).join('')}</ul></div>`;
+}
+
+function renderProfileEditor(p) {
+  const d = p.draft || {};
+  const state = !p.exists ? ['новый файл', 'steel']
+    : p.valid === null ? ['проверка недоступна', 'warn']
+    : p.valid ? ['валиден', 'ok'] : [`ошибок: ${p.errors.length}`, 'danger'];
+  const draftHtml = !d.exists ? '' : `
+    <div style="border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:12px">
+      <div class="row"><b>Черновик переписи</b> <span class="muted mono">${esc(d.path || '')}</span>
+        ${d.accept_ready ? '<span class="pill ok">готов к приёмке</span>'
+          : '<span class="pill warn">ниже порога приёмки 0.8 или нет карточек товаров — принимать на свой риск</span>'}</div>
+      <div class="muted" style="margin:6px 0">confidence ${esc(d.confidence ?? '—')} ·
+        карточек товаров ${esc(d.product_cards ?? '—')} · profile_version ${esc(d.profile_version ?? '—')} ·
+        изменён ${fmtTs(d.modified_at)}</div>
+      <pre style="max-height:220px">${esc(d.text)}</pre>
+      <div class="row"><button class="act" onclick="acceptDraft()">Принять черновик</button>
+        <span class="muted">census_evidence отбрасывается, source census → mixed, profile_version = текущая + 1;
+          файл черновика остаётся</span></div>
+    </div>`;
+  el('profile-editor').innerHTML = `
+    <div class="card">
+      <h2>Профиль сайта <span class="sub mono">${esc(p.file || p.domain + '.yaml')}</span>
+        <span class="pill ${state[1]}">${esc(state[0])}</span></h2>
+      <div class="msg info">Правка применяется <b>к следующей компании бегущего прогона</b>:
+        пайплайн перечитывает каталог профилей перед каждой компанией. Текущая компания доедет
+        на старом профиле.</div>
+      ${draftHtml}
+      <textarea id="pf-text" class="yaml-edit" spellcheck="false">${esc(p.exists ? p.text : PROFILE_STUB(p.domain))}</textarea>
+      <div id="pf-errors">${p.errors && p.errors.length ? profileErrorsHtml(p.errors) : ''}</div>
+      <div class="row" style="margin-top:12px">
+        <button class="act" onclick="saveProfile()">Сохранить</button>
+        <button class="ghost" onclick="checkProfile()">Проверить</button>
+        <button class="ghost" onclick="resetProfile()">Отменить изменения</button>
+        <span class="spacer"></span>
+        <button class="danger" onclick="openProfileDelete()" ${p.exists ? '' : 'disabled'}>Удалить…</button>
+      </div>
+      <div class="muted mono" style="margin-top:8px">${esc(p.path || '')}${p.exists
+        ? ` · изменён ${fmtTs(p.modified_at)} · ${p.bytes} Б · версия ${esc(p.version)}` : ''}</div>
+      <div id="pf-msg"></div>
+      <details class="hint" style="margin-top:10px"><summary>Схема профиля (profiles/_schema.yaml)</summary>
+        <pre>${esc(p.schema_hint || 'файл _schema.yaml не найден')}</pre></details>
+    </div>`;
+}
+
+function showProfileError(e) {
+  const errs = e.data && e.data.detail && e.data.detail.errors;
+  el('pf-errors').innerHTML = errs && errs.length ? profileErrorsHtml(errs) : '';
+  msg('pf-msg', errs && errs.length ? '' : e.message, 'err');
+}
+
+async function checkProfile() {
+  el('pf-errors').innerHTML = '';
+  try {
+    await api(`/profiles/${encodeURIComponent(PROFILE_CTX.domain)}/validate`,
+      {method: 'POST', body: JSON.stringify({text: el('pf-text').value})});
+    msg('pf-msg', 'Профиль валиден.', 'ok');
+  } catch (e) { showProfileError(e); }
+}
+
+async function saveProfile() {
+  const d = PROFILE_CTX.domain;
+  el('pf-errors').innerHTML = '';
+  try {
+    const r = await api(`/profiles/${encodeURIComponent(d)}`, {method: 'PUT',
+      body: JSON.stringify({text: el('pf-text').value, expected_version: PROFILE_CTX.version})});
+    await loadCard();                 // пилюля «профиль сайта: есть» + чистый редактор
+    await openProfileEditor(d);
+    msg('pf-msg', r.detail, 'ok');
+  } catch (e) {
+    if (e.status === 409) msg('pf-msg', e.message + ' Нажмите «Отменить изменения», чтобы перечитать файл.', 'err');
+    else showProfileError(e);
+  }
+}
+
+function resetProfile() { openProfileEditor(PROFILE_CTX.domain); }
+
+function openProfileDelete() {
+  const d = PROFILE_CTX.domain;
+  el('pf-del-go').disabled = true;
+  el('pf-del-body').innerHTML = `
+    <p>Профиль <span class="mono">${esc(d)}.yaml</span> будет удалён. Сайт станет обрабатываться
+      generic-поведением; изменение применится к следующей компании бегущего прогона.</p>
+    <p style="margin-bottom:6px">Для подтверждения введите домен <span class="mono">${esc(d)}</span>:</p>
+    <input id="pf-del-confirm" style="width:100%" placeholder="домен" autocomplete="off"
+      oninput="onProfileDelConfirm()">`;
+  el('dlg-profile-del').showModal();
+}
+function onProfileDelConfirm() {
+  el('pf-del-go').disabled = el('pf-del-confirm').value.trim().toLowerCase() !== PROFILE_CTX.domain;
+}
+async function doProfileDelete() {
+  try {
+    await api(`/profiles/${encodeURIComponent(PROFILE_CTX.domain)}`, {method: 'DELETE',
+      body: JSON.stringify({confirm_domain: el('pf-del-confirm').value.trim()})});
+    el('dlg-profile-del').close();
+    PROFILE_CTX = null;
+    await loadCard();
+    msg('card-action-msg', 'Профиль удалён. Применится к следующей компании бегущего прогона.', 'ok');
+  } catch (e) {
+    el('pf-del-body').insertAdjacentHTML('afterbegin', `<div class="msg err">${esc(e.message)}</div>`);
+  }
+}
+
+async function acceptDraft() {
+  const d = PROFILE_CTX.domain;
+  try {
+    const r = await api(`/profiles/${encodeURIComponent(d)}/accept-draft`,
+      {method: 'POST', body: JSON.stringify({expected_version: PROFILE_CTX.version})});
+    await loadCard();
+    await openProfileEditor(d);
+    msg('pf-msg', r.detail, 'ok');
+  } catch (e) { showProfileError(e); }
+}
+
+// ------------------------------ Настройки ------------------------------
+
+async function loadSettings() {
+  let s;
+  try { s = await api('/settings'); } catch (e) {
+    el('set-form').innerHTML = `<span class="muted">${esc(e.message)}</span>`; return;
+  }
+  el('set-path').textContent = `файл переопределений: ${s.overrides_path} (${s.overrides_count})`;
+  const groups = {};
+  s.items.forEach(i => { (groups[i.group] = groups[i.group] || []).push(i); });
+  let html = Object.keys(groups).map(g => `<fieldset><legend>${esc(g)}</legend>` +
+    groups[g].map(i => {
+      const badge = [
+        i.restart_required ? '<span class="pill steel">после перезапуска</span>' : '',
+        i.locked ? '<span class="pill danger">заблокирован</span>' : '',
+        i.source === 'overrides' ? '<span class="pill warn">переопределён</span>' : '',
+      ].filter(Boolean).join(' ');
+      let control;
+      if (i.type === 'secret') {
+        control = `<input type="password" data-name="${esc(i.name)}" data-type="secret"
+          placeholder="${i.is_set ? 'задано — оставьте пустым, чтобы не менять' : 'не задано'}">`;
+      } else if (i.type === 'bool') {
+        control = `<select data-name="${esc(i.name)}" data-type="bool" ${i.locked ? 'disabled' : ''}>
+          <option value="true" ${i.value === 'true' ? 'selected' : ''}>true</option>
+          <option value="false" ${i.value !== 'true' ? 'selected' : ''}>false</option></select>`;
+      } else {
+        control = `<input type="${i.type === 'int' ? 'number' : 'text'}" data-name="${esc(i.name)}"
+          data-type="${i.type}" value="${esc(i.value === null ? '' : i.value)}" ${i.locked ? 'disabled' : ''}>`;
+      }
+      return `<div class="set-row">
+        <div><div class="nm">${esc(i.name)}</div><div class="nt">${esc(i.note)}</div>
+          ${i.config_default !== null && i.config_default !== undefined && i.config_default !== i.value
+            ? `<div class="nt">по умолчанию: <span class="mono">${esc(i.config_default)}</span></div>` : ''}</div>
+        <div>${control}</div><div>${badge}</div></div>`;
+    }).join('') + '</fieldset>').join('');
+
+  if (s.not_in_this_build.length) {
+    html += `<fieldset><legend>Нет в этой версии пайплайна</legend>
+      <p class="muted" style="font-size:13px;margin:0 0 8px">Параметры из §6 спецификации,
+      которые ни один модуль этой сборки не читает. Появятся здесь автоматически, когда
+      соответствующая логика будет реализована в пайплайне.</p>
+      ${s.not_in_this_build.map(i =>
+        `<div class="set-row"><div class="nm">${esc(i.name)}</div>
+         <div class="muted">${esc(i.group)}</div><div><span class="pill steel">отсутствует</span></div></div>`).join('')}
+      </fieldset>`;
+  }
+  el('set-form').innerHTML = html;
+  SETTINGS_SNAPSHOT = snapshotSettings();
+}
+
+let SETTINGS_SNAPSHOT = {};
+function snapshotSettings() {
+  const out = {};
+  el('set-form').querySelectorAll('[data-name]').forEach(i => { out[i.dataset.name] = i.value; });
+  return out;
+}
+
+async function saveSettings() {
+  const now = snapshotSettings();
+  const values = {};
+  Object.keys(now).forEach(k => {
+    if (now[k] !== SETTINGS_SNAPSHOT[k]) values[k] = now[k];
+  });
+  if (!Object.keys(values).length) { msg('set-msg', 'Изменений нет.', 'info'); return; }
+  try {
+    const r = await api('/settings', {method: 'PUT', body: JSON.stringify({values: values})});
+    const diff = Object.keys(r.diff).map(k =>
+      `${k}: ${r.diff[k].before === null ? '—' : r.diff[k].before} → ${r.diff[k].after === null ? '—' : r.diff[k].after}`);
+    msg('set-msg', (diff.length ? 'Сохранено: ' + diff.join('; ') + '. ' : 'Сохранено. ') + r.detail, 'ok');
+    loadSettings();
+  } catch (e) { msg('set-msg', e.message, 'err'); }
+}
+
+// ------------------------------ Журнал ------------------------------
+
+async function loadRunsTable() {
+  try {
+    const r = await api('/runs?limit=200');
+    const tb = el('runs-table').querySelector('tbody');
+    tb.innerHTML = (r.runs || []).map(x => {
+      const c = x.companies || {}, p = x.perf || {}, cost = x.cost || {};
+      const cls = x.state === 'finished' ? 'ok' : x.state === 'aborted' ? 'danger' : 'warn';
+      return `<tr>
+        <td class="mono">${esc(x.run_id)}</td>
+        <td><span class="pill ${cls}">${esc(x.state)}</span></td>
+        <td>${fmtTs(x.started_at)}</td><td>${fmtTs(x.finished_at)}</td>
+        <td>${num(c.done)} / ${num(c.total)}<br><span class="muted">ошибок ${num(c.failed)}</span></td>
+        <td>${num((x.pages || {}).total)}</td>
+        <td>${num(p.median_company_seconds)}</td>
+        <td>${num(cost.total_rub)}</td>
+        <td><button class="ghost" onclick="showRun('${esc(x.run_id)}')">Открыть</button></td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="9" class="muted">прогонов ещё не было</td></tr>';
+  } catch (e) { /* fail-open */ }
+}
+
+function showRun(runId) {
+  document.querySelector('nav button[data-screen=run]').click();
+  el('run-picker').value = runId;
+  loadRunCompanies();
+  loadErrors();
+}
+
+async function loadJournal() {
+  try {
+    const r = await api('/journal?limit=300');
+    const tb = el('journal-table').querySelector('tbody');
+    tb.innerHTML = (r.entries || []).map(e => `<tr>
+      <td>${fmtTs(e.ts)}</td><td class="mono">${esc(e.action)}</td><td>${esc(e.source)}</td>
+      <td class="mono">${esc(e.company_id || '—')}</td>
+      <td><span class="pill ${e.result === 'ok' ? 'ok' : 'danger'}">${esc(e.result)}</span></td>
+      <td class="muted mono" style="max-width:520px;word-break:break-word">${esc(JSON.stringify(e.details))}</td>
+    </tr>`).join('') || '<tr><td colspan="6" class="muted">журнал пуст</td></tr>';
+  } catch (e) { /* fail-open */ }
+}
+
+// ------------------------------ старт ------------------------------
+
+function boot() {
+  loadSiteList();
+  refreshScreen('overview');
+  TIMER = setInterval(() => {
+    const scr = activeScreen();
+    if (scr === 'overview') { loadStatus(); loadSummary(); loadCheckpoint(); }
+    if (scr === 'run') {
+      if (el('run-auto').checked) { loadRunCompanies(); loadErrors(); }
+      if (el('log-auto').checked) loadLogTail();
+      loadStatus();
+    }
+  }, 10000);
+  setInterval(() => { if (activeScreen() === 'overview') loadHealth(); }, 60000);
+}
+
+if (TOKEN) { el('token-input').value = TOKEN; login(); }
+</script>
+</body>
+</html>

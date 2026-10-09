@@ -10,6 +10,8 @@ class Config:
     """Конфигурация системы мониторинга"""
     # Пути
     excel_path: str = '/home/user/stroy-resurs/mvp/Site_list/Site_list.xlsx'
+    # Основной источник компаний. Если не задан, для совместимости используется excel_path.
+    site_list_dsn: str = ""
     base_dir: str = '/home/user/stroy-resurs/mvp/Base'
     reports_dir: str = '/home/user/stroy-resurs/mvp/Reports'
     vector_db_path: str = '/home/user/stroy-resurs/mvp/VectorDB'
@@ -24,11 +26,15 @@ class Config:
     ai_tunnel_url: str = 'https://api.aitunnel.ru/v1'
     ai_tunnel_api_key: str = 'sk-aitunnel-xy8z6s26DjHQh2pggVwernvQH6NMYUmA'
 
-    # Ollama Cloud API — агрегатор LLM для SGR-извлечения товаров/компаний/дистрибьюторов
-    # (ai_integration.AITunnelClient). Используется OpenAI-совместимый эндпоинт Ollama Cloud
-    # (https://ollama.com/v1), ключ берётся из .env (OLLAMA_API_KEY).
-    # ollama_model — id модели, как его отдаёт GET https://ollama.com/v1/models
-    # (без суффикса ':cloud' — он только для CLI-загрузки).
+    # LLM для SGR-извлечения товаров/компаний/дистрибьюторов (ai_integration.AITunnelClient) —
+    # OpenAI-совместимый эндпоинт; имена полей ollama_* исторические (до 2026-09-29 это был Ollama Cloud).
+    # Прод с 2026-09-29 — ЛОКАЛЬНАЯ gemma4-31b (Gemma 4 31B IT FP8, vLLM за LiteLLM; по метаданным LiteLLM
+    # контекст 15 000 ток., 3 одновременные последовательности, запуск по требованию, гаснет после 30 мин
+    # простоя). LiteLLM доступен через SSH-туннель хоста (systemd --user litellm-tunnel.service):
+    # 127.0.0.1:4000 и 172.17.0.1:4000 — шлюз docker0, адрес для контейнеров.
+    # Ключ — GEMMA4_31B_API_KEY из .env (только эта модель, до 14 параллельных запросов, действует до 2026-10-22).
+    # Ollama Cloud (история): эндпоинт https://ollama.com/v1, ключ OLLAMA_API_KEY; id модели — как его
+    # отдаёт GET https://ollama.com/v1/models (без суффикса ':cloud' — он только для CLI-загрузки).
     # Модель выбрана по итогам сравнения 8 кандидатов на реальном markdown (Анализ системы/_model_ab +
     # _prod_validation) по критерию СТРОГОЙ верности тексту (без перевода ключей) + стабильности:
     #   - gemini-3-flash-preview ПЕРЕВОДИТ русские заголовки («Высота»→«High») → отвергнут;
@@ -37,8 +43,8 @@ class Config:
     #     классификация, 0 сбоев парсинга) — ВЫБРАНА (стабильность важнее скорости). Минус — ~10× медленнее.
     # Архитектура/тюнинг пер-модельно (ai_integration): v4-flash → 2-вызовная SGR (single_1call у неё
     # ломается), thinking ВКЛ (prod_2call — её лучший конфиг), _clean_json_response.
-    ollama_url: str = 'https://ollama.com/v1'
-    ollama_api_key: str = field(default_factory=lambda: os.getenv('OLLAMA_API_KEY', ''))
+    ollama_url: str = 'http://172.17.0.1:4000/v1'
+    ollama_api_key: str = field(default_factory=lambda: os.getenv('GEMMA4_31B_API_KEY', ''))
     # 2026-07-27: прод переведён на gemma4:31b (полный офлайн-прогон 1142 стр. 42 комп. + A/B промпта:
     #   полнота ТХ медиана 1.00 vs deepseek, перевод ключей 0, дисциплина полей 0 нарушений;
     #   отчёт: mvp/Анализ системы/_gemma4_test/REPORT.md).
@@ -47,9 +53,11 @@ class Config:
     #   выявлен «убегающий reasoning» (пустой content, ~7% страниц; лечение: max_tokens=16384 +
     #   анти-луп ретраи temp=0.7 — реализовано и сохранено в ai_integration._MODEL_TUNING).
     # 2026-08-19: для прогона-переписи 2082 возвращена gemma4:31b (single-call) — решение оператора.
-    #   Возврат на deepseek: OLLAMA_MODEL=deepseek-v4-flash:0731 (или правка этой строки) —
-    #   его тюнинг и анти-луп ретраи сохранены и включатся автоматически.
-    ollama_model: str = 'gemma4:31b'
+    # 2026-09-29: прод переведён на локальную gemma4-31b (single-call) — решение заказчика.
+    #   Возврат на Ollama Cloud без правки кода: OLLAMA_URL=https://ollama.com/v1 + OLLAMA_MODEL=gemma4:31b
+    #   (или deepseek-v4-flash:0731 — его тюнинг и анти-луп ретраи сохранены и включатся автоматически);
+    #   при заданном OLLAMA_URL ключ берётся из OLLAMA_API_KEY (см. load_from_env).
+    ollama_model: str = 'gemma4-31b'
 
     # Параметры для фильтрации изображений
     min_image_size_kb = 9  # Минимальный размер изображений в КБ
@@ -281,7 +289,7 @@ class Config:
     
     # Настройки оптимизации LLM
     rate_limit_requests_per_10s: int = 60
-    max_concurrent_llm_requests: int = 3   # Ollama Cloud Pro: не более 3 одновременных запросов к LLM
+    max_concurrent_llm_requests: int = 3   # gemma4-31b (vLLM): 3 одновременные последовательности (раньше — лимит Ollama Cloud Pro)
     llm_request_timeout: int = 30
 
     # Настройки потоковой обработки страниц (конвейер внутри компании):
@@ -392,6 +400,9 @@ class Config:
     census_enabled: bool = False          # режим переписи: писать черновики профилей
     profile_accept_confidence: float = 0.8  # порог автопринятия черновика (пост-обработка)
 
+    # Минимальная пауза между запросами к LLM; 0 сохраняет прежнее поведение.
+    llm_request_delay_seconds: int = 0
+
     # Настройки Kafka
     kafka_bootstrap_servers: str = "192.168.0.15:9092"
     kafka_topic_regular_tasks: str = "regular_tasks"
@@ -425,15 +436,36 @@ class Config:
         """Загрузка конфигурации из переменных окружения"""
         config = cls()
         config.excel_path = os.getenv('EXCEL_PATH', config.excel_path)
+        config.site_list_dsn = os.getenv("SITE_LIST_DSN", config.site_list_dsn)
+        # Диспетчерская и запускаемый ею подпроцесс обязаны видеть одни каталоги.
+        for attr, env_name in (
+            ('base_dir', 'BASE_DIR'),
+            ('reports_dir', 'REPORTS_DIR'),
+            ('vector_db_path', 'VECTOR_DB_PATH'),
+            ('documents_dir', 'DOCUMENTS_DIR'),
+            ('logs_dir', 'LOGS_DIR'),
+            ('graph_db_json_output_dir', 'GRAPH_DB_JSON_OUTPUT_DIR'),
+            ('graph_db_archive_dir', 'GRAPH_DB_ARCHIVE_DIR'),
+            ('graph_db_pending_dir', 'GRAPH_DB_PENDING_DIR'),
+            ('profiles_dir', 'PROFILES_DIR'),
+            ('profiles_drafts_dir', 'PROFILES_DRAFTS_DIR'),
+            ('profile_metrics_dir', 'PROFILE_METRICS_DIR'),
+        ):
+            setattr(config, attr, os.getenv(env_name, getattr(config, attr)))
+        if os.getenv('DOCUMENTS_DIR') and not os.getenv('PRODUCT_CARDS_DIR'):
+            config.product_cards_dir = config.documents_dir
+        else:
+            config.product_cards_dir = os.getenv('PRODUCT_CARDS_DIR', config.product_cards_dir)
         config.ai_tunnel_api_key = os.getenv('AI_TUNNEL_API_KEY', config.ai_tunnel_api_key)       
-        # Ollama Cloud (SGR-извлечение)
-        config.ollama_url = os.getenv('OLLAMA_URL', config.ollama_url)
-        config.ollama_api_key = os.getenv('OLLAMA_API_KEY', config.ollama_api_key)
+        # LLM (SGR-извлечение). OLLAMA_URL = переход на Ollama Cloud, и только тогда ключ OLLAMA_API_KEY:
+        # он всегда есть в .env и без этого условия подменил бы ключ локальной модели (-> 401).
+        if os.getenv('OLLAMA_URL'):
+            config.ollama_url = os.getenv('OLLAMA_URL')
+            config.ollama_api_key = os.getenv('OLLAMA_API_KEY', config.ollama_api_key)
         config.ollama_model = os.getenv('OLLAMA_MODEL', config.ollama_model)
         config.graph_db_api_url = os.getenv('GRAPH_DB_API_URL', config.graph_db_api_url)
         config.graph_db_enable = os.getenv('GRAPH_DB_ENABLE', str(config.graph_db_enable)).lower() == 'true'
         config.vector_db_enable = os.getenv('VECTOR_DB_ENABLE', str(config.vector_db_enable)).lower() == 'true'
-        config.graph_db_pending_dir = os.getenv('GRAPH_DB_PENDING_DIR', config.graph_db_pending_dir)
         config.graph_db_max_retries_on_resume = int(os.getenv('GRAPH_DB_MAX_RETRIES_ON_RESUME', config.graph_db_max_retries_on_resume))
         config.graph_db_resume_delay_seconds = int(os.getenv('GRAPH_DB_RESUME_DELAY_SECONDS', config.graph_db_resume_delay_seconds))
         config.enable_file_conversion = os.getenv('ENABLE_FILE_CONVERSION', str(config.enable_file_conversion)).lower() == 'true'
@@ -450,10 +482,15 @@ class Config:
         # Рычаг конкуренции краула. Окружение = 14 vCPU / 53 ГБ (не полный Threadripper); выбран бюджет 1/2 ≈
         # 7 CPU / 26 ГБ (mem_limit mvp ~24 ГБ) -> дефолт = 20 (кормит 3 слота LLM с запасом). Больше — через env.
         config.max_concurrent_pages = int(os.getenv('MAX_CONCURRENT_PAGES', config.max_concurrent_pages))
+        config.max_pages_per_site = int(os.getenv('MAX_PAGES_PER_SITE', config.max_pages_per_site))
+        config.max_product_pages_per_site = int(
+            os.getenv('MAX_PRODUCT_PAGES_PER_SITE', config.max_product_pages_per_site))
         # D101: порог простоя для сторожа зависаний (сек). 0 отключает сторож.
         config.company_idle_timeout_seconds = int(os.getenv('COMPANY_IDLE_TIMEOUT_SECONDS', config.company_idle_timeout_seconds))
         # Гейт «оболочки» товарной страницы (симв. видимого текста). 0 отключает.
         config.product_min_text = int(os.getenv('PRODUCT_MIN_TEXT', config.product_min_text))
+        config.llm_request_delay_seconds = int(
+            os.getenv('LLM_REQUEST_DELAY_SECONDS', config.llm_request_delay_seconds))
 
         # Настройки потоковой обработки страниц
         config.pipeline_streaming_enabled = os.getenv('PIPELINE_STREAMING_ENABLED', str(config.pipeline_streaming_enabled)).lower() == 'true'

@@ -43,4 +43,11 @@ GraphDB_Pending/
 
 Анализ системы/
 Краулер/
+Скилл_Quality-loop/
+Тестирование моделей/
+tests/
 
+
+# Локальное окружение и переопределения Диспетчерской
+dashboard/local.env
+dashboard/settings_overrides.env

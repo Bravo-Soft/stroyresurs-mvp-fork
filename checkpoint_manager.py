@@ -57,7 +57,8 @@ class CheckpointManager:
             time_since_last = (current_time - self._last_checkpoint_time).total_seconds() / 60
             
             if (time_since_last < self.config.checkpoint_frequency_minutes and 
-                stage not in ['company_started', 'company_completed', 'critical_stage']):
+                stage not in ['company_started', 'company_completed', 'critical_stage',
+                              'critical_error', 'stopped_by_admin']):
                 log.debug(f"Пропускаем чекпоинт {stage} - слишком частый ({time_since_last:.1f} мин)")
                 return False
             
