@@ -1111,7 +1111,8 @@ class MonitoringSystem:
                 ai_data, token_usage = await self.ai_client.extract_product_info(
                 enhanced_text,
                 manufacturer_name,
-                base_domain
+                base_domain,
+                page_url=metadata.get('url', '')
             )                                
             
             text_type = "product"

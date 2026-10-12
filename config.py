@@ -2,6 +2,7 @@
 import os
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
+from urllib.parse import urlparse
 
 load_dotenv()
 
@@ -28,11 +29,11 @@ class Config:
 
     # LLM для SGR-извлечения товаров/компаний/дистрибьюторов (ai_integration.AITunnelClient) —
     # OpenAI-совместимый эндпоинт; имена полей ollama_* исторические (до 2026-09-29 это был Ollama Cloud).
-    # Прод с 2026-09-29 — ЛОКАЛЬНАЯ gemma4-31b (Gemma 4 31B IT FP8, vLLM за LiteLLM; по метаданным LiteLLM
-    # контекст 15 000 ток., 3 одновременные последовательности, запуск по требованию, гаснет после 30 мин
-    # простоя). LiteLLM доступен через SSH-туннель хоста (systemd --user litellm-tunnel.service):
+    # Прод с 2026-10-12 — локальная gemma4-31b-nvfp4 за LiteLLM, прямой промпт v37.
+    # Параметры проверены на стенде: один вызов, 7 клиентских потоков, max_tokens=8192.
+    # LiteLLM доступен через SSH-туннель хоста (systemd --user litellm-tunnel.service):
     # 127.0.0.1:4000 и 172.17.0.1:4000 — шлюз docker0, адрес для контейнеров.
-    # Ключ — GEMMA4_31B_API_KEY из .env (только эта модель, до 14 параллельных запросов, действует до 2026-10-22).
+    # Ключ — GEMMA4_31B_NVFP4_API_KEY из .env; прежняя FP8 использует GEMMA4_31B_API_KEY.
     # Ollama Cloud (история): эндпоинт https://ollama.com/v1, ключ OLLAMA_API_KEY; id модели — как его
     # отдаёт GET https://ollama.com/v1/models (без суффикса ':cloud' — он только для CLI-загрузки).
     # Модель выбрана по итогам сравнения 8 кандидатов на реальном markdown (Анализ системы/_model_ab +
@@ -44,7 +45,7 @@ class Config:
     # Архитектура/тюнинг пер-модельно (ai_integration): v4-flash → 2-вызовная SGR (single_1call у неё
     # ломается), thinking ВКЛ (prod_2call — её лучший конфиг), _clean_json_response.
     ollama_url: str = 'http://172.17.0.1:4000/v1'
-    ollama_api_key: str = field(default_factory=lambda: os.getenv('GEMMA4_31B_API_KEY', ''))
+    ollama_api_key: str = field(default_factory=lambda: os.getenv('GEMMA4_31B_NVFP4_API_KEY', ''))
     # 2026-07-27: прод переведён на gemma4:31b (полный офлайн-прогон 1142 стр. 42 комп. + A/B промпта:
     #   полнота ТХ медиана 1.00 vs deepseek, перевод ключей 0, дисциплина полей 0 нарушений;
     #   отчёт: mvp/Анализ системы/_gemma4_test/REPORT.md).
@@ -56,8 +57,9 @@ class Config:
     # 2026-09-29: прод переведён на локальную gemma4-31b (single-call) — решение заказчика.
     #   Возврат на Ollama Cloud без правки кода: OLLAMA_URL=https://ollama.com/v1 + OLLAMA_MODEL=gemma4:31b
     #   (или deepseek-v4-flash:0731 — его тюнинг и анти-луп ретраи сохранены и включатся автоматически);
-    #   при заданном OLLAMA_URL ключ берётся из OLLAMA_API_KEY (см. load_from_env).
-    ollama_model: str = 'gemma4-31b'
+    #   у Ollama Cloud ключ OLLAMA_API_KEY; локальный URL сохраняет ключ выбранной модели.
+    # 2026-10-12: gemma4-31b-nvfp4, прямой промпт v37; ключ GEMMA4_31B_NVFP4_API_KEY.
+    ollama_model: str = 'gemma4-31b-nvfp4'
 
     # Параметры для фильтрации изображений
     min_image_size_kb = 9  # Минимальный размер изображений в КБ
@@ -289,7 +291,7 @@ class Config:
     
     # Настройки оптимизации LLM
     rate_limit_requests_per_10s: int = 60
-    max_concurrent_llm_requests: int = 3   # gemma4-31b (vLLM): 3 одновременные последовательности (раньше — лимит Ollama Cloud Pro)
+    max_concurrent_llm_requests: int = 7   # gemma4-31b-nvfp4: 7 клиентских потоков, как на стенде v37
     llm_request_timeout: int = 30
 
     # Настройки потоковой обработки страниц (конвейер внутри компании):
@@ -457,12 +459,17 @@ class Config:
         else:
             config.product_cards_dir = os.getenv('PRODUCT_CARDS_DIR', config.product_cards_dir)
         config.ai_tunnel_api_key = os.getenv('AI_TUNNEL_API_KEY', config.ai_tunnel_api_key)       
-        # LLM (SGR-извлечение). OLLAMA_URL = переход на Ollama Cloud, и только тогда ключ OLLAMA_API_KEY:
-        # он всегда есть в .env и без этого условия подменил бы ключ локальной модели (-> 401).
-        if os.getenv('OLLAMA_URL'):
-            config.ollama_url = os.getenv('OLLAMA_URL')
-            config.ollama_api_key = os.getenv('OLLAMA_API_KEY', config.ollama_api_key)
+        # LLM: ключ выбирается по модели; явный локальный OLLAMA_URL не подменяет его облачным.
+        config.ollama_url = os.getenv('OLLAMA_URL', config.ollama_url)
         config.ollama_model = os.getenv('OLLAMA_MODEL', config.ollama_model)
+        key_env = {
+            'gemma4-31b-nvfp4': 'GEMMA4_31B_NVFP4_API_KEY',
+            'gemma4-31b': 'GEMMA4_31B_API_KEY',
+        }.get(config.ollama_model, 'OLLAMA_API_KEY')
+        if urlparse(config.ollama_url).hostname == 'ollama.com':
+            key_env = 'OLLAMA_API_KEY'
+        config.ollama_api_key = os.getenv(key_env, '')
+        config.max_concurrent_llm_requests = 7 if config.ollama_model == 'gemma4-31b-nvfp4' else 3
         config.graph_db_api_url = os.getenv('GRAPH_DB_API_URL', config.graph_db_api_url)
         config.graph_db_enable = os.getenv('GRAPH_DB_ENABLE', str(config.graph_db_enable)).lower() == 'true'
         config.vector_db_enable = os.getenv('VECTOR_DB_ENABLE', str(config.vector_db_enable)).lower() == 'true'

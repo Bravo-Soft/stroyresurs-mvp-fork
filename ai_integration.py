@@ -13,6 +13,7 @@ import os
 from models import ReasoningOutput, ProductOutput
 from datetime import datetime
 from contextlib import nullcontext
+from gemma_nvfp4_single_prompt import SYSTEM as GEMMA_NVFP4_SYSTEM, USER_TEMPLATE as GEMMA_NVFP4_USER_TEMPLATE
 
 log = logging.getLogger("ai_integration")
 
@@ -225,6 +226,9 @@ _MODEL_TUNING = {
     "gemma4:31b":             {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": True},
     # прод с 2026-09-29: локальная gemma4-31b (vLLM за LiteLLM, см. config.ollama_*) — тюнинг как у gemma4:31b.
     "gemma4-31b":             {"effort": None,   "thinking_off": False, "num_ctx": None,  "robust": True},
+    # Проверенный однопромптовый v37 (2026-10-12): параметры совпадают с тестовым стендом.
+    "gemma4-31b-nvfp4":       {"effort": "none", "thinking_off": False, "num_ctx": None,  "robust": True,
+                               "max_tokens": 8192},
     "gpt-oss:120b":           {"effort": "low",  "thinking_off": False, "num_ctx": None,  "robust": True},
     "gpt-oss:20b":            {"effort": "low",  "thinking_off": False, "num_ctx": None,  "robust": True},
     "qwen3-coder-next":       {"effort": None,   "thinking_off": False, "num_ctx": 32768, "robust": False},
@@ -259,7 +263,7 @@ def _payload_tuning(model: str) -> dict:
 # Модели, у которых единый вызов (single_1call) даёт корректный финальный JSON (отчёт A/B §4).
 # Для остальных (deepseek-v3.2/v4-flash, qwen, minimax) наивное объединение промптов ломает вывод
 # (модель печатает промежуточную step_-структуру) → используем 2-вызовную SGR.
-_SINGLE_CALL_MODELS = {"gemini-3-flash-preview", "glm-5.2", "gemma4:31b", "gemma4-31b"}
+_SINGLE_CALL_MODELS = {"gemini-3-flash-preview", "glm-5.2", "gemma4:31b", "gemma4-31b", "gemma4-31b-nvfp4"}
 
 # D78: детерминированная нормализация латинских (машинных) ключей характеристик в русские.
 # Сайты вида ekontaktor.ru (Next.js) отдают в разметке англ-блок data-props; извлечение иногда
@@ -1797,9 +1801,11 @@ class AITunnelClient:
             log.error(f"Не удалось сохранить ошибочный SGR ответ: {e}")    
             
     def _single_system_prompt(self) -> str:
-        """Системный промпт единого вызова (single_1call): правила REASONER + правила и схема
+        """Gemma NVFP4: прямой промпт v37. Для остальных моделей: правила REASONER + правила и схема
         FORMATTER (текст правил — verbatim из соответствующих методов) + override-блок, который
         задаёт архитектуру вывода (без промежуточной step_-структуры). Победитель A/B (REPORT.md §7)."""
+        if self.model == "gemma4-31b-nvfp4":
+            return GEMMA_NVFP4_SYSTEM
         override = (
             "\n\n================================================================================\n"
             "АРХИТЕКТУРА ВЫВОДА (важно): НЕ выводи промежуточный JSON со step_1..step_8. "
@@ -1809,15 +1815,19 @@ class AITunnelClient:
         )
         return self._reasoning_system_prompt() + "\n\n" + self._formatter_system_prompt() + override
 
-    def _single_user_prompt(self, text: str, manufacturer: str, base_domain: str) -> str:
-        """Пользовательский промпт единого вызова: правила REASONER без хвостовой инструкции о
+    def _single_user_prompt(self, text: str, manufacturer: str, base_domain: str, page_url: str = "") -> str:
+        """Gemma NVFP4: шаблон v37. Для остальных: правила REASONER без хвостовой инструкции о
         выводе step_-структуры (это архитектура, а не правило извлечения)."""
+        if self.model == "gemma4-31b-nvfp4":
+            return GEMMA_NVFP4_USER_TEMPLATE.format(
+                text=text[:100000], manufacturer=manufacturer,
+                base_domain=base_domain, page_url=page_url or base_domain)
         ru = self._reasoning_user_prompt(text, manufacturer, base_domain)
         return ru.split("ВЫВОДИ ТОЛЬКО JSON")[0].rstrip()
 
-    async def _sgr_single(self, text: str, manufacturer: str, base_domain: str) -> Tuple[Optional[Dict], Dict[str, int]]:
+    async def _sgr_single(self, text: str, manufacturer: str, base_domain: str, page_url: str = "") -> Tuple[Optional[Dict], Dict[str, int]]:
         """Единый вызов извлечения товара (single_1call) — победитель A/B для gemini-3-flash-preview.
-        Один POST вместо двух (REASONER+FORMATTER): temperature=0, reasoning_effort=low, устойчивый
+        Один POST вместо двух (REASONER+FORMATTER): temperature=0, тюнинг модели, устойчивый
         парсер (модель подмешивает <think> в content). Возвращает:
           {"product": {...}}      — товар;
           {"error": "Trash_418#"} — страница не товарная (вердикт модели);
@@ -1827,12 +1837,14 @@ class AITunnelClient:
             "model": self.model,
             "messages": [
                 {"role": "system", "content": self._single_system_prompt()},
-                {"role": "user", "content": self._single_user_prompt(text, manufacturer, base_domain)},
+                {"role": "user", "content": self._single_user_prompt(text, manufacturer, base_domain, page_url)},
             ],
             "temperature": 0.0,
             "reasoning_effort": _effort_for_model(self.model),
             "response_format": {"type": "json_object"},
         }
+        if self.model == "gemma4-31b-nvfp4":
+            data.update(_payload_tuning(self.model))
         result, token_usage = await self._make_request_with_retry(data)
         if not result:
             return None, token_usage
@@ -1851,13 +1863,13 @@ class AITunnelClient:
         _strip_price_spec_keys(final_dict)   # цена только в price: ключи-цены из ТХ (детерминированно)
         return final_dict, token_usage
 
-    async def extract_product_info(self, text: str, manufacturer: str, base_domain: str, use_sgr: bool = True) -> Tuple[Optional[Dict], Dict[str, int]]:
+    async def extract_product_info(self, text: str, manufacturer: str, base_domain: str, use_sgr: bool = True, page_url: str = "") -> Tuple[Optional[Dict], Dict[str, int]]:
         """Извлечение структурированной информации о товаре из Markdown. Архитектура — ПЕР-МОДЕЛЬНО
-        (Анализ системы/_model_ab/REPORT.md §4): gemini/glm работают единым вызовом (_sgr_single),
+        (Анализ системы/_model_ab/REPORT.md §4): gemini/glm/gemma работают единым вызовом (_sgr_single),
         остальным (deepseek/qwen/minimax) нужен 2-вызовный SGR (_sgr_reasoning→_sgr_formatter),
         т.к. наивный single_1call у них печатает промежуточную step_-структуру вместо товара."""
         if self.model in _SINGLE_CALL_MODELS:
-            return await self._sgr_single(text, manufacturer, base_domain)
+            return await self._sgr_single(text, manufacturer, base_domain, page_url)
 
         # 2-вызовная SGR (REASONER → гейт is_product → FORMATTER)
         reasoning_dict, token_usage1, valid_reasoning = await self._sgr_reasoning(text, manufacturer, base_domain)

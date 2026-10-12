@@ -45,6 +45,8 @@ WHITELIST = [
        'id модели, как его отдаёт GET /v1/models шлюза'),
     _W('OLLAMA_API_KEY', 'LLM', 'secret', 'ollama_api_key',
        'Ключ доступа к LLM-шлюзу (Bearer в каждом запросе)'),
+    _W('GEMMA4_31B_NVFP4_API_KEY', 'LLM', 'secret', None,
+       'Ключ локальной модели gemma4-31b-nvfp4 в LiteLLM'),
     _W('LLM_REQUEST_DELAY_SECONDS', 'LLM', 'int', 'llm_request_delay_seconds',
        'Таймаут между запросами к LLM: минимальная пауза между последовательными запросами, сек '
        '(общая на все параллельные воркеры). 0 — без паузы'),
