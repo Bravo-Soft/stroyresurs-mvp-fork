@@ -1,0 +1,64 @@
+domain: betar.ru
+profile_version: 2
+profiled_at: '2026-08-19'
+confidence: 0.767
+source: mixed
+notes:
+- '2026-11-09: добавлены настройки сайта из config.py и рабочего профиля; показатели переписи и confidence
+  сохранены.'
+crawl:
+  render: html
+  bitrix_offers: true
+sections:
+  product_url_patterns:
+  - /catalog/[^/]+/[^/]+/?$
+  - /catalog/[^/]+/?$
+extract:
+  tier: llm
+baseline:
+  structure_hash: 4b594286945b6353cd0e9be39ae9621a179d15fd
+  selector_hit_rate: 1.0
+  pages_crawled: 29
+  product_pages: 28
+  product_cards: 17
+  jsonld_share: 1.0
+  cms_detected: generic-content
+  fetch_fail_rate: 0.4133
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.85
+  sitemap_url_count: null
+  extraction_path_share:
+    contacts_universal: 0.3171
+    universal: 0.6829
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts: &id001
+    product: 28
+    main_page: 1
+census_evidence:
+  fetch_methods:
+    http_first: 35
+    dynamic: 9
+  pages_by_category: *id001
+  alerts:
+  - fetch_fail_rate 0.4133 > 0.15
+  - 'секция contacts: 0 страниц'
+  - 'секция distributor: 0 страниц'
+  top_urls:
+    product:
+    - http://www.betar.ru/catalog
+    - http://betar.ru/catalog/plastics_production/
+    - http://betar.ru/catalog/bytovye-schetchiki-vody/skhv-i-sgv/
+    - http://betar.ru/catalog/aksessuary/regulyator-davleniya-rd-15/
+    - http://betar.ru/catalog/bytovye-schetchiki-vody/universalnye-elektronnye-sgv-e-s-interfeysom-rs-485-i-impulsnym-vykhodom/
+    - http://betar.ru/catalog/schetchiki-gaza/sgbm-s-radiokanalom-lorawan-lartekh/
+    - http://betar.ru/catalog/schetchiki-gaza/sgk/
+    - http://betar.ru/catalog/schetchiki-gaza/sgbm-s-radiokanalom-lorawan-vega/
+    - http://betar.ru/catalog/promyshlennye-schetchiki-vody/svm/
+    - http://betar.ru/catalog/elektroschetchiki/2-tarif/
+    category: []
+    contacts: []
+    distributor: []
+    price_list: []

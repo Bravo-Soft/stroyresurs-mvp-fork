@@ -13,6 +13,7 @@ import os
 from models import ReasoningOutput, ProductOutput
 from datetime import datetime
 from contextlib import nullcontext
+from product_quality import normalize_product_fields
 from gemma_nvfp4_single_prompt import SYSTEM as GEMMA_NVFP4_SYSTEM, USER_TEMPLATE as GEMMA_NVFP4_USER_TEMPLATE
 
 log = logging.getLogger("ai_integration")
@@ -159,11 +160,21 @@ def _repair_invalid_escapes(s: str) -> str:
     return re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
 
 
+def _unique_json_object(pairs):
+    """Не допускаем незаметную перезапись отличающихся строк одним JSON-ключом."""
+    result = {}
+    for key, value in pairs:
+        if key in result and result[key] != value:
+            raise ValueError(f'Повторяющийся JSON-ключ: {key}')
+        result[key] = value
+    return result
+
+
 def _try_load(s: str) -> Optional[dict]:
     base = (s, re.sub(r",\s*]", "]", re.sub(r",\s*}", "}", s)))
     for cand in base + tuple(_repair_invalid_escapes(c) for c in base):
         try:
-            o = json.loads(cand)
+            o = json.loads(cand, object_pairs_hook=_unique_json_object)
             if isinstance(o, dict):
                 return o
         except Exception:
@@ -303,7 +314,15 @@ def _normalize_spec_keys_ru(final_dict):
         return
     def walk(o):
         if isinstance(o, dict):
-            return {_ru_spec_key(k): walk(v) for k, v in o.items()}
+            result = {}
+            targets = [_ru_spec_key(k) for k in o]
+            for k, v in o.items():
+                target = _ru_spec_key(k)
+                # При коллизии сохраняем оба исходных ключа вместо потери значения.
+                if targets.count(target) > 1:
+                    target = k
+                result[target] = walk(v)
+            return result
         if isinstance(o, list):
             return [walk(x) for x in o]
         return o
@@ -1785,7 +1804,7 @@ class AITunnelClient:
         try:
             log_dir = os.path.join(os.getcwd(), "logs")
             os.makedirs(log_dir, exist_ok=True)
-            timestamp = int(time.time())
+            timestamp = time.time_ns()
             filename = f"sgr_error_{stage}_{timestamp}_attempt{attempt+1}.json"
             filepath = os.path.join(log_dir, filename)
             error_data = {
@@ -1801,7 +1820,7 @@ class AITunnelClient:
             log.error(f"Не удалось сохранить ошибочный SGR ответ: {e}")    
             
     def _single_system_prompt(self) -> str:
-        """Gemma NVFP4: прямой промпт v37. Для остальных моделей: правила REASONER + правила и схема
+        """Gemma NVFP4: прямой промпт v39. Для остальных моделей: правила REASONER + правила и схема
         FORMATTER (текст правил — verbatim из соответствующих методов) + override-блок, который
         задаёт архитектуру вывода (без промежуточной step_-структуры). Победитель A/B (REPORT.md §7)."""
         if self.model == "gemma4-31b-nvfp4":
@@ -1816,7 +1835,7 @@ class AITunnelClient:
         return self._reasoning_system_prompt() + "\n\n" + self._formatter_system_prompt() + override
 
     def _single_user_prompt(self, text: str, manufacturer: str, base_domain: str, page_url: str = "") -> str:
-        """Gemma NVFP4: шаблон v37. Для остальных: правила REASONER без хвостовой инструкции о
+        """Gemma NVFP4: шаблон v39. Для остальных: правила REASONER без хвостовой инструкции о
         выводе step_-структуры (это архитектура, а не правило извлечения)."""
         if self.model == "gemma4-31b-nvfp4":
             return GEMMA_NVFP4_USER_TEMPLATE.format(
@@ -1848,7 +1867,12 @@ class AITunnelClient:
         result, token_usage = await self._make_request_with_retry(data)
         if not result:
             return None, token_usage
-        content = result['choices'][0]['message']['content']
+        choice = result['choices'][0]
+        content = choice['message']['content']
+        if choice.get('finish_reason') == 'length':
+            self._save_sgr_error_response('single_length', content or '', 0)
+            log.error('SGR single: ответ оборван лимитом, страница будет повторена')
+            return None, token_usage
         fd = _robust_json_extract(content)
         if not isinstance(fd, dict):
             # D35: сбой парсинга ≠ «не товар». Возвращаем None (как сетевую ошибку) —
@@ -1861,6 +1885,7 @@ class AITunnelClient:
         final_dict = fd if "product" in fd else {"product": fd}
         _normalize_spec_keys_ru(final_dict)  # D78: латинские ключи ТХ -> русские (детерминированно)
         _strip_price_spec_keys(final_dict)   # цена только в price: ключи-цены из ТХ (детерминированно)
+        normalize_product_fields(final_dict, text)
         return final_dict, token_usage
 
     async def extract_product_info(self, text: str, manufacturer: str, base_domain: str, use_sgr: bool = True, page_url: str = "") -> Tuple[Optional[Dict], Dict[str, int]]:
@@ -1889,6 +1914,7 @@ class AITunnelClient:
             return None, total_tokens
         _normalize_spec_keys_ru(final_dict)  # D78: латинские ключи ТХ -> русские (детерминированно)
         _strip_price_spec_keys(final_dict)   # цена только в price: ключи-цены из ТХ (детерминированно)
+        normalize_product_fields(final_dict, text)
         return final_dict, total_tokens
     
     async def extract_company_info(self, text: str, company_id: str, chunk_info: str = "") -> Tuple[Optional[str], Dict[str, int]]:

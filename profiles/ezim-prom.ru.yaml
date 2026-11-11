@@ -1,0 +1,12 @@
+domain: ezim-prom.ru
+profiled_at: '2026-11-02'
+source: manual
+notes:
+  - 'Лендинг: 16 товарных блоков; описание, раскрываемое при hover, уже присутствует в product__text.'
+  - 'DOM-id товаров отсутствуют. Ссылка использует стандартный текстовый фрагмент по уникальному названию, без создания URL отдельной страницы.'
+crawl:
+  inline_products:
+    paths: ['/']
+    item_selector: '.product'
+    name_selector: '.product__name'
+    content_selectors: ['.product__price', '.product__text']

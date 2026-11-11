@@ -342,7 +342,8 @@ class PipelineOrchestrator:
                     progress=0.0
                 )
                 # Обрабатываем компанию под тем же сторожем, что и регулярную (D101)
-                result = await self._process_company_watchdogged(monitoring_system, urgent_task.company_data)
+                company_data = dict(urgent_task.company_data, _monitoring_task_id=urgent_task.task_id)
+                result = await self._process_company_watchdogged(monitoring_system, company_data)
                 timed_out = result is None
                 if timed_out:
                     result = {'status': 'error',

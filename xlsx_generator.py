@@ -47,6 +47,7 @@ class XLSXGenerator:
             'Показатель': [
                 'Количество сайтов для проверки',
                 'Успешно обработано сайтов',
+                'Частично обработано сайтов',
                 'Ошибки обработки сайтов',
                 'Страниц обработано',
                 'Продуктовых страниц обработано',
@@ -65,7 +66,8 @@ class XLSXGenerator:
             'Значение': [
                 len(results),
                 len([r for r in results if r.get('status') == 'success']),
-                len([r for r in results if r.get('status') != 'success']),
+                len([r for r in results if r.get('status') == 'partial']),
+                len([r for r in results if r.get('status') not in ('success', 'partial')]),
                 statistics.pages_processed,
                 statistics.product_pages_processed,
                 statistics.company_pages_processed,

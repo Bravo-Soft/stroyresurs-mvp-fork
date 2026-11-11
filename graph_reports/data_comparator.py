@@ -73,6 +73,20 @@ class DataComparator:
         new_norm = self.normalize_value(new_value).strip()
         return old_norm == new_norm
     
+    @staticmethod
+    def content(value):
+        """Содержательные поля; даты проверки и выдачи не являются изменением."""
+        ignored = {"id", "upload_date", "update_date", "report_date", "report_version",
+                   "data_version", "data_update_in_progress", "verification_date"}
+        if isinstance(value, dict):
+            if value.get("hash"):
+                ignored.add("download_date")
+            return {str(k).casefold(): DataComparator.content(v) for k, v in value.items()
+                    if str(k).casefold() not in ignored}
+        if isinstance(value, list):
+            return sorted((DataComparator.content(v) for v in value), key=repr)
+        return value.strip() if isinstance(value, str) else value
+
     def _get_company_status(self, new_company: Dict[str, Any]) -> str:
         """
         Определение статуса компании на основе дат
@@ -85,27 +99,15 @@ class DataComparator:
            - report_date >= update_date → "ALREADY_REPORTED"
         """
         
-        upload_date = self._parse_date(new_company.get("upload_date"))
         report_date = self._parse_date(new_company.get("report_date"))
-        update_date = self._parse_date(new_company.get("update_date"))
-        
-        # Сценарий 1: Только upload_date, нет report_date
-        if upload_date and not report_date:
+        if not report_date:
             return "NEW_COMPANY"
-        
-        # Сценарий 2: Есть upload_date и report_date, но нет update_date
-        if upload_date and report_date and not update_date:
-            return "ALREADY_REPORTED"
-        
-        # Сценарий 3: Есть все три даты
-        if upload_date and report_date and update_date:
-            if report_date < update_date:
-                return "NEEDS_COMPARISON"
-            else:
-                return "ALREADY_REPORTED"
-        
-        return "UNKNOWN"
-    
+        if new_company.get("report_version") and new_company.get("data_version"):
+            return ("ALREADY_REPORTED" if new_company["report_version"] == new_company["data_version"]
+                    else "NEEDS_COMPARISON")
+        update_date = self._parse_date(new_company.get("update_date"))
+        return "NEEDS_COMPARISON" if update_date and update_date > report_date else "ALREADY_REPORTED"
+
     def compare_companies(self, old_company: Dict[str, Any], 
                          new_company: Dict[str, Any]) -> Tuple[ChangeType, Dict[str, Any], Dict[str, Any]]:
         """Сравнение данных компании с учетом новой логики статусов"""
@@ -129,27 +131,18 @@ class DataComparator:
             changes_old = {}
             changes_new = {}
             
-            compare_fields = [
-                "наименование компании",
-                "реквизиты",
-                "телефон",
-                "описание",
-                "адрес",
-                "website",
-                "E-mail"
-            ]
-            
+            old_fields = self.content({k: v for k, v in old_company.items()
+                                       if k not in {"products", "suppliers", "files"}})
+            new_fields = self.content({k: v for k, v in new_company.items()
+                                       if k not in {"products", "suppliers", "files"}})
             has_changes = False
-            
-            for field in compare_fields:
-                old_val = old_company.get(field)
-                new_val = new_company.get(field)
-                
-                if not self.compare_strings(old_val, new_val):
+            for field in old_fields.keys() | new_fields.keys():
+                old_val, new_val = old_fields.get(field), new_fields.get(field)
+                if old_val != new_val:
                     has_changes = True
                     changes_old[field] = old_val
                     changes_new[field] = new_val
-            
+
             if has_changes:
                 return ChangeType.EDITING, changes_old, changes_new
             else:
@@ -173,26 +166,14 @@ class DataComparator:
         changes_old = {}
         changes_new = {}
         
-        compare_fields = [
-            "наименование",
-            "регион",
-            "адрес",
-            "телефон",
-            "url",
-            "url страницы"
-        ]
-        
+        old_fields, new_fields = self.content(old_supplier), self.content(new_supplier)
         has_changes = False
-        
-        for field in compare_fields:
-            old_val = old_supplier.get(field)
-            new_val = new_supplier.get(field)
-            
-            if not self.compare_strings(old_val, new_val):
+        for field in old_fields.keys() | new_fields.keys():
+            if old_fields.get(field) != new_fields.get(field):
                 has_changes = True
-                changes_old[field] = old_val
-                changes_new[field] = new_val
-        
+                changes_old[field] = old_fields.get(field)
+                changes_new[field] = new_fields.get(field)
+
         if has_changes:
             return ChangeType.EDITING, changes_old, changes_new
         else:
@@ -209,14 +190,14 @@ class DataComparator:
         if not old_file and not new_file:
             return ChangeType.NO_CHANGES, {}, {}
         
-        old_date = old_file.get("download_date")
-        new_date = new_file.get("download_date")
-        
-        if old_date == new_date:
+        old_content, new_content = self.content(old_file), self.content(new_file)
+        if old_file.get("hash") and new_file.get("hash"):
+            old_content.pop("download_date", None)
+            new_content.pop("download_date", None)
+        if old_content == new_content:
             return ChangeType.NO_CHANGES, {}, {}
-        else:
-            return ChangeType.EDITING, old_file, new_file
-    
+        return ChangeType.EDITING, old_file, new_file
+
     def _analyze_files(self, old_files: List[Dict[str, Any]], 
                       new_files: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Анализ изменений файлов (компании или продукта)"""
@@ -287,6 +268,13 @@ class DataComparator:
                 is_new_company
             )
             
+            # Новые товары, документы и изменения ТХ поднимают статус компании.
+            if status == ChangeType.NO_CHANGES:
+                children = list(suppliers_analysis.values()) + list(products_analysis.values()) + list(company_files_analysis.values())
+                children += [f for p in products_analysis.values() for f in p.get("files", {}).values()]
+                if any(child["status"] != ChangeType.NO_CHANGES for child in children):
+                    status = ChangeType.EDITING
+
             results[company_id] = {
                 "status": status,
                 "old_company": old_company,
@@ -356,14 +344,10 @@ class DataComparator:
                 elif not old_product and new_product:
                     status = ChangeType.NEW_DATA
                 else:
-                    old_name = self.safe_str(old_product.get("product_name", ""))
-                    new_name = self.safe_str(new_product.get("product_name", ""))
-                    
-                    if old_name != new_name:
-                        status = ChangeType.EDITING
-                    else:
-                        status = ChangeType.NO_CHANGES
-            
+                    status = (ChangeType.NO_CHANGES
+                              if self.content(old_product) == self.content(new_product)
+                              else ChangeType.EDITING)
+
             # Анализируем файлы продукта
             product_files_analysis = self._analyze_files_with_company_status(
                 old_product.get("files", []) if old_product else [],

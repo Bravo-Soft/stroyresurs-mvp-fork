@@ -15,9 +15,18 @@ if __name__ == "__main__":
     main_bot_path = project_root / "bot_report" / "main_bot.py"
     
     if main_bot_path.exists():
-        from bot_report.main_bot import main
-        import asyncio
-        asyncio.run(main())
+        from dotenv import load_dotenv
+        from bot_logging import configure_bot_logging
+        load_dotenv(project_root / '.env')
+        configure_bot_logging()
+        try:
+            from bot_report.main_bot import main
+            import asyncio
+            asyncio.run(main())
+        except Exception:
+            import logging
+            logging.getLogger('main_bot').exception('Ошибка запуска или работы бота')
+            raise
     else:
         print(f"Файл {main_bot_path} не найден!")
         sys.exit(1)

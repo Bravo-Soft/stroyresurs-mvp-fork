@@ -138,6 +138,9 @@ class MarkdownConverter(BaseMarkdownConverter):
         <sup> прогонялся через _normalize_sup_text и приклеивался к предыдущему тексту
         БЕЗ пробела (м<sup>3</sup>/ч → м^3/ч, 1700±10<sup>*</sup> → 1700±10*),
         <br> давал один пробел, прочие теги — рекурсивно своё содержимое."""
+        if getattr(self, 'structured_tables', False):
+            from product_tables import cell_text
+            return cell_text(cell, self)
         parts = []
 
         def walk(node):
@@ -194,6 +197,11 @@ class MarkdownConverter(BaseMarkdownConverter):
     def convert_table(self, el, text, **kwargs):
         if el is None:
             return ""
+        if getattr(self, 'structured_tables', False):
+            from product_tables import structured_table_markdown
+            structured = structured_table_markdown(el, self)
+            if structured is not None:
+                return structured
         matrix = self._parse_table(el)
         if not matrix:
             return ""
@@ -201,7 +209,10 @@ class MarkdownConverter(BaseMarkdownConverter):
         if not flat_matrix:
             return ""
         def row_to_md(row):
-            return "| " + " | ".join(str(cell) if cell else " " for cell in row) + " |"
+            values = [str(cell) if cell else " " for cell in row]
+            if getattr(self, 'structured_tables', False):
+                values = [v.replace('|', r'\|').replace('\n', '<br>') for v in values]
+            return "| " + " | ".join(values) + " |"
         header = flat_matrix[0]
         body = flat_matrix[1:]
         md_lines = [
@@ -224,6 +235,25 @@ class MarkdownConverter(BaseMarkdownConverter):
 
 
 # ==================== ОБЩАЯ ОЧИСТКА (УНИВЕРСАЛЬНАЯ) ====================
+
+def _site_product_container(soup, page_url):
+    """Проверенный текущий товар вместо похожих article/footer двух сайтов."""
+    if not urlparse(page_url).path.startswith('/products/'):
+        return None
+    domain = _normalize_domain(page_url) if page_url else ''
+    selector = {'zavodmel.ru': 'section.product .product__info',
+                'npo-stekloplastic.ru': '.di-page-contents.hentry'}.get(domain)
+    if not selector:
+        return None
+    product = soup.select_one(selector)
+    heading = soup.find('h1')
+    if product is not None and heading is not None and product in heading.parents:
+        if domain == 'npo-stekloplastic.ru':
+            for form in product.select('form.wpcf7-form'):
+                form.decompose()
+        return product
+    return None
+
 
 def clean_noise(soup, url=None, strip_hidden=True):
     """Удаляет только универсальные шумовые блоки (script, style, общие классы).
@@ -249,6 +279,8 @@ def clean_noise(soup, url=None, strip_hidden=True):
     # Удаление скрытых блоков (общая логика). Пропускаем, если strip_hidden=False
     # (домен использует display:none для неактивных вкладок с полезным контентом).
     if strip_hidden:
+        for tag in soup.select('[hidden]'):
+            tag.decompose()
         for tag in soup.find_all(style=re.compile(r'display\s*:\s*none', re.I)):
             try:
                 tag.decompose()
@@ -403,6 +435,14 @@ def _emit_census(event, **data):
         logging.debug(f'census sink: {e}')
 
 
+def _markdown_fallback(url, page_type, source, target, reason, **details):
+    """Причина резервного пути доступна и в журнале, и в метриках прогона."""
+    logging.info('Markdown fallback %s -> %s: %s; url=%s; page_type=%s; %s',
+                 source, target, reason, url, page_type, details)
+    _emit_census('markdown_fallback', url=url, page_type=page_type,
+                source=source, target=target, reason=reason, **details)
+
+
 def _get_adapter_by_module(module_name):
     """Адаптер Profile_Markdown по имени модуля (extract.custom_module профиля)."""
     if not module_name:
@@ -549,11 +589,23 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
     общий конвертер (товарный extract при этом НЕ вызывается, чтобы не разбирать
     страницу компании как карточку товара).
     """
+    from product_interactions import isolate_product_state, preserve_product_panels
+    if page_type not in ('company', 'distributor'):
+        html = isolate_product_state(html, url)
+        if html is None:
+            return ''
     # Парсим HTML
     try:
         soup = BeautifulSoup(html, 'lxml')
     except Exception:
         soup = BeautifulSoup(html, 'html.parser')
+
+    if page_type not in ('company', 'distributor') and preserve_product_panels(soup, url):
+        html = str(soup)
+    if page_type in ('company', 'distributor'):
+        from contact_interactions import preserve_contact_panels
+        preserve_contact_panels(soup)
+        html = str(soup)
 
     # Определяем base_url для относительных ссылок
     base_url = url or ''
@@ -593,8 +645,6 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
     keep_hidden_tabs = getattr(adapter, 'KEEP_HIDDEN_TABS', False)
     if profile is not None:
         keep_hidden_tabs = keep_hidden_tabs or profile.extract.keep_hidden_tabs
-    soup = clean_noise(soup, url or base_url, strip_hidden=not keep_hidden_tabs)
-
     # Пер-сайтовый дополнительный шум из профиля (extract.markdown.remove_selectors).
     if profile is not None:
         for _sel in profile.extract.markdown.remove_selectors:
@@ -603,6 +653,11 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
                     _tag.decompose()
                 except Exception:
                     pass
+
+    # Даже адаптеру NEEDS_RAW_HTML передаём явно очищенную профилем страницу.
+    # Служебные script пока сохранены: адаптеру может требоваться их разметка.
+    if profile is not None and profile.extract.markdown.remove_selectors:
+        html = str(soup)
 
     # Настройки markdown-профиля: порог «пустого» markdown, жёсткий лимит длины,
     # пер-типовый CSS-контейнер (product/company/distributor).
@@ -632,6 +687,41 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
             _emit_census('extraction', **data)
         return result
 
+    if profile_container:
+        selected = soup.select_one(profile_container)
+        if selected is not None:
+            # Явная область имеет приоритет над адаптером и эвристиками контейнера.
+            # Сохраняем её классы/таблицы, но не исполняемые и скрытые служебные узлы.
+            soup = BeautifulSoup(str(selected), 'html.parser')
+            selectors = ['script', 'style', 'noscript', 'template']
+            if not keep_hidden_tabs:
+                selectors += ['[hidden]', '[style]']
+            for selector in selectors:
+                for tag in soup.select(selector):
+                    if tag.attrs is None:
+                        continue
+                    if selector == '[style]' and not re.search(r'display\s*:\s*none', tag.get('style', ''), re.I):
+                        continue
+                    tag.decompose()
+            converter = MarkdownConverter(heading_style='ATX', bullets='-', strip=['script', 'style'])
+            from product_tables import is_table_site
+            converter.structured_tables = page_type not in ('company', 'distributor') and is_table_site(base_url)
+            try:
+                return _finish(converter.convert(str(soup)), 'profile_container')
+            except Exception as e:
+                # Не расширяем область до чужих товаров при ошибке конвертера.
+                _markdown_fallback(url, page_type, 'profile_container', 'empty',
+                                   'profile_conversion_error', error=str(e))
+                return _finish('', 'profile_container')
+        _markdown_fallback(url, page_type, 'profile_container', 'automatic',
+                           'profile_container_missing', selector=profile_container)
+
+    soup = clean_noise(soup, url or base_url, strip_hidden=not keep_hidden_tabs)
+    prepared_universal = bool(keep_hidden_tabs or (md_profile and md_profile.remove_selectors))
+    if profile is not None and profile.extract.tier == 'custom' and adapter is None:
+        _markdown_fallback(url, page_type, 'adapter', 'automatic', 'adapter_missing',
+                           module=profile.extract.custom_module)
+
     # Спец-обработка страниц компании/дистрибьюторов: выделенные методы адаптера
     # extract_company / extract_distributor. Товарный путь (page_type='') не затрагивается.
     if page_type in ('company', 'distributor'):
@@ -642,7 +732,13 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
                 special_result = special_fn(str(soup), base_url)
             except Exception as e:
                 logging.debug(f"Ошибка в adapter.{special_attr} для {url}: {e}")
+                _markdown_fallback(url, page_type, 'adapter_special', 'contacts_universal',
+                                   'adapter_special_error', error=str(e))
                 special_result = None
+            else:
+                if special_result is None:
+                    _markdown_fallback(url, page_type, 'adapter_special', 'contacts_universal',
+                                       'adapter_special_empty')
             if special_result is not None:
                 return _finish(special_result, 'adapter_special')
         # Нет спец-метода адаптера (или он вернул None) → универсальный доменно-независимый
@@ -650,14 +746,18 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
         universal_result = _extract_contacts_universal(soup, base_url)
         if universal_result is not None:
             return _finish(universal_result, 'contacts_universal')
+        _markdown_fallback(url, page_type, 'contacts_universal', 'generic', 'contacts_empty')
         # Если и он ничего не дал — общий конвертер ниже.
     else:
         # Применяем специфичную очистку адаптера (если есть)
         if adapter and hasattr(adapter, 'clean') and callable(adapter.clean):
             try:
                 adapter.clean(soup)
+                prepared_universal = True
             except Exception as e:
                 logging.debug(f"Ошибка в adapter.clean для {domain}: {e}")
+                prepared_universal = True
+                _markdown_fallback(url, page_type, 'adapter_clean', 'automatic', 'adapter_clean_error', error=str(e))
 
         # Пробуем специализированное извлечение (если адаптер имеет метод extract)
         adapter_result = None
@@ -678,6 +778,7 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
             if adapter_result is not None:
                 # Успешно обработано адаптером
                 return _finish(adapter_result, 'adapter')
+            _markdown_fallback(url, page_type, 'adapter', 'automatic', 'adapter_empty')
 
     # --- ОБЩИЙ МЕТОД (если адаптер не справился или его нет) ---
     converter = MarkdownConverter(
@@ -685,12 +786,16 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
         bullets='-',
         strip=['script', 'style'],
     )
+    from product_tables import is_table_site
+    converter.structured_tables = page_type not in ('company', 'distributor') and is_table_site(base_url)
 
     def _build_markdown(root_soup):
         """Выбирает контейнер карточки и конвертирует его в markdown.
         Контейнер из профиля сайта (extract.markdown.*_container) — первым в цепочке;
         нет матча — прежняя generic-цепочка."""
         main = root_soup.select_one(profile_container) if profile_container else None
+        if main is None and page_type not in ('company', 'distributor'):
+            main = _site_product_container(root_soup, base_url)
         main = (main or
                 root_soup.select_one('[itemtype*="Product"]') or
                 root_soup.select_one('article') or
@@ -703,10 +808,12 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
             return converter.convert(str(main))
         except Exception as e:
             logging.error(f"Ошибка конвертера: {e}")
+            _markdown_fallback(url, page_type, 'generic_container', 'generic_document', 'conversion_error', error=str(e))
             try:
                 return converter.convert(str(root_soup))
             except Exception as e2:
                 logging.error(f"Ошибка fallback конвертера: {e2}")
+                _markdown_fallback(url, page_type, 'generic_document', 'empty', 'conversion_error', error=str(e2))
                 return ""
 
     # Базовый вариант — без новой товарной чистки (страховка).
@@ -729,6 +836,8 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
         base_len = len(baseline_markdown.strip())
         clean_len = len(cleaned_markdown.strip())
         if base_len and (clean_len < md_min_len or clean_len < base_len * 0.3):
+            _markdown_fallback(url, page_type, 'product_clean', 'generic', 'product_clean_too_short',
+                               before_len=base_len, after_len=clean_len)
             logging.debug(
                 f"clean_noise_product откат для {url}: {base_len}->{clean_len} символов"
             )
@@ -743,20 +852,31 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
         # текущий (generic) результат.
         try:
             import universal_extractor as _ue
-        except ImportError:
+        except ImportError as e:
             _ue = None
-        except Exception:
+            _markdown_fallback(url, page_type, 'universal', 'generic', 'universal_import_error', error=str(e))
+        except Exception as e:
             _ue = None
+            _markdown_fallback(url, page_type, 'universal', 'generic', 'universal_import_error', error=str(e))
         if _ue is not None:
             try:
-                universal_markdown = _ue.extract_product_markdown(html, base_url)
+                if prepared_universal:
+                    universal_markdown = _ue.extract_product_markdown(str(soup), base_url, prepared=True)
+                else:
+                    universal_markdown = _ue.extract_product_markdown(html, base_url)
             except Exception as e:
                 logging.debug(f"universal_extractor откат для {url}: {e}")
+                _markdown_fallback(url, page_type, 'universal', 'generic', 'universal_error', error=str(e))
                 universal_markdown = None
+            else:
+                if universal_markdown is None:
+                    _markdown_fallback(url, page_type, 'universal', 'generic', 'universal_empty')
             cur_len = len(markdown.strip())
             if universal_markdown is not None:
                 uni_len = len(universal_markdown.strip())
                 if cur_len and (uni_len < md_min_len or uni_len < cur_len * 0.5):
+                    _markdown_fallback(url, page_type, 'universal', 'generic', 'universal_too_short',
+                                       before_len=cur_len, after_len=uni_len)
                     logging.debug(
                         f"universal_extractor короче — откат для {url}: {cur_len}->{uni_len} символов"
                     )

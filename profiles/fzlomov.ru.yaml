@@ -1,0 +1,13 @@
+domain: fzlomov.ru
+profiled_at: '2026-11-02'
+source: manual
+notes:
+  - 'Лендинг: 7 товаров. scripts.js связывает more/sertif с more-block/sertif-block своего .item; данные уже в HTML.'
+  - 'Существующие #product-N поддерживаются скриптом сайта; документы сохраняются только из соответствующего товара.'
+crawl:
+  inline_products:
+    paths: ['/']
+    item_selector: '.plywood > .item[id]'
+    name_selector: '.title'
+    content_selectors: ['.more-block', '.sertif-block']
+    id_pattern: 'product-[0-9]+'

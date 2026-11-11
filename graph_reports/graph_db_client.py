@@ -16,7 +16,7 @@ class GraphDBClient:
         self.api_url = config.graph_db_api_url.rstrip('/')
         # Разделяем эндпоинты для получения и добавления данных
         self.get_url = f"{self.api_url}/get"  # Для получения данных
-#        self.get_url = "http://192.168.0.123:4242/api/companies/get"  # Для получения данных
+#        self.get_url = "https://stroy-resurs-db.bravo-soft.ru/api/companies/get"  # Для получения данных
         self.add_url = f"{self.api_url}/add"  # Для добавления данных
         print(f"DEBUG: GraphDB GET URL: {self.get_url}")
         print(f"DEBUG: GraphDB ADD URL: {self.add_url}")

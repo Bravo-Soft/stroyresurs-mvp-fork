@@ -2,6 +2,9 @@
 import asyncio
 import logging
 import pandas as pd
+import pipeline_control
+from pathlib import Path
+from uuid import uuid4
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 import os
@@ -13,16 +16,18 @@ import traceback
 import aiofiles
 from urllib.parse import urlparse
 from config import Config
+from report_queue import company_update_lock, company_state_path
 from domain_equivalency import normalize_site_url, same_registrable_domain
 from web_crawler import WebCrawler  
 from ai_integration import AITunnelClient
 from docx_generator import DOCXGenerator
 from xlsx_generator import XLSXGenerator
 from product_utils import extract_product_name_from_ai_text, sanitize_company_name, sanitize_filename
+from product_source_url import resolve_product_source_url
 from checkpoint_manager import CheckpointManager
 from rate_limiter import RateLimiter
 from performance_monitor import PerformanceMonitor
-from product_id_manager import ProductIDManager
+from product_id_manager import ProductIDManager, restore_source_variant_name
 from file_id_manager import FileIDManager
 from distributor_id_manager import DistributorIDManager
 from graph_db_uploader import GraphDBUploader, GraphDBFatalError
@@ -32,7 +37,18 @@ from pipeline_orchestrator import PipelineOrchestrator
 import activity_heartbeat
 # from site_profiler import SiteProfiler
 from text_extractor import html_to_markdown
+from product_tables import restore_source_tables, TableStructureError
+from source_product_tables import compact_source_tables, restore_deterministic_tables, source_family_catalog_reason
 from processing_time_tracker import ProcessingTimeTracker
+from Profile_Markdown.tegola_ru import restore_source_product
+from product_quality import normalize_product_fields
+from labelled_source_instructions import restore_labelled_instructions
+from quality_source_fields import restore_quality_source_fields
+from labelled_product_sections import restore_labelled_product_sections
+from visible_product_sections import restore_visible_product_sections
+from source_detail_fields import restore_source_detail_fields
+from bitumex_source_sections import restore_bitumex_source_sections
+from product_extraction_revision import product_extraction_revision
 
 log = logging.getLogger("main")
 
@@ -66,34 +82,56 @@ def _count_value_numeric(value: Any) -> int:
 
 
 def count_numeric_characteristics(product: Dict[str, Any]) -> int:
-    """ГЕЙТ качества (решение пользователя, июнь-2026): число ЧИСЛОВЫХ тех.характеристик товара.
-    В итоговую обработку (карточка товара + отправка в БД) идут ТОЛЬКО товары с >=3 такими
-    характеристиками — параметрический поиск в системе завязан именно на числовые значения
-    характеристик. Обходит specifications (с вложенными словарями/списками) + поля dimensions/weight.
-    Габариты вида AAA×BBB×CCC засчитываются по числу осей (12×12×123 → 3)."""
+    """Числовой гейт с исключениями v37: коды, упаковка и условия не являются ТХ.
+
+    Перечень/диапазон значений одного поля — одна ТХ. Только явно размерное
+    поле с записью через ×/х/* даёт независимые оси габаритов.
+    """
     if not isinstance(product, dict):
         return 0
-    count = 0
+    excluded = re.compile(
+        r'\bгост\b|(?:^|\W)ту(?:\W|$)|стандарт|норматив|артикул|модель|код|'
+        r'маркир|марка\s+(?:стали|материала|изделия|полотна|нити)|цвет|ral|гарант|срок\s+(?:хранения|годности|службы|эксплуатации)|хранени|упаков|палл[её]т|фасов|\bтара\b|'
+        r'цен[аы]|стоимост|заказ|достав|телефон|адрес|инструкц|'
+        r'услови[яй]|окружающ|наименован|производител|сертификат|единиц[аы] измер',
+        re.IGNORECASE)
+    axes = re.compile(r'габарит|размер|длин|ширин|высот|dimensions', re.IGNORECASE)
 
-    def walk(obj):
-        nonlocal count
-        if isinstance(obj, dict):
-            for v in obj.values():
-                if isinstance(v, (dict, list)):
-                    walk(v)
-                elif v is not None and str(v).strip():
-                    count += _count_value_numeric(v)
-        elif isinstance(obj, list):
-            for it in obj:
-                walk(it)
+    def walk(value, key=''):
+        if isinstance(value, dict):
+            # Имя модели/исполнения — контейнер, а не характеристика.
+            if re.search(r'упаков|палл[её]т|фасов|\bтара\b', key, re.IGNORECASE):
+                return 0
+            return sum(walk(v, str(k)) for k, v in value.items())
+        if isinstance(value, list):
+            if all(not isinstance(v, (dict, list)) for v in value):
+                # Несколько значений одной ТХ не создают новых параметров.
+                return max((walk(v, key) for v in value), default=0)
+            return sum(walk(v, key) for v in value)
+        key = re.sub(r'\s*\((?:по\s+)?(?:ГОСТ|ТУ|СТБ|ISO)\b[^)]*\)', '', key, flags=re.I)
+        if re.fullmatch(r'металл|материал|покрытие|замасливатель|состав стекла|нд|нтд|примечани[ея]|конструкция|устройство|принцип работы|состав и свойства материала|(?:строка|столбец)\s+\d+', key.strip(), re.I):
+            return 0  # Обозначение материала/покрытия не физическая величина.
+        if excluded.search(key) or re.search(
+                r'температур.*(?:монтаж|окружающ|хранени)', key, re.IGNORECASE):
+            return 0
+        if value is None:
+            return 0
+        text = str(value)
+        if (re.fullmatch(r'нити\s+в\s+(?:основе|утке)', key.strip(), re.I)
+                and re.fullmatch(r'[А-ЯA-Z]+[\d\w(),./×х*+-]+', text.strip(), re.I)):
+            return 0  # Код использованной нити, не её числовое свойство.
+        if re.search(r'₽|\b(?:руб(?:ль|ля|лей)?|RUB|USD|EUR)\b', key + ' ' + text, re.I):
+            return 0  # Денежные колонки не становятся ТХ без слова «цена».
+        # Классы покрытий и цветовые коды — идентификаторы, не значения толщины.
+        text = re.sub(r'\b(?:RAL|Zn|AlZn|RR)\s*\d+\b', '', text, flags=re.IGNORECASE)
+        if not re.search(r'\d', text):
+            return 0
+        return _count_value_numeric(text) if axes.search(key) else 1
 
-    walk(product.get('specifications', {}))
-    for fld in ('dimensions', 'weight'):
-        val = product.get(fld)
-        if val:
-            count += _count_value_numeric(val)
+    count = walk(product.get('specifications', {}))
+    count += walk(product.get('dimensions'), 'dimensions')
+    count += walk(product.get('weight'), 'Масса')
     return count
-
 
 def collapse_chelaz_size_variants(pages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """D85 (типоразмеры + URL-алиасы chelaz.ru, вариант A): в каталоге /katalog/.../<модель>/
@@ -198,6 +236,11 @@ class CompanyStatistics:
         self.files_conversion_failed = 0
         
         self.errors = []
+        self.update_mode = False
+        self.crawl_status = 'unknown'
+        self.crawl_stop_reason = ''
+        self.crawl_stop_reasons = []
+        self.crawl_summary = {}
     
     def finish(self):
         self.end_time = time.time()
@@ -247,6 +290,11 @@ class CompanyStatistics:
             'files_converted': self.files_converted,
             'files_conversion_failed': self.files_conversion_failed,
             'processing_time': self.get_processing_time(),
+            'update_mode': self.update_mode,
+            'crawl_status': self.crawl_status,
+            'crawl_stop_reason': self.crawl_stop_reason,
+            'crawl_stop_reasons': self.crawl_stop_reasons,
+            'crawl_summary': self.crawl_summary,
             'errors': self.errors
         }
 
@@ -259,6 +307,7 @@ class Statistics:
         self.pages_processed = 0
         self.companies_processed = 0
         self.companies_success = 0
+        self.companies_partial = 0
         self.companies_failed = 0
         
         self.total_input_tokens = 0
@@ -315,6 +364,7 @@ class Statistics:
 Общее время выполнения: {self.get_execution_time()}
 Обработано компаний: {self.companies_processed}
 - Успешно: {self.companies_success}
+- Частично: {self.companies_partial}
 - С ошибками: {self.companies_failed}
 Обработано страниц: {self.pages_processed}
 ----------------------------------------
@@ -451,7 +501,7 @@ class MonitoringSystem:
         self._processing_urls = set()
         self._processing_urls_lock = asyncio.Lock()
         self._processing_product_ids = set()
-        self._processing_product_ids_lock = asyncio.Lock()
+        self._processing_product_ids_lock = asyncio.Condition()
         # Лок сериализации чекпоинтов из воркеров потоковой обработки
         self._stream_ckpt_lock = asyncio.Lock()
         
@@ -465,10 +515,10 @@ class MonitoringSystem:
         
         # Кэши для быстрой проверки дубликатов
         self._global_processed_product_ids = set()
-        # D59 (C): дедуп кросс-доменных/путь-версий одного товара по слагу — НА СТАДИИ
+        # Дедуп подтверждённых адресных дублей товара — НА СТАДИИ
         # УСПЕШНОГО извлечения (не на crawl), чтобы провалившаяся версия (soft-404 на
         # основном домене холдинга) не блокировала рабочую со вторичного домена. Ключ —
-        # crawler._product_dedup_key(source_url) = <группа доменов>|<слаг>.
+        # crawler._product_dedup_key(source_url) сохраняет полный адрес товара без схемы.
         self._global_processed_slug_keys = set()
         self._processing_slug_keys = set()
         self._global_processed_file_ids = set()
@@ -693,31 +743,46 @@ class MonitoringSystem:
                 company_dir
             )
             
-            if 'error' in crawl_result:
-                return {
-                    'status': 'crawling_error',
-                    'error': crawl_result['error'],
-                    'products': [],
-                    'downloaded_files': []
-                }
-            
+            crawl_status = crawl_result.get('crawl_status', 'unknown')
+            stop_reason = crawl_result.get('stop_reason') or (
+                'completeness_unknown' if crawl_status == 'unknown' else '')
+            stop_reasons = list(crawl_result.get('stop_reasons') or [])
+            if stop_reason and stop_reason not in stop_reasons:
+                stop_reasons.append(stop_reason)
+            summary = {key: value for key, value in crawl_result.items()
+                       if key in ('attempted_pages', 'fetched_pages', 'successful_urls',
+                                  'failed_attempts', 'failed_pages', 'total_pages',
+                                  'resumed_pages', 'processing_errors', 'usable_pages')
+                       or key.startswith(('pending_', 'remaining_'))}
+            failed = crawl_status == 'failed' or ('error' in crawl_result and crawl_status != 'partial')
+            status = 'crawling_error' if failed else 'success' if crawl_status == 'complete' else 'partial'
             self.statistics.pages_processed += crawl_result.get('total_pages', 0)
-            
-            return {
-                'status': 'success',
+            result = {
+                'status': status,
+                'crawl_status': crawl_status,
+                'stop_reason': stop_reason,
+                'stop_reasons': stop_reasons,
+                'crawl_summary': summary,
                 'crawl_data': crawl_result,
-                # P05 U2 / ревью слияния F1: гейт D167 в process_company читает working_url
-                # из этого словаря, а не из вложенного crawl_data
                 'working_url': crawl_result.get('working_url'),
                 'products_count': len(crawl_result.get('products', [])),
                 'files_count': len(crawl_result.get('downloaded_files', [])),
                 'stored_pages': crawl_result.get('stored_pages', [])
             }
-            
+            if status != 'success':
+                result['error'] = crawl_result.get('error') or stop_reason or 'Краулинг не завершён'
+            return result
+
         except Exception as e:
             log.error(f"Ошибка краулинга сайта {company_data['website']}: {e}")
             return {
                 'status': 'error',
+                'crawl_status': 'failed',
+                'stop_reason': 'internal_error',
+                'stop_reasons': ['internal_error'],
+                'crawl_summary': {},
+                'crawl_data': {},
+                'stored_pages': [],
                 'error': str(e),
                 'products': [],
                 'downloaded_files': []
@@ -821,14 +886,6 @@ class MonitoringSystem:
             self._processing_urls.add(normalized_url)
         
         try:
-            # Проверяем в хранилище
-            is_processed = await self.crawler.temp_storage.is_page_processed(
-                normalized_url, company_data['original_name'], page['category']
-            )
-            if is_processed:
-                log.info(f"Страница уже обработана в хранилище, пропускаем: {normalized_url}")
-                return None
-
             # Загружаем HTML из временного хранилища
             storage_result = await self.crawler.temp_storage.load_cleaned_html(page['file_path'])
             if not storage_result:
@@ -836,11 +893,62 @@ class MonitoringSystem:
             
             html_content = storage_result['html_content']
             metadata = storage_result['metadata']
-            
+            cached_ai_data = None
+            revision = product_extraction_revision(metadata.get('url', ''))
+            cache_current = not revision or metadata.get('product_extraction_revision') == revision
+            if metadata.get('checkpoints', {}).get('ai_processed', False) and cache_current:
+                cached_product = metadata.get('product_result')
+                if page['category'] == 'product' and cached_product:
+                    product = dict(cached_product, metadata=metadata)
+                    product['source_url'] = resolve_product_source_url(metadata.get('url', ''), html_content)
+                    async with self._processing_product_ids_lock:
+                        await self._processing_product_ids_lock.wait_for(
+                            lambda: product['product_id'] not in self._processing_product_ids)
+                        if product['product_id'] in self._global_processed_product_ids:
+                            return None
+                        self._global_processed_product_ids.add(product['product_id'])
+                        key = self.crawler._product_dedup_key(product['source_url'])
+                        if key:
+                            self._global_processed_slug_keys.add(key)
+                    self._global_processed_urls.add(normalized_url)
+                    # При изменении адреса при том же содержимом обновляем ссылку карточки.
+                    if product['source_url'] != cached_product.get('source_url'):
+                        try:
+                            folder, _ = self._get_product_folder_path(company_dir, product['product_id'], product['name'])
+                            await self.docx_generator.generate_product_card(product, company_data, folder)
+                        except Exception as e:
+                            log.error(f"Ошибка обновления карточки сохранённого товара: {e}")
+                        try:
+                            await self.crawler.temp_storage.save_product_result(page['file_path'], product)
+                        except Exception as e:
+                            log.error(f"Ошибка сохранения кэша товара {normalized_url}: {e}")
+                    return product
+                # Старые метаданные не содержат product_result: используем сохранённый
+                # JSON модели, если он есть. Запрос к модели для той же версии не нужен.
+                ai_path = metadata.get('ai_text_path')
+                if page['category'] == 'product' and ai_path and Path(ai_path).is_file():
+                    try:
+                        async with aiofiles.open(ai_path, 'r', encoding='utf-8') as f:
+                            saved_ai = await f.read()
+                        cached_ai_data = json.loads(saved_ai.split('=' * 60)[1].strip())
+                    except (OSError, ValueError, IndexError):
+                        log.warning(f"Не удалось прочитать сохранённый результат AI: {ai_path}")
+                if cached_ai_data is None:
+                    # Один флаг без результата не позволяет восстановить товар для графа.
+                    log.warning(f"Результат обработанной версии недоступен, повторяем извлечение: {normalized_url}")
+
             # Обработка продуктовых страниц
             if page['category'] == 'product':
-                product_data = await self.process_product_page(html_content, company_data, company_stats, metadata, company_dir)
+                if cached_ai_data is None:
+                    product_data = await self.process_product_page(html_content, company_data, company_stats, metadata, company_dir)
+                else:
+                    product_data = await self.process_product_page(html_content, company_data, company_stats, metadata, company_dir,
+                                                                   cached_ai_data=cached_ai_data)
                 if product_data:
+                    try:
+                        await self.crawler.temp_storage.save_product_result(page['file_path'], product_data)
+                    except Exception as e:
+                        log.error(f"Ошибка сохранения кэша товара {normalized_url}: {e}")
                     # Успешная обработка - добавляем URL в глобальный кэш
                     async with self._processing_urls_lock:
                         self._global_processed_urls.add(normalized_url)
@@ -869,6 +977,9 @@ class MonitoringSystem:
             async with self._processing_urls_lock:
                 self._processing_urls.discard(normalized_url)
             return None
+        finally:
+            async with self._processing_urls_lock:
+                self._processing_urls.discard(normalized_url)
 
     async def _second_pass_product_extraction(self, all_pages: List[Dict], company_data: Dict[str, str],
                                               company_stats: CompanyStatistics,
@@ -1063,14 +1174,14 @@ class MonitoringSystem:
 
     async def process_product_page(self, html_content: str, company_data: Dict[str, str],
                                 company_stats: CompanyStatistics, metadata: Dict, 
-                                company_dir: str) -> Optional[Dict[str, Any]]:
+                                company_dir: str, *, cached_ai_data: Optional[Dict] = None) -> Optional[Dict[str, Any]]:
         """Обработка продуктовой страницы с JSON-данными"""
         product_id = None
         # Флаг владения product_id в _processing_product_ids: снимать флаг в finally
         # имеет право только задача, которая его поставила (иначе задача-дубликат
         # стирает флаг у работающей задачи и та падает на remove() с KeyError)
         product_id_acquired = False
-        slug_key = None            # D59 (C): ключ склейки версий товара по слагу
+        slug_key = None            # ключ полного адреса товара после редиректа
         slug_key_acquired = False  # владелец slug_key в _processing_slug_keys (как product_id)
         try:
             current_time = datetime.now().isoformat()
@@ -1098,23 +1209,33 @@ class MonitoringSystem:
                 parsed_url = urlparse(base_domain)
                 base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
+            # Полный Markdown сохраняется для аудита; большие ряды восстанавливаются из HTML.
+            compact_html = compact_source_tables(html_content, metadata.get('url', ''))
+            prompt_markdown = (markdown_content if compact_html == html_content else
+                               html_to_markdown(compact_html, url=metadata.get('url', '')))
+
             # Добавляем метаданные в промпт
             enhanced_text = f"""
             Производитель: {manufacturer_name}
             URL страницы: {metadata.get('url', '')}
 
-            {markdown_content}                
+            {prompt_markdown}                
             """
             
-            # Получаем JSON данные от AI
-            with self.processing_tracker.clean_span('ai'):
-                ai_data, token_usage = await self.ai_client.extract_product_info(
-                enhanced_text,
-                manufacturer_name,
-                base_domain,
-                page_url=metadata.get('url', '')
-            )                                
-            
+            # Сохранённый ответ относится к точно той же версии HTML.
+            family_catalog_reason = source_family_catalog_reason(html_content, metadata.get('url', ''))
+            if family_catalog_reason:
+                ai_data = {'error': 'Trash_418#', 'source_rejection': family_catalog_reason}
+                token_usage = {'input_tokens': 0, 'output_tokens': 0}
+            elif cached_ai_data is not None:
+                ai_data = cached_ai_data
+                token_usage = {'input_tokens': 0, 'output_tokens': 0}
+            else:
+                with self.processing_tracker.clean_span('ai'):
+                    ai_data, token_usage = await self.ai_client.extract_product_info(
+                        enhanced_text, manufacturer_name, base_domain,
+                        page_url=metadata.get('url', ''))
+
             text_type = "product"
             is_product = False
             
@@ -1139,6 +1260,22 @@ class MonitoringSystem:
             # тех.характеристик (параметрический поиск завязан на числовые значения характеристик;
             # габариты AAA×BBB×CCC считаются по числу осей). Пустой specifications — тоже не товар.
             elif isinstance(ai_data, dict) and "product" in ai_data:
+                try:
+                    restore_source_tables(ai_data, html_content, metadata.get('url', ''))
+                    restore_deterministic_tables(ai_data, html_content, metadata.get('url', ''))
+                    restore_source_product(ai_data, html_content, metadata.get('url', ''))
+                    restore_labelled_instructions(ai_data, html_content, metadata.get('url', ''))
+                    normalize_product_fields(ai_data, enhanced_text)
+                    restore_quality_source_fields(ai_data, html_content, metadata.get('url', ''))
+                    restore_labelled_product_sections(ai_data, html_content, metadata.get('url', ''))
+                    restore_visible_product_sections(ai_data, html_content, metadata.get('url', ''))
+                    restore_source_detail_fields(ai_data, html_content, metadata.get('url', ''))
+                    restore_bitumex_source_sections(ai_data, html_content, metadata.get('url', ''))
+                    restore_source_variant_name(ai_data, html_content, metadata.get('url', ''))
+                except TableStructureError as exc:
+                    log.error(f"Таблица не перенесена без потерь, страница будет повторена: {metadata.get('url', '')}: {exc}")
+                    company_stats.products_failed += 1
+                    return None
                 product_data_ai = ai_data.get("product") or {}
                 specifications = product_data_ai.get("specifications", {})
                 numeric_specs = count_numeric_characteristics(product_data_ai)
@@ -1237,47 +1374,34 @@ class MonitoringSystem:
                 company_stats.products_failed += 1
                 return None
             
-            # АТОМАРНАЯ проверка дубликатов product_id ПОСЛЕ генерации
+            source_url = resolve_product_source_url(metadata.get('url', ''), html_content)
+            slug_key = self.crawler._product_dedup_key(source_url) if self.crawler else None
+
+            # Повтор ждёт результат владельца ID/URL-ключа. При ошибке владельца
+            # ключ освобождается, и повтор сам обрабатывает товар. wait_for отпускает лок.
             async with self._processing_product_ids_lock:
+                await self._processing_product_ids_lock.wait_for(
+                    lambda: product_id in self._global_processed_product_ids
+                    or (slug_key and slug_key in self._global_processed_slug_keys)
+                    or (product_id not in self._processing_product_ids
+                        and (not slug_key or slug_key not in self._processing_slug_keys)))
                 if product_id in self._global_processed_product_ids:
                     log.info(f"Товар уже обработан (глобально), пропускаем: {product_id}")
-                    company_stats.products_skipped_duplicate += 1
-                    self.statistics.total_products_skipped_duplicate += 1
-                    await self.crawler.temp_storage.mark_as_ai_processed(
-                        metadata.get('storage_path', ''), 
-                        ai_text_path
-                    )
-                    return None
-                if product_id in self._processing_product_ids:
-                    log.debug(f"Товар уже в обработке: {product_id}")
-                    company_stats.products_skipped_duplicate += 1
-                    self.statistics.total_products_skipped_duplicate += 1
-                    await self.crawler.temp_storage.mark_as_ai_processed(
-                        metadata.get('storage_path', ''),
-                        ai_text_path
-                    )
-                    return None
-                # D59 (C): кросс-доменные/путь-версии одного товара дают РАЗНЫЕ имена (значит
-                # разные product_id — проверки выше их не ловят). Склеиваем по слагу. Точка
-                # достигается только для УСПЕШНО извлечённого товара (Trash_418#/soft-404
-                # возвращаются раньше), поэтому провалившаяся версия ключ не занимает и не
-                # блокирует рабочую версию со вторичного домена холдинга.
-                slug_key = self.crawler._product_dedup_key(metadata.get('url', '')) if self.crawler else None
-                if slug_key and (slug_key in self._global_processed_slug_keys
-                                 or slug_key in self._processing_slug_keys):
-                    log.info(f"D59 (C): дубль товара по слагу ({slug_key}), пропускаем URL: {metadata.get('url','')}")
-                    company_stats.products_skipped_duplicate += 1
-                    self.statistics.total_products_skipped_duplicate += 1
-                    await self.crawler.temp_storage.mark_as_ai_processed(
-                        metadata.get('storage_path', ''),
-                        ai_text_path
-                    )
-                    return None
-                self._processing_product_ids.add(product_id)
-                product_id_acquired = True
-                if slug_key:
-                    self._processing_slug_keys.add(slug_key)
-                    slug_key_acquired = True
+                elif slug_key and slug_key in self._global_processed_slug_keys:
+                    log.info(f"Дубль товара по адресу ({slug_key}), пропускаем URL: {metadata.get('url','')}")
+                else:
+                    self._processing_product_ids.add(product_id)
+                    product_id_acquired = True
+                    if slug_key:
+                        self._processing_slug_keys.add(slug_key)
+                        slug_key_acquired = True
+
+            if not product_id_acquired:
+                company_stats.products_skipped_duplicate += 1
+                self.statistics.total_products_skipped_duplicate += 1
+                await self.crawler.temp_storage.mark_as_ai_processed(
+                    metadata.get('storage_path', ''), ai_text_path)
+                return None
 
             try:
                 # Извлекаем ссылки на изображения из JSON
@@ -1315,7 +1439,7 @@ class MonitoringSystem:
                     'product_id': product_id, 
                     'name': product_name,                       
                     'ai_raw_text': ai_data, 
-                    'source_url': metadata.get('url', ''),
+                    'source_url': source_url,
                     'product_folder': product_folder_rel,  
                     'manufacturer': manufacturer, 
                     'original_manufacturer': company_data['original_name'],
@@ -1326,17 +1450,6 @@ class MonitoringSystem:
                     'file_ids': [f.get('id') for f in downloaded_files_with_ids],
                     'files': downloaded_files_with_ids
                 }
-
-                # Добавляем в глобальный кэш product_id
-                async with self._processing_product_ids_lock:
-                    self._global_processed_product_ids.add(product_id)
-                    self._processing_product_ids.remove(product_id)
-                    # D59 (C): фиксируем слаг как обработанный ТОЛЬКО здесь (успех), чтобы
-                    # следующие URL-версии того же товара схлопнулись в одну карточку.
-                    if slug_key_acquired:
-                        self._global_processed_slug_keys.add(slug_key)
-                        self._processing_slug_keys.discard(slug_key)
-                        slug_key_acquired = False
 
                 # Помечаем страницу как обработанную
                 await self.crawler.temp_storage.mark_as_ai_processed(
@@ -1357,13 +1470,26 @@ class MonitoringSystem:
                     log.error(f"Ошибка генерации карточки товара: {e}")
                     # Продолжаем обработку даже при ошибке генерации карточки
             
+                # Успех фиксируется перед возвратом товара: сбой записи метаданных
+                # выше не должен блокировать рабочую URL-версию.
+                async with self._processing_product_ids_lock:
+                    self._global_processed_product_ids.add(product_id)
+                    self._processing_product_ids.discard(product_id)
+                    product_id_acquired = False
+                    if slug_key_acquired:
+                        self._global_processed_slug_keys.add(slug_key)
+                        self._processing_slug_keys.discard(slug_key)
+                        slug_key_acquired = False
+                    self._processing_product_ids_lock.notify_all()
                 company_stats.products_processed += 1
                 return product_data
                 
             finally:
-                # В любом случае удаляем product_id из processing
-                async with self._processing_product_ids_lock:
-                    self._processing_product_ids.discard(product_id)
+                if product_id_acquired:
+                    async with self._processing_product_ids_lock:
+                        self._processing_product_ids.discard(product_id)
+                        product_id_acquired = False
+                        self._processing_product_ids_lock.notify_all()
 
         except Exception as e:
             log.error(f"Ошибка обработки продуктовой страницы: {e}")
@@ -1376,11 +1502,13 @@ class MonitoringSystem:
             if product_id and product_id_acquired:
                 async with self._processing_product_ids_lock:
                     self._processing_product_ids.discard(product_id)
-            # D59 (C): если слаг остался в processing (провал ДО фиксации в global) —
+                    self._processing_product_ids_lock.notify_all()
+            # Если адресный ключ остался в processing (провал ДО фиксации в global) —
             # снимаем, чтобы другая URL-версия товара могла быть обработана (не терять товар).
             if slug_key_acquired:
                 async with self._processing_product_ids_lock:
                     self._processing_slug_keys.discard(slug_key)
+                    self._processing_product_ids_lock.notify_all()
 
     async def load_existing_ids_from_index(self):
         """Загрузка существующих ID из векторной БД"""
@@ -1923,7 +2051,47 @@ class MonitoringSystem:
         except Exception as e:
             log.error(f"Ошибка при сохранении компании в pending список: {e}")
 
+    async def _prepare_company_crawl(self, company_data: Dict, force_restart: bool = False):
+        """Продолжение только явно идентифицированного незавершённого прохода компании."""
+        checkpoint = None
+        if not force_restart and not pipeline_control.ignore_checkpoint():
+            checkpoint = await self.checkpoint_manager.load_checkpoint()
+        previous = checkpoint.current_company if checkpoint else {}
+        finished_stages = {'company_completed', 'paused_for_urgent', 'stopped_by_admin'}
+        resume_id = (previous.get('_crawl_run_id')
+                     if checkpoint and checkpoint.current_stage not in finished_stages
+                     and str(previous.get('company_id')) == str(company_data.get('company_id'))
+                     and previous.get('_monitoring_task_id') == company_data.get('_monitoring_task_id')
+                     else None)
+        company_data['_crawl_run_id'] = resume_id or uuid4().hex
+        # Дедупликация извлечения ограничена одной компанией и одним проходом.
+        # Статус AI хранится у конкретной версии HTML, а не у URL навсегда.
+        self._global_processed_urls.clear()
+        self._global_processed_product_ids.clear()
+        self._global_processed_slug_keys.clear()
+        self._global_processed_file_ids.clear()
+        self._global_processed_distributor_ids.clear()
+        self._processing_urls.clear()
+        await self.crawler.reset_state(company_data['original_name'],
+                                       crawl_run_id=company_data['_crawl_run_id'],
+                                       resume=bool(resume_id))
+
     async def process_company(self, company_data: Dict[str, str], force_restart: bool = False) -> Dict[str, Any]:
+        # Bot и pipeline используют общий каталог Bot в bind-mount.
+        bot_dir = os.path.join(os.path.dirname(self.config.documents_dir), 'Bot')
+        cid = company_data['company_id']
+        async with company_update_lock(bot_dir, cid):
+            state = company_state_path(bot_dir, cid)
+            state.write_text('updating')
+            result = await self._process_company_locked(company_data, force_restart)
+            stats = result.get('company_statistics', {})
+            ready = stats.get('graph_db_uploaded') and stats.get('crawl_status') == 'complete'
+            state.write_text('ready' if ready else ('awaiting_graph'
+                             if stats.get('crawl_status') == 'complete' and self.config.graph_db_enable
+                             else 'incomplete'))
+            return result
+
+    async def _process_company_locked(self, company_data: Dict[str, str], force_restart: bool = False) -> Dict[str, Any]:
         log.info(f"Обработка компании: {company_data['original_name']}")
         
         # # Определяем домен для профиля
@@ -1974,8 +2142,8 @@ class MonitoringSystem:
         processed_urls_at_start = len(self._global_processed_urls)
         processed_product_ids_at_start = len(self._global_processed_product_ids)
 
-        # Сбрасываем состояние краулера и загружаем обработанные URL из хранилища
-        await self.crawler.reset_state(company_data['original_name'])
+        # Выбираем новый мониторинг или возобновление идентифицированного прохода
+        await self._prepare_company_crawl(company_data, force_restart)
 
         company_stats = CompanyStatistics(company_data)
         self.processing_tracker.set_current_company(company_data.get('company_id'))
@@ -2034,6 +2202,14 @@ class MonitoringSystem:
             log.info(f"Запуск краулинга для {company_data['website']}")
             crawl_result = await self.full_site_crawling(company_data, company_dir)
             result['crawling_result'] = crawl_result
+            company_stats.crawl_status = crawl_result.get('crawl_status', 'unknown')
+            company_stats.crawl_stop_reason = crawl_result.get('stop_reason', 'completeness_unknown')
+            company_stats.crawl_stop_reasons = list(crawl_result.get('stop_reasons') or [])
+            company_stats.crawl_summary = dict(crawl_result.get('crawl_summary') or {})
+            result['crawl_status'] = company_stats.crawl_status
+            result['stop_reason'] = company_stats.crawl_stop_reason
+            result['stop_reasons'] = company_stats.crawl_stop_reasons
+            result['crawl_summary'] = company_stats.crawl_summary
 
             # Потоковая обработка: краул закончился — дожидаемся «хвоста» очереди
             # (выполняется и на ветке неуспешного краула, чтобы не оставить воркеров)
@@ -2045,7 +2221,7 @@ class MonitoringSystem:
                 log.info(f"Потоковая обработка завершена: {len(streamed_products)} товаров "
                          f"извлечено параллельно с краулом")
 
-            if crawl_result['status'] != 'success':
+            if crawl_result['status'] not in ('success', 'partial'):
                 result['status'] = 'crawling_failed'
                 error_msg = f"Ошибка краулинга: {crawl_result.get('error')}"
                 company_stats.errors.append(error_msg)
@@ -2066,6 +2242,20 @@ class MonitoringSystem:
                     error_type='crawling_error',
                     company_stats=company_stats
                 )
+                result['error'] = error_msg
+                result['company_statistics'] = company_stats.to_dict()
+                self._finalize_profiling(crawl_result, company_stats)
+                await self.checkpoint_manager.save_checkpoint(
+                    company_data=company_data,
+                    processed_urls=self._global_processed_urls,
+                    stage="crawling_failed",
+                    progress={"status": "crawling_failed", "crawl_status": company_stats.crawl_status,
+                              "stop_reason": company_stats.crawl_stop_reason,
+                              "stop_reasons": company_stats.crawl_stop_reasons,
+                              "crawl_summary": company_stats.crawl_summary},
+                    company_stats=company_stats.to_dict(), errors=[error_msg])
+                self.statistics.companies_processed += 1
+                self.statistics.companies_failed += 1
                 return result
             
             else:
@@ -2100,7 +2290,11 @@ class MonitoringSystem:
                 processed_urls=self._global_processed_urls,
                 stage="crawling_completed",
                 progress={
-                    "status": "crawling_done",
+                    "status": "crawling_done" if company_stats.crawl_status == 'complete' else "crawling_partial",
+                    "crawl_status": company_stats.crawl_status,
+                    "stop_reason": company_stats.crawl_stop_reason,
+                    "stop_reasons": company_stats.crawl_stop_reasons,
+                    "crawl_summary": company_stats.crawl_summary,
                     "pages_found": len(stored_pages),
                     "products_found": len(product_pages),
                     "distributors_found": len(distributor_pages),
@@ -2117,13 +2311,14 @@ class MonitoringSystem:
             # Получаем domain_dirs для скачивания файлов
             domain_dirs = self._get_domain_dirs(company_data['website'], company_data, company_dir)
             
-            # Получаем необработанные страницы из хранилища
-            unprocessed_pages_from_storage = await self.crawler.temp_storage.get_unprocessed_pages(company_data['original_name'])
+            # Берём только актуальные страницы, проверенные в этом проходе;
+            # сохранённые результаты товаров нужны для возобновления отправки.
+            current_pages_from_storage = await self.crawler.temp_storage.get_company_files(company_data['original_name'])
             
-            # Объединяем страницы из краулера и необработанные из хранилища
+            # Объединяем страницы краулера с проверенными версиями текущего прохода
             all_pages_dict = {}
             
-            for page in unprocessed_pages_from_storage:
+            for page in current_pages_from_storage:
                 normalized_url = page['metadata'].get('normalized_url')
                 if normalized_url:
                     all_pages_dict[normalized_url] = {
@@ -2160,7 +2355,7 @@ class MonitoringSystem:
             self.statistics.distributor_pages_processed += company_stats.distributor_pages_processed
             self.statistics.company_pages_processed += company_stats.company_pages_processed
             
-            log.info(f"Начинаем обработку {len(all_pages)} страниц (из краулера: {len(stored_pages)}, из хранилища: {len(unprocessed_pages_from_storage)})")
+            log.info(f"Начинаем обработку {len(all_pages)} страниц (из краулера: {len(stored_pages)}, из хранилища: {len(current_pages_from_storage)})")
             
                         # 1. Обработка страниц компании
             log.info("Получение актуального наименования компании через AI")
@@ -2433,13 +2628,23 @@ class MonitoringSystem:
             
             # === КОНЕЦ КОНВЕРТАЦИИ ФАЙЛОВ ===
 
+            if company_stats.crawl_status != 'complete' and result['status'] == 'success':
+                result['status'] = 'partial'
+                result['error'] = f"Неполный краулинг: {company_stats.crawl_stop_reason}"
+                result['errors'].append(result['error'])
+                company_stats.errors.append(result['error'])
+
             # ЧЕКПОИНТ 6: Обработка компании завершена
             await self.checkpoint_manager.save_checkpoint(
                 company_data=company_data,
                 processed_urls=self._global_processed_urls,
                 stage="company_completed",
                 progress={
-                    "status": "company_processing_complete",
+                    "status": "company_processing_complete" if company_stats.crawl_status == 'complete' else "company_processing_partial",
+                    "crawl_status": company_stats.crawl_status,
+                    "stop_reason": company_stats.crawl_stop_reason,
+                    "stop_reasons": company_stats.crawl_stop_reasons,
+                    "crawl_summary": company_stats.crawl_summary,
                     "final_products": len(structured_products),
                     "final_distributors": len(structured_distributors),
                     "final_cards": company_stats.cards_generated,
@@ -2497,6 +2702,8 @@ class MonitoringSystem:
             # Очиста чекпоинта после успешной обработки
             await self.checkpoint_manager.clear_checkpoint()
             await self._trim_global_url_cache()
+        elif result['status'] == 'partial':
+            self.statistics.companies_partial += 1
         else:
             self.statistics.companies_failed += 1
         
@@ -2542,7 +2749,8 @@ class MonitoringSystem:
                 log_file=self.config.converter_log_file,
                 delete_originals=self.config.delete_originals_after_conversion,
                 delete_empty_folders=self.config.delete_empty_folders,
-                exclude_product_cards=True
+                exclude_product_cards=True,
+                download_cache_dir=getattr(self.config, 'base_dir', None)
             )
             
             # Запускаем конвертацию. run_conversion блокирующий (ThreadPoolExecutor +
@@ -3060,20 +3268,8 @@ class MonitoringSystem:
                     progress=100.0
                 )
                 
-                # Обновляем report_date в Graph DB
-                if self.config.graph_db_enable:
-                    try:
-                        company_id = urgent_task.company_data.get('company_id')
-                        if company_id:
-                            current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            success = await self.graph_db_uploader.update_company_report_date(
-                                company_id, current_date
-                            )
-                            if success:
-                                log.info(f"report_date обновлен для urgent компании {company_id}")
-                    except Exception as e:
-                        log.error(f"Ошибка обновления report_date для urgent компании: {e}")
-                
+                # Дату отчёта фиксирует бот после подтверждённой выдачи архива.
+
                 log.info(f"URGENT задача {urgent_task.task_id} успешно обработана")
             else:
                 error_msg = result.get('error', 'Неизвестная ошибка')

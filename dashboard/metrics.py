@@ -17,7 +17,9 @@
 
 import glob
 import os
+import re
 import statistics
+import threading
 from datetime import datetime, timedelta
 
 from common import (cfg_value, latest_run_id, list_run_ids, logs_dir,
@@ -94,19 +96,76 @@ def summary(run_id=None):
     }
 
 
+_MODE_LINE = re.compile(
+    (r'(?m)^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ - main - INFO - '
+     r'Режим (ОБНОВЛЕНИЯ|ПЕРВИЧНОЙ ЗАГРУЗКИ) для компании: ([^\r\n]+)\r?\n').encode('utf-8'))
+_MODE_CACHE = {'identity': None, 'offset': 0, 'events': {}}
+_MODE_LOCK = threading.Lock()
+
+
+def _processing_modes(records, run):
+    """Старые JSONL не содержат режима: восстанавливаем его по журналу этого прогона."""
+    modes = []
+    for record in records:
+        mode = record.get('processing_mode')
+        update = (record.get('statistics') or {}).get('update_mode')
+        modes.append(mode if mode in ('initial', 'update') else
+                     'update' if update is True else 'initial' if update is False else None)
+    start = (run.get('started_at') or '')[:19]
+    if not start or all(mode is not None for mode in modes):
+        return modes
+    path = os.path.join(logs_dir(), 'monitoring.log')
+    with _MODE_LOCK:
+        try:
+            with open(path, 'rb') as source:
+                info = os.fstat(source.fileno())
+                identity = (path, info.st_dev, info.st_ino)
+                if identity != _MODE_CACHE['identity'] or info.st_size < _MODE_CACHE['offset']:
+                    _MODE_CACHE.update(identity=identity, offset=0, events={})
+                source.seek(_MODE_CACHE['offset'])
+                remainder = b''
+                # Один проход по старому журналу; дальше читается только дописанный хвост.
+                while source.tell() < info.st_size:
+                    data = source.read(min(1048576, info.st_size - source.tell()))
+                    if not data:
+                        break
+                    chunk = remainder + data
+                    end = chunk.rfind(b'\n') + 1
+                    for match in _MODE_LINE.finditer(chunk, 0, end):
+                        stamp, mode, name = [item.decode('utf-8') for item in match.groups()]
+                        event = (stamp.replace(' ', 'T'),
+                                 'update' if mode == 'ОБНОВЛЕНИЯ' else 'initial')
+                        _MODE_CACHE['events'].setdefault(name, []).append(event)
+                    remainder = chunk[end:]
+                _MODE_CACHE['offset'] = source.tell() - len(remainder)
+        except OSError:
+            return modes
+        for index, record in enumerate(records):
+            finish = (record.get('ts') or '')[:19]
+            if modes[index] is None and finish:
+                events = [event for event in _MODE_CACHE['events'].get(record.get('name'), [])
+                          if start <= event[0] <= finish]
+                if events:
+                    modes[index] = max(events, key=lambda event: event[0])[1]
+    return modes
+
+
 def companies(run_id=None):
     """Метрики по компаниям прогона (§4 /metrics/companies)."""
     run_id = run_id or latest_run_id()
     if not run_id:
         return {'run_id': None, 'companies': []}
     rows = []
-    for r in read_companies_jsonl(run_id):
+    records = read_companies_jsonl(run_id)
+    modes = _processing_modes(records, _run_json(run_id) or {})
+    for r, processing_mode in zip(records, modes):
         stats = r.get('statistics') or {}
         rows.append({
             'company_id': r.get('company_id'),
             'name': r.get('name'),
             'website': r.get('website'),
             'kind': r.get('kind'),
+            'processing_mode': processing_mode,
             'status': r.get('status'),
             'zero': _is_zero_company(r),
             'duration_seconds': r.get('duration_seconds'),
@@ -242,21 +301,58 @@ def errors_by_module(run_id=None):
             'companies_failed': companies_failed, 'total_errors': total_errors}
 
 
+def _all_logs_tail(lines):
+    """События двух процессов; строки трассировки остаются рядом со своей записью."""
+    records, sources, details = [], [], []
+    for source, label in (('bot', 'Бот'), ('monitoring', 'Пайплайн')):
+        try:
+            result = log_tail(lines=1000, source=source)
+        except OSError as exc:
+            result = {'lines': [], 'modified_at': None, 'detail': str(exc)}
+        sources.append({'source': source, **{k: v for k, v in result.items() if k != 'lines'}})
+        if result.get('detail'):
+            details.append(label + ': ' + result['detail'])
+        current = None
+        for line in result['lines']:
+            match = re.match(r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?', line)
+            if match or current is None:
+                stamp = match.group().replace('T', ' ').replace(',', '.') if match else ''
+                current = (stamp, [f'[{label}] {line}'])
+                records.append(current)
+            else:
+                current[1].append(line)
+    records.sort(key=lambda item: item[0])
+    modified = [s['modified_at'] for s in sources if s.get('modified_at')]
+    return {'path': None, 'sources': sources, 'detail': '; '.join(details),
+            'modified_at': max(modified) if modified else None,
+            'lines': [line for _, event in records for line in event][-lines:]}
+
+
 def log_tail(lines=200, source='monitoring'):
-    """Хвост лога: monitoring (лог пайплайна) или stdout (вывод подпроцесса)."""
+    """Хвост отдельного лога или общий журнал модулей бота и пайплайна."""
     lines = max(1, min(int(lines), 1000))
+    if source == 'all':
+        return _all_logs_tail(lines)
     if source == 'stdout':
         path = os.path.join(runs_dir(), 'pipeline_stdout.log')
+    elif source == 'bot':
+        path = os.path.join(logs_dir(), 'pachka_bot.log')
+    elif source == 'bot-rebuild':
+        path = os.path.join(runs_dir(), 'bot_rebuild.log')
     else:
         path = os.path.join(logs_dir(), 'monitoring.log')
     if not os.path.isfile(path):
-        return {'path': path, 'lines': [], 'detail': 'файл ещё не создан'}
+        return {'path': path, 'lines': [], 'detail': 'файл ещё не создан', 'modified_at': None}
     with open(path, 'rb') as f:
+        modified_at = datetime.fromtimestamp(os.fstat(f.fileno()).st_mtime).isoformat()
         f.seek(0, os.SEEK_END)
         size = f.tell()
-        f.seek(max(0, size - 262144))  # последние 256 КБ достаточно для 1000 строк
+        offset = max(0, size - 262144)  # ограничиваем чтение последних 256 КБ
+        f.seek(offset)
+        if offset:
+            f.readline()  # отбрасываем начало неполной строки, в том числе UTF-8
         tail = f.read().decode('utf-8', errors='replace')
-    return {'path': path, 'lines': tail.splitlines()[-lines:]}
+    return {'path': path, 'lines': tail.splitlines()[-lines:], 'modified_at': modified_at}
 
 
 def runs(limit=100):

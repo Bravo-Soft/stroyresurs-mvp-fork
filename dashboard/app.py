@@ -5,7 +5,7 @@
 # Контракт (§2, §4, §9):
 #   * одно FastAPI-приложение, порт :5510;
 #   * все эндпоинты под /api/v1, авторизация — статический токен:
-#     Authorization: Bearer <env DASHBOARD_TOKEN>;
+#     DASHBOARD_TOKEN — администратор, DASHBOARD_IT_TOKEN — ИТ-специалист;
 #   * API-first: UI (static/index.html) только вызывает эти же эндпоинты,
 #     поэтому всё автоматизируемо и тестируемо без браузера;
 #   * fail-open чтения: недоступный backend или отсутствующий файл метрик
@@ -26,11 +26,12 @@ import urllib.request
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import companies as companies_mod
+import bot_control
 import journal
 import metrics
 import profiles_store
@@ -49,18 +50,60 @@ API_PREFIX = '/api/v1'
 # ============================== авторизация ==================================
 
 def require_token(authorization: str = Header(default='', alias='Authorization')):
-    """Статический токен в заголовке (§9). Токен — в env, не в коде."""
+    """Роль определяется только серверным токеном; прежний токен остаётся админским."""
     expected = os.environ.get('DASHBOARD_TOKEN', '')
     if not expected:
         raise HTTPException(
             status_code=503,
             detail='DASHBOARD_TOKEN не задан в окружении — Диспетчерская отключена')
+    it_token = os.environ.get('DASHBOARD_IT_TOKEN', '')
+    if it_token and secrets.compare_digest(it_token.encode(), expected.encode()):
+        raise HTTPException(status_code=503,
+                            detail='Токены администратора и ИТ-специалиста должны различаться')
     scheme, _, value = authorization.partition(' ')
-    if scheme.lower() != 'bearer' or not secrets.compare_digest(value.strip(), expected):
-        raise HTTPException(status_code=401, detail='Неверный или отсутствующий токен')
+    if scheme.lower() == 'bearer' and value.strip():
+        supplied = value.strip().encode()
+        if secrets.compare_digest(supplied, expected.encode()):
+            return 'admin'
+        if it_token and secrets.compare_digest(supplied, it_token.encode()):
+            return 'it'
+    raise HTTPException(status_code=401, detail='Неверный или отсутствующий токен')
 
 
-api = APIRouter(prefix=API_PREFIX, dependencies=[Depends(require_token)])
+# Новые изменяющие маршруты по умолчанию доступны только администратору.
+IT_WRITE_ROUTES = {
+    ('POST', API_PREFIX + '/bot/restart'),
+    ('PUT', API_PREFIX + '/settings'),
+}
+
+# Эти параметры позволяют обойти запрет запуска кода, управления прогоном
+# или замены профилей. Обычные настройки доступны обеим ролям.
+ADMIN_ONLY_SETTINGS = {
+    'PIPELINE_CMD', 'LIBREOFFICE_PATH', 'WATCHDOG_AUTORESTART',
+    'WATCHDOG_GRACE_SECONDS', 'COMPANY_IDLE_TIMEOUT_SECONDS', 'LOGS_DIR',
+    'PROFILES_DIR', 'PROFILES_DRAFTS_DIR',
+}
+
+
+def require_access(request: Request, role: str = Depends(require_token)):
+    """Общая проверка всех маршрутов API, до вызова обработчика и записи данных."""
+    route = request.scope.get('route')
+    if role != 'admin' and request.method not in {'GET', 'HEAD', 'OPTIONS'} \
+            and (request.method, getattr(route, 'path', None)) not in IT_WRITE_ROUTES:
+        raise HTTPException(status_code=403,
+                            detail='Недостаточно прав: действие доступно только администратору')
+
+
+api = APIRouter(prefix=API_PREFIX, dependencies=[Depends(require_access)])
+
+
+@api.get('/auth/me')
+async def auth_me(response: Response, role: str = Depends(require_token)):
+    """Права текущего пользователя для интерфейса; токены в ответ не попадают."""
+    response.headers['Cache-Control'] = 'no-store'
+    return {'role': role, 'role_label': 'Администратор' if role == 'admin' else 'ИТ-специалист',
+            'permissions': {'manage_profiles': role == 'admin',
+                            'delete_data': role == 'admin', 'control_pipeline': role == 'admin'}}
 
 
 @app.get('/')
@@ -164,8 +207,25 @@ async def run_detail(run_id: str):
 
 
 @api.get('/logs/tail')
-async def logs_tail(lines: int = 200, source: str = 'monitoring'):
+async def logs_tail(response: Response, lines: int = 200, source: str = 'monitoring'):
+    response.headers['Cache-Control'] = 'no-store'
     return metrics.log_tail(lines=lines, source=source)
+
+
+@api.get('/bot/status')
+async def bot_status():
+    return bot_control.status()
+
+
+@api.post('/bot/restart', status_code=202)
+async def bot_restart():
+    """Пересобрать и запустить только сервис bot; ход — в /bot/status."""
+    try:
+        return bot_control.restart_async()
+    except bot_control.AlreadyRunning as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except (bot_control.Unavailable, OSError) as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @api.get('/metrics/summary')
@@ -179,7 +239,7 @@ async def metrics_summary(run_id: Optional[str] = None):
 async def metrics_companies(run_id: Optional[str] = None):
     if run_id:
         _valid_run_id(run_id)
-    return metrics.companies(run_id)
+    return await asyncio.to_thread(metrics.companies, run_id)
 
 
 @api.get('/errors')
@@ -369,14 +429,28 @@ async def company_crawl(company_id: str):
 # ============================== настройки ====================================
 
 @api.get('/settings')
-async def settings_get():
+async def settings_get(role: str = Depends(require_token)):
     """Белый список параметров: текущее, дефолт, тип, «требует перезапуска» (§6)."""
-    return settings_store.read_all()
+    return _settings_for_role(role)
+
+
+def _settings_for_role(role):
+    settings = settings_store.read_all()
+    if role != 'admin':
+        settings = {**settings, 'items': [
+            {**row, 'locked': True,
+             'note': row.get('note', '') + ' Изменение доступно только администратору.'}
+            if row['name'] in ADMIN_ONLY_SETTINGS else row
+            for row in settings['items']]}
+    return settings
 
 
 @api.put('/settings')
-async def settings_put(body: SettingsRequest):
+async def settings_put(body: SettingsRequest, role: str = Depends(require_token)):
     """Сохранить значения в файл переопределений. Применятся при следующем старте (§6)."""
+    if role != 'admin' and ADMIN_ONLY_SETTINGS.intersection(body.values):
+        raise HTTPException(status_code=403,
+                            detail='Служебные параметры запуска и профилей меняет только администратор')
     try:
         diff = settings_store.save(body.values, issued_by='ui')
     except settings_store.SettingsError as e:
@@ -385,7 +459,7 @@ async def settings_put(body: SettingsRequest):
     return {'ok': True, 'diff': diff,
             'detail': ('Изменения применятся при следующем старте пайплайна; '
                        'к бегущему прогону они не применяются.'),
-            'settings': settings_store.read_all()}
+            'settings': _settings_for_role(role)}
 
 
 # ============================== профили сайтов ===============================

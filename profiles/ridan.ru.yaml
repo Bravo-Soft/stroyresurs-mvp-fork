@@ -1,0 +1,13 @@
+domain: ridan.ru
+profile_version: 1
+profiled_at: '2026-11-03'
+source: manual
+confidence: 1.0
+notes:
+- 'Дожидаемся JSON-LD организации и непустого списка дилеров; фильтры включаются до завершения AJAX.'
+crawl:
+  contact_ready_selector: >-
+    body:has(script[type="application/ld+json"]) [data-distributors-list] [data-distributor-name],
+    body:has(script[type="application/ld+json"]):not(:has([data-distributors-list]))
+sections:
+  distributor_urls: ['https://ridan.ru/distributors-and-service-partners']

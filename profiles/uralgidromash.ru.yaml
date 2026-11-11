@@ -1,0 +1,6 @@
+domain: uralgidromash.ru
+source: manual
+notes:
+- 'D41: одинаковый видимый текст /ru и без префикса подтверждён на товарных страницах.'
+crawl:
+  strip_ru_prefix_paths: [/katalog-produktsii/item/]

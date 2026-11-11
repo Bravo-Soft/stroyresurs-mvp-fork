@@ -18,10 +18,24 @@ crawl:
                               # warmup (cookie-прогрев до первого запроса) | blocked (не обрабатывать)
   ajax_tabs: false            # товарные вкладки грузятся AJAX-ом: рендер с кликами + склейка (D01)
   bitrix_offers: false        # Bitrix product_offers.php: дотянуть таблицу исполнений (D82)
+  contact_ready_selector: null # CSS-условие готовности контактов/дилеров; timeout -> incomplete_render
   tab_panel_selector: null    # пер-сайтовый селектор панели активной вкладки (доп. к глобальным)
+  inline_products: null      # товары одной страницы; только после подтверждения разметки
+  # inline_products:
+  #   paths: ['/']
+  #   item_selector: '.catalog .item'   # контейнер отдельного товара
+  #   name_selector: 'h3'             # уникальное название внутри контейнера
+  #   content_selectors: ['.details', '.documents']  # обязательные блоки того же товара
+  #   id_pattern: null               # regex существующего DOM-id; null -> текстовый якорь по названию
+  #   name_prefix_selector: null     # подпись перед названием, контекст текстового якоря при совпадающих именах
   equivalent_domains: []      # зеркала/бренд-домены, ведущие в этот же профиль
+  file_hosts: []             # точные внешние хосты для файлов/картинок; НЕ страницы/карты
   strict_www: false           # контент только на www — канонизировать К www (D: pktmt.ru)
   subdomain_collapse: []      # шаблоны '*.example.ru': поддомены схлопывать в канонический домен
+  ignored_query_params: []    # подтверждённые параметры-шум только этого сайта
+  query_noise_paths: []       # точные пути для ignored_query_params; [] = весь сайт
+  strip_ru_prefix_paths: []   # пути без /ru, где подтвержден языковой алиас
+  repair_region_entity: false # D98: восстановить ®ion= как region на АэроБел
   exclude_paths: []           # подстроки пути, не краулить для ЭТОГО домена (D69/D89/D98)
   limits:
     pages: null               # null -> config.max_pages_per_site

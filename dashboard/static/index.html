@@ -7,7 +7,7 @@
 <!--
   Тонкий UI (§2 спецификации): одна статическая страница, vanilla JS, без SPA-фреймворка
   и сборки. Вся логика — на сервере; страница только вызывает /api/v1/* (§4).
-  Пять экранов (§3): Обзор, Прогон, Компания, Настройки, Журнал.
+  Шесть экранов: Обзор, Прогон, Компания, Бот, Настройки, Журнал.
 -->
 <style>
   :root {
@@ -94,6 +94,11 @@
   .chk-list { max-height:260px; overflow:auto; border:1px solid var(--line); border-radius:8px;
               padding:6px 10px; }
   .chk-list label { display:block; padding:3px 0; font-size:13.5px; cursor:pointer; }
+  #run-table { table-layout:fixed; min-width:1100px; font-size:13px; }
+  #run-table th, #run-table td { padding:7px 8px; overflow-wrap:anywhere; }
+  #run-table th { white-space:normal; }
+  #run-table .pill { max-width:100%; white-space:normal; line-height:1.35; font-size:12px; }
+  #run-table button { max-width:100%; padding:5px 7px; font-size:12px; white-space:normal; }
   fieldset { border:1px solid var(--line); border-radius:8px; margin:0 0 14px; padding:12px 14px; }
   legend { font-size:12px; text-transform:uppercase; letter-spacing:.07em; color:var(--soft);
            font-weight:600; padding:0 6px; }
@@ -114,8 +119,7 @@
 <div id="login" class="login">
   <div class="card">
     <h2>Диспетчерская Стройресурса</h2>
-    <p class="muted" style="font-size:13.5px">Введите токен оператора (переменная окружения
-      <code>DASHBOARD_TOKEN</code> на сервере панели).</p>
+    <p class="muted" style="font-size:13.5px">Введите токен доступа, выданный администратором.</p>
     <div class="row">
       <input type="password" id="token-input" placeholder="Токен" style="flex:1" autocomplete="off">
       <button class="act" onclick="login()">Войти</button>
@@ -131,10 +135,12 @@
     <button data-screen="overview" class="active">Обзор</button>
     <button data-screen="run">Прогон</button>
     <button data-screen="company">Компания</button>
+    <button data-screen="bot">Бот</button>
     <button data-screen="settings">Настройки</button>
     <button data-screen="log">Журнал</button>
   </nav>
   <span class="spacer"></span>
+  <span id="hdr-role" class="pill steel"></span>
   <span id="hdr-state" class="pill steel">—</span>
   <button class="ghost" onclick="logout()">Выйти</button>
 </header>
@@ -147,10 +153,10 @@
     <h2>Состояние пайплайна <span class="sub" id="ov-updated"></span></h2>
     <div id="ov-status" class="row"><span class="muted">Загрузка…</span></div>
     <div class="row" style="margin-top:14px">
-      <button class="act" id="btn-start" onclick="openStart()">▶ Старт</button>
-      <button class="ghost" id="btn-stop" onclick="doStop(false)">■ Остановить мягко</button>
-      <button class="ghost" id="btn-kill" onclick="doStop(true)">✕ Жёстко</button>
-      <button class="ghost" id="btn-restart" onclick="doRestart()">↻ Перезапустить</button>
+      <button data-permission="control_pipeline" class="act" id="btn-start" onclick="openStart()">▶ Старт</button>
+      <button data-permission="control_pipeline" class="ghost" id="btn-stop" onclick="doStop(false)">■ Остановить мягко</button>
+      <button data-permission="control_pipeline" class="ghost" id="btn-kill" onclick="doStop(true)">✕ Жёстко</button>
+      <button data-permission="control_pipeline" class="ghost" id="btn-restart" onclick="doRestart()">↻ Перезапустить</button>
       <span class="muted" id="ov-checkpoint"></span>
     </div>
     <div id="ov-msg"></div>
@@ -189,7 +195,10 @@
       <input type="search" id="run-filter" placeholder="Фильтр по названию" oninput="renderRunCompanies()">
     </div>
     <div class="scroll"><table id="run-table">
-      <thead><tr><th>Компания</th><th>Тип</th><th>Статус</th><th>Время</th>
+      <colgroup><col style="width:23%"><col style="width:8%"><col style="width:13%">
+        <col style="width:16%"><col style="width:7%"><col style="width:7%">
+        <col style="width:9%"><col style="width:8%"><col style="width:9%"></colgroup>
+      <thead><tr><th>Компания</th><th>Тип</th><th>Режим обработки</th><th>Статус</th><th>Время</th>
         <th>Товары</th><th>Страницы</th><th>Ошибки</th><th></th></tr></thead>
       <tbody></tbody></table></div>
   </div>
@@ -238,6 +247,37 @@
     <div id="card-msg"></div>
   </div>
   <div id="card-body"></div>
+</section>
+
+<!-- ============================ БОТ ============================ -->
+<section id="s-bot" class="screen">
+  <div class="card">
+    <h2>Управление ботом Пачки <span class="pill steel" id="bot-state">Загрузка…</span></h2>
+    <p class="muted" style="font-size:13.5px">Пересборка применяет текущий код проекта.
+      На этапе перезапуска бот временно недоступен.</p>
+    <div class="row">
+      <button class="act" id="btn-bot-restart" onclick="doBotRestart()" disabled>Пересобрать и перезапустить бот</button>
+      <button class="ghost" id="btn-bot-refresh" onclick="loadBot()">Обновить</button>
+      <label class="muted"><input type="checkbox" id="bot-auto" checked> автообновление логов каждые 10 с</label>
+    </div>
+    <p class="muted" id="bot-status-detail"></p>
+    <div id="bot-msg"></div>
+  </div>
+  <div class="card">
+    <h2>Логи работы модулей <span class="sub">последние 300 строк</span></h2>
+    <label class="muted">Источник
+      <select id="bot-log-source" onchange="loadBotLog()">
+        <option value="bot">Бот и формирование отчётов</option>
+      </select>
+    </label>
+    <p class="muted" id="bot-log-updated" style="font-size:12px"></p>
+    <pre id="bot-log-pre">Загрузка…</pre>
+  </div>
+  <div class="card">
+    <h2>Лог пересборки и запуска <span class="sub">последние 300 строк</span></h2>
+    <p class="muted" id="bot-rebuild-updated" style="font-size:12px"></p>
+    <pre id="bot-rebuild-pre">Загрузка…</pre>
+  </div>
 </section>
 
 <!-- ============================ НАСТРОЙКИ ============================ -->
@@ -298,7 +338,7 @@
         <button class="ghost" onclick="setAllCompanies(true)">Все</button>
         <button class="ghost" onclick="setAllCompanies(false)">Снять</button>
       </div>
-      <input type="search" id="st-filter" placeholder="Поиск по названию или сайту"
+      <input type="search" id="st-filter" placeholder="Поиск по названию, ID или сайту"
              oninput="renderChooser()" style="width:100%;margin-bottom:8px">
       <div class="chk-list" id="st-list"><span class="muted">Загрузка ситлиста…</span></div>
       <p class="muted" style="font-size:12.5px;margin:8px 0 0">
@@ -307,7 +347,7 @@
   </div>
   <div class="dlg-foot">
     <button class="ghost" onclick="document.getElementById('dlg-start').close()">Отмена</button>
-    <button class="act" onclick="doStart()">Запустить</button>
+    <button data-permission="control_pipeline" class="act" onclick="doStart()">Запустить</button>
   </div>
 </dialog>
 
@@ -316,7 +356,7 @@
   <div class="dlg-body" id="purge-body"></div>
   <div class="dlg-foot">
     <button class="ghost" onclick="document.getElementById('dlg-purge').close()">Отмена</button>
-    <button class="danger" id="purge-go" onclick="doPurge()" disabled>Удалить</button>
+    <button data-permission="delete_data" class="danger" id="purge-go" onclick="doPurge()" disabled>Удалить</button>
   </div>
 </dialog>
 
@@ -325,7 +365,7 @@
   <div class="dlg-body" id="pf-del-body"></div>
   <div class="dlg-foot">
     <button class="ghost" onclick="document.getElementById('dlg-profile-del').close()">Отмена</button>
-    <button class="danger" id="pf-del-go" onclick="doProfileDelete()" disabled>Удалить</button>
+    <button data-permission="manage_profiles" class="danger" id="pf-del-go" onclick="doProfileDelete()" disabled>Удалить</button>
   </div>
 </dialog>
 
@@ -334,19 +374,35 @@
 const API = '/api/v1';
 let TOKEN = localStorage.getItem('dispatcher_token') || '';
 let SITE_LIST = [];        // ситлист для чекбоксов и datalist
+const SELECTED_COMPANY_IDS = new Set(); // выбор сохраняется при смене фильтра
 let RUN_ROWS = [];         // строки текущего прогона (для фильтра без перезапроса)
 let PURGE_CTX = null;      // контекст открытого диалога очистки
 let PROFILE_CTX = null;    // открытый редактор профиля сайта: {domain, version, exists}
 let TIMER = null;
+let HEALTH_TIMER = null;
+let IDENTITY = null;
+let AUTH_SESSION = 0;
+
+function can(permission) { return !!(IDENTITY && IDENTITY.permissions && IDENTITY.permissions[permission]); }
+function applyPermissions() {
+  el('hdr-role').textContent = IDENTITY ? IDENTITY.role_label : '';
+  document.querySelectorAll('[data-permission]').forEach(node => {
+    node.hidden = !can(node.dataset.permission);
+  });
+  if (el('pf-text')) el('pf-text').readOnly = !can('manage_profiles');
+}
+const BOT_LOG_REQUESTS = {};
 
 // ------------------------------ инфраструктура ------------------------------
 
 async function api(path, opts) {
+  const session = AUTH_SESSION;
   const options = Object.assign({headers: {}}, opts || {});
   options.headers['Authorization'] = 'Bearer ' + TOKEN;
   if (options.body) options.headers['Content-Type'] = 'application/json';
   const resp = await fetch(API + path, options);
   const text = await resp.text();
+  if (session !== AUTH_SESSION) throw new Error('Сеанс изменился.');
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (e) { data = {detail: text}; }
   if (resp.status === 401) { logout('Токен отклонён.'); throw new Error('401'); }
@@ -386,21 +442,35 @@ function num(v) { return (v === null || v === undefined) ? '—' : v; }
 // ------------------------------ вход ------------------------------
 
 async function login() {
-  TOKEN = el('token-input').value.trim();
-  if (!TOKEN) { msg('login-msg', 'Введите токен.', 'err'); return; }
+  const token = el('token-input').value.trim();
+  if (!token) { msg('login-msg', 'Введите токен.', 'err'); return; }
+  logout();
+  TOKEN = token;
+  const session = AUTH_SESSION;
   try {
-    await api('/status');
+    const identity = await api('/auth/me');
+    if (session !== AUTH_SESSION) return;
+    IDENTITY = identity;
+    applyPermissions();
     localStorage.setItem('dispatcher_token', TOKEN);
     el('login').hidden = true;
     el('app').hidden = false;
     boot();
   } catch (e) {
-    msg('login-msg', 'Не удалось войти: ' + e.message, 'err');
+    if (session === AUTH_SESSION) msg('login-msg', 'Не удалось войти: ' + e.message, 'err');
   }
 }
 function logout(reason) {
   localStorage.removeItem('dispatcher_token');
   TOKEN = '';
+  AUTH_SESSION++;
+  IDENTITY = null;
+  PROFILE_CTX = null;
+  PURGE_CTX = null;
+  el('card-body').innerHTML = '';
+  document.querySelectorAll('dialog[open]').forEach(dialog => dialog.close());
+  applyPermissions();
+  if (HEALTH_TIMER) clearInterval(HEALTH_TIMER);
   if (TIMER) clearInterval(TIMER);
   el('app').hidden = true;
   el('login').hidden = false;
@@ -426,6 +496,7 @@ function activeScreen() {
 function refreshScreen(name) {
   if (name === 'overview') { loadStatus(); loadSummary(); loadHealth(); loadCheckpoint(); }
   if (name === 'run') { loadRuns(true); loadErrors(); loadLogTail(); }
+  if (name === 'bot') loadBot();
   if (name === 'settings') loadSettings();
   if (name === 'log') { loadRunsTable(); loadJournal(); }
 }
@@ -551,6 +622,7 @@ async function loadHealth() {
 // ------------------------------ управление ------------------------------
 
 async function openStart() {
+  if (!can('control_pipeline')) return;
   el('dlg-start').showModal();
   if (!SITE_LIST.length) await loadSiteList();
   renderChooser();
@@ -571,29 +643,39 @@ async function loadSiteList() {
 function renderChooser() {
   if (!SITE_LIST.length) return;
   const q = el('st-filter').value.trim().toLowerCase();
-  const checked = new Set(selectedCompanyIds());
   const rows = SITE_LIST.filter(c => !q
+    || c.company_id.toLowerCase().includes(q)
     || c.name.toLowerCase().includes(q) || c.website.toLowerCase().includes(q));
   el('st-list').innerHTML = rows.map(c =>
-    `<label><input type="checkbox" value="${esc(c.company_id)}" ${checked.has(c.company_id) ? 'checked' : ''}
-      onchange="updateChooserCount()"> ${esc(c.name || c.company_id)}
-      <span class="muted mono">${esc(c.website)}</span></label>`).join('')
+    `<label><input type="checkbox" value="${esc(c.company_id)}" ${SELECTED_COMPANY_IDS.has(c.company_id) ? 'checked' : ''}
+      onchange="updateCompanySelection(this)"> ${esc(c.name || c.company_id)}
+      <span class="muted mono">ID: ${esc(c.company_id)} · ${esc(c.website)}</span></label>`).join('')
     || '<span class="muted">ничего не найдено</span>';
   updateChooserCount();
 }
 function selectedCompanyIds() {
-  return Array.from(el('st-list').querySelectorAll('input:checked')).map(i => i.value);
+  return Array.from(SELECTED_COMPANY_IDS);
+}
+function updateCompanySelection(input) {
+  if (input.checked) SELECTED_COMPANY_IDS.add(input.value);
+  else SELECTED_COMPANY_IDS.delete(input.value);
+  updateChooserCount();
 }
 function setAllCompanies(on) {
-  el('st-list').querySelectorAll('input[type=checkbox]').forEach(i => { i.checked = on; });
+  el('st-list').querySelectorAll('input[type=checkbox]').forEach(i => {
+    i.checked = on;
+    if (on) SELECTED_COMPANY_IDS.add(i.value);
+    else SELECTED_COMPANY_IDS.delete(i.value);
+  });
   updateChooserCount();
 }
 function updateChooserCount() {
-  const n = selectedCompanyIds().length;
+  const n = SELECTED_COMPANY_IDS.size;
   el('st-count').textContent = n ? `отмечено ${n}` : 'отмечены все';
 }
 
 async function doStart() {
+  if (!can('control_pipeline')) return;
   const mode = document.querySelector('input[name=st-mode]:checked').value;
   const ids = selectedCompanyIds();
   const body = {mode: mode, resume: el('st-resume').checked,
@@ -607,6 +689,7 @@ async function doStart() {
 }
 
 async function doStop(force) {
+  if (!can('control_pipeline')) return;
   if (force && !confirm('Жёсткая остановка снимет дерево процессов немедленно.\n'
       + 'Незавершённая компания будет переобработана целиком. Продолжить?')) return;
   try {
@@ -617,6 +700,7 @@ async function doStop(force) {
 }
 
 async function doRestart() {
+  if (!can('control_pipeline')) return;
   try {
     const r = await api('/pipeline/restart', {method: 'POST', body: JSON.stringify({mode: 'full'})});
     msg('ov-msg', r.detail || 'Пайплайн перезапущен.', 'ok');
@@ -653,7 +737,7 @@ function renderRunCompanies() {
   const q = el('run-filter').value.trim().toLowerCase();
   const rows = RUN_ROWS.filter(c => !q || (c.name || '').toLowerCase().includes(q));
   const tb = el('run-table').querySelector('tbody');
-  if (!rows.length) { tb.innerHTML = '<tr><td colspan="8" class="muted">нет записей</td></tr>'; return; }
+  if (!rows.length) { tb.innerHTML = '<tr><td colspan="9" class="muted">нет записей</td></tr>'; return; }
   tb.innerHTML = rows.map(c => {
     const st = c.status === 'success'
       ? (c.zero ? '<span class="pill warn">ноль товаров</span>' : '<span class="pill ok">готово</span>')
@@ -662,6 +746,8 @@ function renderRunCompanies() {
     return `<tr>
       <td><b>${esc(c.name)}</b><br><span class="muted mono">${esc(c.company_id)}</span></td>
       <td>${c.kind === 'urgent' ? '<span class="pill warn">срочная</span>' : 'обычная'}</td>
+      <td>${c.processing_mode === 'initial' ? 'Первичная загрузка'
+        : c.processing_mode === 'update' ? 'Обновление' : '<span class="muted">Не указан</span>'}</td>
       <td>${st}</td><td>${fmtSec(c.duration_seconds)}</td>
       <td>${c.products}</td><td>${pages}</td>
       <td>${c.errors.length ? `<span class="pill danger" title="${esc(c.errors.join(' | '))}">${c.errors.length}</span>` : '—'}</td>
@@ -693,6 +779,72 @@ async function loadLogTail() {
     el('log-pre').textContent = (r.lines || []).join('\n') || (r.detail || '—');
     el('log-pre').scrollTop = el('log-pre').scrollHeight;
   } catch (e) { el('log-pre').textContent = e.message; }
+}
+
+// ------------------------------ Бот ------------------------------
+
+function loadBot() {
+  return Promise.all([loadBotStatus(), loadBotLog(), loadBotRebuildLog()]);
+}
+
+function renderBotStatus(r) {
+  const labels = {idle: 'Перезапуск не выполняется', building: 'Пересборка…',
+    starting: 'Запуск…', checking: 'Проверка готовности…',
+    succeeded: 'Бот пересобран и запущен', failed: 'Ошибка пересборки или запуска'};
+  el('bot-state').textContent = labels[r.phase] || r.phase;
+  el('bot-state').className = 'pill ' + (r.pending ? 'warn' : r.error ? 'danger'
+    : r.phase === 'succeeded' ? 'ok' : 'steel');
+  el('bot-status-detail').textContent = r.error || r.detail || '';
+  el('btn-bot-restart').disabled = !r.available || r.pending;
+}
+
+async function loadBotStatus() {
+  try {
+    renderBotStatus(await api('/bot/status'));
+  } catch (e) {
+    el('bot-state').textContent = 'Статус недоступен';
+    el('bot-status-detail').textContent = e.message;
+    el('btn-bot-restart').disabled = true;
+  }
+}
+
+function loadBotLog() {
+  return loadBotLogTail('bot', 'bot-log-pre', 'bot-log-updated');
+}
+
+function loadBotRebuildLog() {
+  return loadBotLogTail('bot-rebuild', 'bot-rebuild-pre', 'bot-rebuild-updated');
+}
+
+async function loadBotLogTail(source, preId, updatedId) {
+  const requestId = (BOT_LOG_REQUESTS[preId] || 0) + 1;
+  BOT_LOG_REQUESTS[preId] = requestId;
+  try {
+    const r = await api(`/logs/tail?lines=300&source=${source}`, {cache: 'no-store'});
+    if (BOT_LOG_REQUESTS[preId] !== requestId) return;
+    el(preId).textContent = (r.lines || []).join('\n') || r.detail || 'Лог пока пуст.';
+    el(preId).scrollTop = el(preId).scrollHeight;
+    el(updatedId).textContent = 'Прочитано: ' + new Date().toLocaleTimeString('ru-RU')
+      + (r.modified_at ? ' · Файл изменён: ' + fmtTs(r.modified_at) : '')
+      + (r.detail && r.lines?.length ? ' · ' + r.detail : '');
+  } catch (e) {
+    if (BOT_LOG_REQUESTS[preId] !== requestId) return;
+    el(preId).textContent = 'Не удалось загрузить лог ' + (source === 'bot-rebuild' ? 'пересборки' : 'модулей') + ': ' + e.message;
+    el(updatedId).textContent = 'Ошибка обновления';
+  }
+}
+
+async function doBotRestart() {
+  el('btn-bot-restart').disabled = true;
+  msg('bot-msg', '');
+  try {
+    const r = await api('/bot/restart', {method: 'POST'});
+    renderBotStatus({available: true, ...r});
+    await loadBotRebuildLog();
+  } catch (e) {
+    msg('bot-msg', 'Перезапуск бота не выполнен: ' + e.message, 'err');
+    await loadBotStatus();
+  }
 }
 
 async function doCrawl() {
@@ -771,10 +923,10 @@ async function loadCard() {
         <span class="muted mono">каталог: ${esc(c.safe_name || '')}</span>
       </div>
       <div class="row" style="margin-top:12px">
-        <button class="act" onclick="crawlFromCard('${esc(c.company_id)}')">Краулить сейчас</button>
+        <button data-permission="control_pipeline" class="act" onclick="crawlFromCard('${esc(c.company_id)}')">Краулить сейчас</button>
         <button class="ghost" onclick="toggleProfileEditor('${esc(pr.domain || '')}')"
           ${pr.domain ? '' : 'disabled'}>Профиль сайта</button>
-        <button class="danger" onclick="openPurge('${esc(c.company_id)}')"
+        <button data-permission="delete_data" class="danger" onclick="openPurge('${esc(c.company_id)}')"
           ${c.busy ? 'disabled' : ''}>Очистить данные…</button>
       </div>
       <div id="card-action-msg"></div>
@@ -793,6 +945,7 @@ async function loadCard() {
           || '<tr><td colspan="7" class="muted">нет записей</td></tr>'}</tbody></table></div>
     </div>`;
 
+  applyPermissions();
   loadCardGraph(c.company_id);
 }
 
@@ -818,6 +971,7 @@ async function loadCardGraph(id) {
 }
 
 async function crawlFromCard(id) {
+  if (!can('control_pipeline')) return;
   try {
     const r = await api(`/companies/${encodeURIComponent(id)}/crawl`, {method: 'POST'});
     msg('card-action-msg', `Задача поставлена в очередь: ${r.task_id}`, 'ok');
@@ -827,6 +981,7 @@ async function crawlFromCard(id) {
 // ------------------------------ очистка ------------------------------
 
 async function openPurge(id) {
+  if (!can('delete_data')) return;
   PURGE_CTX = {company_id: id, sources: ['temp', 'documents']};
   el('purge-go').disabled = true;
   el('purge-body').innerHTML = '<span class="muted">Считаю, что будет удалено…</span>';
@@ -870,7 +1025,8 @@ async function renderPurge() {
     <p style="margin-bottom:6px">Для подтверждения введите id компании
       <span class="mono">${esc(d.company_id)}</span>:</p>
     <input id="purge-confirm" style="width:100%" placeholder="id компании" autocomplete="off"
-      oninput="onPurgeConfirm()">`;
+      oninput="onPurgeConfirm()">
+    <div id="purge-confirm-msg" role="alert"></div>`;
   onPurgeSourceChange();
   loadPurgeGraph();
 }
@@ -903,11 +1059,14 @@ function onPurgeSourceChange() {
 }
 function onPurgeConfirm() {
   const input = el('purge-confirm');
+  msg('purge-confirm-msg', input && input.value && input.value.trim() !== PURGE_CTX.company_id
+    ? 'Ошибка удаления данных. Проверьте правильность ввода id компании' : '', 'err');
   el('purge-go').disabled = !(input && input.value.trim() === PURGE_CTX.company_id
     && PURGE_CTX.sources.length && !(PURGE_CTX.dry && PURGE_CTX.dry.busy));
 }
 
 async function doPurge() {
+  if (!can('delete_data')) return;
   const body = {sources: PURGE_CTX.sources, confirm_company_id: el('purge-confirm').value.trim()};
   try {
     const r = await api(`/companies/${encodeURIComponent(PURGE_CTX.company_id)}/purge`,
@@ -967,7 +1126,7 @@ function renderProfileEditor(p) {
         карточек товаров ${esc(d.product_cards ?? '—')} · profile_version ${esc(d.profile_version ?? '—')} ·
         изменён ${fmtTs(d.modified_at)}</div>
       <pre style="max-height:220px">${esc(d.text)}</pre>
-      <div class="row"><button class="act" onclick="acceptDraft()">Принять черновик</button>
+      <div class="row"><button data-permission="manage_profiles" class="act" onclick="acceptDraft()">Принять черновик</button>
         <span class="muted">census_evidence отбрасывается, source census → mixed, profile_version = текущая + 1;
           файл черновика остаётся</span></div>
     </div>`;
@@ -975,18 +1134,18 @@ function renderProfileEditor(p) {
     <div class="card">
       <h2>Профиль сайта <span class="sub mono">${esc(p.file || p.domain + '.yaml')}</span>
         <span class="pill ${state[1]}">${esc(state[0])}</span></h2>
-      <div class="msg info">Правка применяется <b>к следующей компании бегущего прогона</b>:
-        пайплайн перечитывает каталог профилей перед каждой компанией. Текущая компания доедет
-        на старом профиле.</div>
+      <div class="msg info">${can('manage_profiles')
+        ? 'Правка применяется <b>к следующей компании бегущего прогона</b>: пайплайн перечитывает каталог профилей перед каждой компанией. Текущая компания доедет на старом профиле.'
+        : 'Профиль доступен только для чтения. Изменять, проверять, создавать и удалять профили, принимать черновики может администратор.'}</div>
       ${draftHtml}
       <textarea id="pf-text" class="yaml-edit" spellcheck="false">${esc(p.exists ? p.text : PROFILE_STUB(p.domain))}</textarea>
       <div id="pf-errors">${p.errors && p.errors.length ? profileErrorsHtml(p.errors) : ''}</div>
       <div class="row" style="margin-top:12px">
-        <button class="act" onclick="saveProfile()">Сохранить</button>
-        <button class="ghost" onclick="checkProfile()">Проверить</button>
-        <button class="ghost" onclick="resetProfile()">Отменить изменения</button>
+        <button data-permission="manage_profiles" class="act" onclick="saveProfile()">Сохранить</button>
+        <button data-permission="manage_profiles" class="ghost" onclick="checkProfile()">Проверить</button>
+        <button data-permission="manage_profiles" class="ghost" onclick="resetProfile()">Отменить изменения</button>
         <span class="spacer"></span>
-        <button class="danger" onclick="openProfileDelete()" ${p.exists ? '' : 'disabled'}>Удалить…</button>
+        <button data-permission="manage_profiles" class="danger" onclick="openProfileDelete()" ${p.exists ? '' : 'disabled'}>Удалить…</button>
       </div>
       <div class="muted mono" style="margin-top:8px">${esc(p.path || '')}${p.exists
         ? ` · изменён ${fmtTs(p.modified_at)} · ${p.bytes} Б · версия ${esc(p.version)}` : ''}</div>
@@ -994,6 +1153,7 @@ function renderProfileEditor(p) {
       <details class="hint" style="margin-top:10px"><summary>Схема профиля (profiles/_schema.yaml)</summary>
         <pre>${esc(p.schema_hint || 'файл _schema.yaml не найден')}</pre></details>
     </div>`;
+  applyPermissions();
 }
 
 function showProfileError(e) {
@@ -1003,6 +1163,7 @@ function showProfileError(e) {
 }
 
 async function checkProfile() {
+  if (!can('manage_profiles')) return;
   el('pf-errors').innerHTML = '';
   try {
     await api(`/profiles/${encodeURIComponent(PROFILE_CTX.domain)}/validate`,
@@ -1012,6 +1173,7 @@ async function checkProfile() {
 }
 
 async function saveProfile() {
+  if (!can('manage_profiles')) return;
   const d = PROFILE_CTX.domain;
   el('pf-errors').innerHTML = '';
   try {
@@ -1029,6 +1191,7 @@ async function saveProfile() {
 function resetProfile() { openProfileEditor(PROFILE_CTX.domain); }
 
 function openProfileDelete() {
+  if (!can('manage_profiles')) return;
   const d = PROFILE_CTX.domain;
   el('pf-del-go').disabled = true;
   el('pf-del-body').innerHTML = `
@@ -1043,6 +1206,7 @@ function onProfileDelConfirm() {
   el('pf-del-go').disabled = el('pf-del-confirm').value.trim().toLowerCase() !== PROFILE_CTX.domain;
 }
 async function doProfileDelete() {
+  if (!can('manage_profiles')) return;
   try {
     await api(`/profiles/${encodeURIComponent(PROFILE_CTX.domain)}`, {method: 'DELETE',
       body: JSON.stringify({confirm_domain: el('pf-del-confirm').value.trim()})});
@@ -1056,6 +1220,7 @@ async function doProfileDelete() {
 }
 
 async function acceptDraft() {
+  if (!can('manage_profiles')) return;
   const d = PROFILE_CTX.domain;
   try {
     const r = await api(`/profiles/${encodeURIComponent(d)}/accept-draft`,
@@ -1195,8 +1360,12 @@ function boot() {
       if (el('log-auto').checked) loadLogTail();
       loadStatus();
     }
+    if (scr === 'bot') {
+      loadBotStatus();
+      if (el('bot-auto').checked) { loadBotLog(); loadBotRebuildLog(); }
+    }
   }, 10000);
-  setInterval(() => { if (activeScreen() === 'overview') loadHealth(); }, 60000);
+  HEALTH_TIMER = setInterval(() => { if (activeScreen() === 'overview') loadHealth(); }, 60000);
 }
 
 if (TOKEN) { el('token-input').value = TOKEN; login(); }

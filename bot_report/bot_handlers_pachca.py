@@ -226,50 +226,9 @@ class PachcaBot:
             company_id = company_data_kafka.get('company_id') or company_data.get('ID производителя')
             log.info(f"Генерация отчетов для компании {company_id}")
 
-            report_success, report_message = await self.report_service.generate_reports_for_companies([company_id])
-            if not report_success:
-                await self.pachca.send_message(user_id,
-                    f"⚠️ <b>Обработка завершена, но отчет не сгенерирован</b>\n\n🏢 {company_data.get('Наименование')}\n<i>{report_message}</i>",
-                    reply_markup=self._get_back_to_main_keyboard(is_admin))
-                return
+            await self._deliver_queued_report(
+                user_id, processing_msg_id, 1, f"urgent:{task_id}", [str(company_id)])
 
-            date_str = datetime.now().strftime("%d_%m_%Y")
-            user_id_str = str(user_id).zfill(4)
-
-            await self.api_client.delete_user_directory(date_str, user_id_str)
-            archive_success, archive_message, archive_path = await self.report_service.create_archive_for_user(user_id_str, date_str)
-            if not archive_success:
-                await self.pachca.send_message(user_id,
-                    f"⚠️ <b>Обработка завершена, но архив не создан</b>\n\n{archive_message}",
-                    reply_markup=self._get_back_to_main_keyboard(is_admin))
-                return
-
-            upload_success, upload_message, download_url = await self.api_client.upload_archive(archive_path, date_str, user_id_str)
-            if not upload_success:
-                await self.pachca.send_message(user_id,
-                    f"⚠️ <b>Обработка завершена, но загрузка не удалась</b>\n\n{upload_message}",
-                    reply_markup=self._get_back_to_main_keyboard(is_admin))
-                return
-
-            try:
-                current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                await self.api_client.update_company_report_date(company_id, current_date)
-            except Exception as e:
-                log.error(f"Ошибка обновления report_date: {e}")
-
-            normalized_url = self._normalize_download_url(download_url)
-
-            success_text = (f"✅ <b>Компания успешно обработана</b>\n\n"
-                            f"🏢 <b>{company_data.get('Наименование')}</b>\n"
-                            f"🌐 {company_data.get('Website', '')}\n"
-                            f"🆔 ID компании: <code>{company_id}</code>\n\n"
-                            f"📥 <b>Скачать архив, нажав на кнопку ниже.</b>\n"
-                            f"🕒 <i>Ссылка действительна до следующего запроса.</i>")
-
-            await self.pachca.send_message(user_id, success_text,
-                                        reply_markup=self._get_download_keyboard(normalized_url))
-
-            self.user_manager.update_last_company_update_date(user_id, datetime.now().isoformat())
             log.info(f"Urgent задача {task_id} полностью обработана")
 
         except Exception as e:
@@ -329,7 +288,7 @@ class PachcaBot:
     
     async def handle_callback(self, user_id: int, callback_data: str, message_id: str):
         """Обработка нажатий на inline-кнопки"""
-        log.info(f"Callback from {user_id}: {callback_data}")
+        log.info('Нажатие кнопки: пользователь=%s, действие=%s, сообщение=%s', user_id, callback_data, message_id)
         
         if callback_data.startswith("view_invite_"):
             await self._handle_view_invite(user_id, callback_data, message_id)
@@ -510,69 +469,57 @@ class PachcaBot:
     async def _process_company_count_input(self, user_id: int, text: str, message_id: str):
         try:
             count = int(text.strip())
-            if count < 1 or count > 100:
-                await self.pachca.send_message(user_id, "❌ Введите число от 1 до 100:")
-                return
-            self.state_manager.update_data(user_id, {"company_count": count})
-            processing_msg_id = await self._send_processing_message(user_id, f"🔄 Формирование отчета по {count} компаниям...")
-            if not processing_msg_id:
-                await self.pachca.send_message(user_id, "❌ Не удалось начать формирование отчета.")
-                self.state_manager.clear(user_id)
-                return
-            self.state_manager.set_state(user_id, UserStates.processing_report)
-            
-            date_str = datetime.now().strftime("%d_%m_%Y")
-            user_id_str = str(user_id).zfill(4)
-            
-            await self.api_client.delete_user_directory(date_str, user_id_str)
-            success, report_msg, company_ids = await self.report_service.generate_ranked_reports(limit=count)
-            if not success:
-                await self.pachca.edit_message(user_id, processing_msg_id, f"❌ {report_msg}")
-                self.state_manager.clear(user_id)
-                return
-            
-            await self.pachca.edit_message(user_id, processing_msg_id, "✅ Отчеты сгенерированы\n🔄 Создание архива...")
-            success, archive_msg, archive_path = await self.report_service.create_archive_for_user(user_id_str, date_str)
-            if not success:
-                await self.pachca.edit_message(user_id, processing_msg_id, f"❌ {archive_msg}")
-                self.state_manager.clear(user_id)
-                return
-            
-            await self.pachca.edit_message(user_id, processing_msg_id, "✅ Архив создан\n🔄 Загрузка на сервер...")
-            success, upload_msg, download_url = await self.api_client.upload_archive(archive_path, date_str, user_id_str)
-            if not success:
-                await self.pachca.edit_message(user_id, processing_msg_id, f"❌ {upload_msg}")
-                self.state_manager.clear(user_id)
-                return
-            
-            self.user_manager.increment_reports(user_id)
-            response_text = (f"✅ Отчёт по {count} {self._get_company_word(count)} сформирован.\n\n"
-                             f"📥 Скачать архив, нажав на кнопку ниже.\n\n"
-                             f"🕒 Ссылка действительна до следующего запроса.")
-            await self.pachca.edit_message(user_id, processing_msg_id,
-                                            "✅ Архив загружен на сервер.\n📎 Готовлю ссылку...")
-            
-            await self.pachca.send_message(user_id, response_text,
-                                            reply_markup=self._get_download_keyboard(download_url))
-                                                    
-            asyncio.create_task(self._update_report_dates_after_success(user_id, company_ids))
-            self.state_manager.clear(user_id)
-        except Exception as e:
-            log.error(f"Ошибка ввода количества: {e}")
-            await self.pachca.send_message(user_id, "❌ Ошибка. Попробуйте снова.")
-            self.state_manager.clear(user_id)
-    
-    async def _update_report_dates_after_success(self, user_id: int, company_ids: List[str]):
-        if not company_ids:
+        except ValueError:
+            await self.pachca.send_message(user_id, "❌ Введите число от 1 до 100:")
             return
-        current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        success, msg = await self.api_client.update_companies_report_dates(company_ids, current_date)
-        if success:
-            self.user_manager.update_last_report_date(user_id, current_date)
-    
+        if count < 1 or count > 100:
+            await self.pachca.send_message(user_id, "❌ Введите число от 1 до 100:")
+            return
+        processing_msg_id = await self._send_processing_message(
+            user_id, f"🔄 Формирование отчёта по {count} компаниям...")
+        if not processing_msg_id:
+            return
+        self.state_manager.set_state(user_id, UserStates.processing_report)
+        await self._deliver_queued_report(user_id, processing_msg_id, count,
+                                          f"report:{user_id}:{message_id}")
+
+    async def _deliver_queued_report(self, user_id, processing_msg_id, count, event_key, company_ids=None):
+        batch = None
+        try:
+            batch = await self.report_service.prepare_report(count, user_id, event_key, company_ids)
+            actual = len(batch['companies'])
+            text = f"✅ Отчёт по {actual} {self._get_company_word(actual)} сформирован."
+            if actual < count:
+                text += f"\nЗапрошено {count}; сейчас доступно {actual}."
+            text += "\n\n📥 Скачать архив можно по кнопке ниже."
+            # До сетевого вызова сохраняем неопределённое состояние отправки.
+            # Даже тайм-аут не доказывает, что сообщение не дошло пользователю.
+            self.report_service.queue.mark_sending(batch['id'], batch['download_url'])
+            success, message_id = await self.pachca.send_message_and_get_id(
+                user_id, text, reply_markup=self._get_download_keyboard(self._normalize_download_url(batch['download_url'])))
+            if not success or not message_id:
+                await self.pachca.edit_message(user_id, processing_msg_id,
+                    "⚠️ Не удалось подтвердить доставку ссылки. Повторная выдача этих компаний "
+                    f"приостановлена до проверки. Номер запроса: {batch['id']}")
+                return
+            await self.report_service.confirm_delivery(batch, message_id)
+            self.user_manager.increment_reports(user_id)
+            self.user_manager.update_last_report_date(user_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            await self.pachca.edit_message(user_id, processing_msg_id, "✅ Архив подготовлен, ссылка отправлена.")
+        except Exception as e:
+            log.exception("Ошибка выдачи отчёта")
+            await self.pachca.edit_message(user_id, processing_msg_id, f"❌ {e}")
+        finally:
+            if batch:
+                self.report_service.queue.release(batch['id'], 'Выдача не начата')
+            self.state_manager.clear(user_id)
+
     async def _process_admin_delete_invite_code(self, user_id: int, code: str, message_id: str):
         """Обработка ввода кода инвайта для удаления"""
-        if self.invite_manager.delete_invite(code.strip().upper()):
+        deleted = self.invite_manager.delete_invite(code.strip().upper())
+        log.info('Удаление инвайта: администратор=%s, код=%s, результат=%s',
+                 user_id, code.strip().upper(), 'удалён' if deleted else 'не найден/ошибка')
+        if deleted:
             await self.pachca.send_message(user_id, f"✅ Инвайт {code} удален", reply_markup=self._get_back_to_admin_keyboard())
             await self._notify_admins(f"Инвайт {code} удален администратором {user_id}")
         else:
@@ -787,7 +734,10 @@ class PachcaBot:
     
     async def _handle_confirm_delete_invite(self, user_id: int, callback_data: str, message_id: str):
         invite_code = callback_data.replace(CallbackData.ADMIN_CONFIRM_DELETE, "")
-        if self.invite_manager.delete_invite(invite_code):
+        deleted = self.invite_manager.delete_invite(invite_code)
+        log.info('Удаление инвайта: администратор=%s, код=%s, результат=%s',
+                 user_id, invite_code, 'удалён' if deleted else 'не найден/ошибка')
+        if deleted:
             await self.pachca.send_message(user_id, f"✅ Инвайт {invite_code} удален", reply_markup=self._get_back_to_admin_keyboard())
             await self._notify_admins(f"Инвайт {invite_code} удален администратором {user_id}")
         else:

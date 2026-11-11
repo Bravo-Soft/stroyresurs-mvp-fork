@@ -32,7 +32,7 @@ class BotConfig:
     archive_name: str = "Отчёт_об_изменениях.zip"
     
     # API эндпоинты (бэкенд)
-    api_base_url: str = "http://192.168.0.123:4242"
+    api_base_url: str = "https://stroy-resurs-db.bravo-soft.ru"
     report_upload_url: str = None
     report_delete_file_url: str = None
     report_delete_dir_url: str = None
@@ -94,6 +94,7 @@ class BotConfig:
                 log.error(f"Ошибка парсинга PACHKA_ADMIN_ID: {e}")
         
         # Пути
+        self.logs_dir = os.getenv('LOGS_DIR', self.logs_dir)
         self.reports_dir = self.base_dir / "Documents/Reports"
         self.documents_dir = self.base_dir / "Documents"
         self.archive_temp_dir = self.base_dir / "ArchiveTemp"
@@ -108,7 +109,7 @@ class BotConfig:
         self.report_delete_file_url = f"{self.api_base_url}/api/reports/delete/file"
         self.report_delete_dir_url = f"{self.api_base_url}/api/reports/delete/directory"
         self.graph_db_api_url = f"{self.api_base_url}/api/companies"
-        self.report_download_url = "https://192.168.0.123:4243/api/reports/download"
+        self.report_download_url = f"{self.api_base_url}/api/reports/download"
         self.update_url = f"{self.api_base_url}/api/companies/add"
         
         # Создание директорий

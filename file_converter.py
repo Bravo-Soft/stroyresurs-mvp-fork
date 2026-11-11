@@ -12,6 +12,12 @@ import json
 import tempfile
 import uuid
 import shutil
+from file_download_cache import FileDownloadCache
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 # Настройка логирования
 log = logging.getLogger("file_converter")
@@ -41,7 +47,8 @@ class FileConverter:
                  log_file: str = "file_conversion.log",
                  delete_originals: bool = True,
                  delete_empty_folders: bool = True,
-                 exclude_product_cards: bool = True):
+                 exclude_product_cards: bool = True,
+                 download_cache_dir: Optional[str] = None):
         """
         Инициализация конвертера
         
@@ -61,6 +68,7 @@ class FileConverter:
         self.exclude_product_cards = exclude_product_cards
         self._conversion_errors = []
         self.last_results = []
+        self.download_cache = FileDownloadCache(download_cache_dir) if download_cache_dir else None
         
         # Настройка логирования
         self._setup_logging(log_file)
@@ -99,6 +107,9 @@ class FileConverter:
     def _check_dependencies(self):
         """Проверка необходимых зависимостей"""
         if not self.libreoffice_path.exists():
+            if Image is not None:
+                log.warning("LibreOffice недоступен; возможна локальная конвертация WEBP через Pillow")
+                return
             error_msg = f"LibreOffice не найден по пути: {self.libreoffice_path}"
             log.error(error_msg)
             self._conversion_errors.append(error_msg)
@@ -200,7 +211,8 @@ class FileConverter:
         unique_profile_dir = None
 
         try:
-            if output_file.exists():
+            if output_file.exists() and (self.download_cache is None
+                    or self.download_cache.conversion_current(input_file, output_file)):
                 return ConversionResult(
                     input_file=str(input_file),
                     output_file=str(output_file),
@@ -211,34 +223,63 @@ class FileConverter:
             
             output_file.parent.mkdir(parents=True, exist_ok=True)
             
-            unique_profile_dir = f"/tmp/lo_profile_{uuid.uuid4()}"
+            # Обновлённый источник конвертируем отдельно: старый PDF не должен
+            # скрывать неудачную конвертацию и остаётся целым до успешного результата.
+            render_path = output_file
+            managed = self.download_cache and self.download_cache.conversion_entries(input_file)
+            if managed:
+                render_path = self.download_cache.root / 'conversions' / uuid.uuid4().hex / output_file.name
+                render_path.parent.mkdir(parents=True, exist_ok=True)
+            result = None
+            converted_webp = False
+            # Сервер может отдавать WEBP по URL с расширением .jpg. Определяем
+            # настоящий формат декодером, не переименовываем и не меняем источник.
+            if Image is not None and input_file.suffix.lower() in {
+                    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}:
+                with Image.open(input_file) as image:
+                    if image.format == 'WEBP':
+                        rgba = image.convert('RGBA')
+                        background = Image.new('RGB', rgba.size, 'white')
+                        background.paste(rgba, mask=rgba.getchannel('A'))
+                        background.save(render_path, 'PDF')
+                        converted_webp = True
+
+            if not converted_webp:
+                unique_profile_dir = f"/tmp/lo_profile_{uuid.uuid4()}"
             
-            command = [
-                str(self.libreoffice_path),
-                '--headless',
-                '--invisible',
-                '--nodefault',
-                '--nofirststartwizard',
-                '--nolockcheck',
-                '--nologo',
-                f'-env:UserInstallation=file://{unique_profile_dir}',
-                '--convert-to', 'pdf',
-                '--outdir', str(output_file.parent),
-                str(input_file)
-            ]
+                command = [
+                    str(self.libreoffice_path),
+                    '--headless',
+                    '--invisible',
+                    '--nodefault',
+                    '--nofirststartwizard',
+                    '--nolockcheck',
+                    '--nologo',
+                    f'-env:UserInstallation=file://{unique_profile_dir}',
+                    '--convert-to', 'pdf',
+                    '--outdir', str(render_path.parent),
+                    str(input_file)
+                ]
             
-            # Вызов LibreOffice
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=300,         
-                check=True
-            )
+                # Вызов LibreOffice
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,         
+                    check=True
+                )
             
             conversion_time = (datetime.now() - start_time).total_seconds()
             
-            if output_file.exists():
+            if render_path.exists():
+                if managed:
+                    self.download_cache.archive(output_file)
+                    shutil.copy2(render_path, output_file)
+                    # Дата загрузки относится к источнику, а не к конвертации.
+                    source_time = input_file.stat().st_mtime
+                    os.utime(output_file, (source_time, source_time))
+                    self.download_cache.record_conversion(input_file, output_file)
                 log.info(f"Успешно сконвертирован: {input_file} -> {output_file}")
                 if self.delete_originals and input_file.exists():
                     input_file.unlink()
@@ -252,7 +293,7 @@ class FileConverter:
                 )
             else:
                 error_msg = f"PDF файл не создан после конвертации: {output_file}"
-                log.error(f"{error_msg}. stderr: {result.stderr}")
+                log.error(f"{error_msg}. stderr: {getattr(result, 'stderr', '')}")
                 self._conversion_errors.append(error_msg)
                 return ConversionResult(
                     input_file=str(input_file),

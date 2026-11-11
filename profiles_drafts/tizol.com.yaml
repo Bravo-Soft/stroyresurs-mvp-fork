@@ -1,0 +1,73 @@
+domain: tizol.com
+profile_version: 2
+profiled_at: '2026-09-02'
+confidence: 0.823
+source: mixed
+notes:
+- '2026-11-09: добавлены настройки сайта из config.py и рабочего профиля; показатели переписи и confidence
+  сохранены.'
+crawl:
+  render: browser
+  ajax_tabs: true
+  tab_selector: .product-page__section-btn
+  tab_panel_selector: .product-page__section-content
+sections:
+  contacts_urls:
+  - /contacts/
+  distributor_urls:
+  - /dealers/
+  product_url_patterns:
+  - /catalog/[^/]+/[^/]+/?$
+  - /catalog/[^/]+/?$
+extract:
+  tier: custom
+  custom_module: tizol_com
+baseline:
+  structure_hash: 058d1d6cc7132163c8f089b1901fdf617cb91d2d
+  selector_hit_rate: null
+  pages_crawled: 55
+  product_pages: 52
+  product_cards: 29
+  jsonld_share: null
+  cms_detected: null
+  fetch_fail_rate: 0.1169
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.1228
+  gate3_pass_rate: 0.7632
+  sitemap_url_count: 472
+  extraction_path_share:
+    adapter: 0.9123
+    contacts_universal: 0.0877
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts: &id001
+    main_page: 1
+    product: 52
+    contacts: 1
+    distributor: 1
+census_evidence:
+  fetch_methods:
+    http_first: 15
+    ajax_tabs: 52
+    dynamic: 1
+  pages_by_category: *id001
+  alerts: []
+  top_urls:
+    product:
+    - https://tizol.com/catalog/stroitelnaya-izolyaciya/plita-myagkaya-pm-50
+    - https://tizol.com/catalog/stroitelnaya-izolyaciya/plita-zhestkaya-pzh-100
+    - https://tizol.com/catalog/tekhnicheskaya-izolyaciya/shnur-bazaltovyy-teploizolyacionnyy-shbtizol-10
+    - https://tizol.com/catalog/stroitelnaya-izolyaciya/plita-poluzhestkaya-pp-80
+    - https://tizol.com/catalog/tekhnicheskaya-izolyaciya/material-bazaltovyy-ognezashchitnyy-rulonnyy-mbor-s2-5
+    - https://tizol.com/catalog/tekhnicheskaya-izolyaciya/shnur-bazaltovyy-teploizolyacionnyy-shbtizol-40
+    - https://tizol.com/catalog/stroitelnaya-izolyaciya/tizol-sendvich-125
+    - https://tizol.com/catalog/tekhnicheskaya-izolyaciya/material-bazaltovyy-ognezashchitnyy-rulonnyy-mbor-13
+    - https://tizol.com/catalog/tekhnicheskaya-izolyaciya/maty-bazaltovye-mpb-30
+    - https://tizol.com/catalog/stroitelnaya-izolyaciya/plita-povyshennoy-zhestkosti-ppzh-160
+    category: []
+    contacts:
+    - https://tizol.com/contacts
+    distributor:
+    - https://tizol.com/dealers
+    price_list: []

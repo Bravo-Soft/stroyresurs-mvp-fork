@@ -27,21 +27,17 @@ class MonitoringIntegrator:
     def _create_main_config(self) -> MainConfig:
         """Создание конфигурации для Kafka"""
         # Загружаем основную конфигурацию из переменных окружения
-        config = MainConfig()
+        config = MainConfig.load_from_env()
         
         # Корректируем пути, если нужно
         config.base_dir = str(self.bot_config.base_dir / "Base")
         config.reports_dir = str(self.bot_config.reports_dir)
         config.documents_dir = str(self.bot_config.documents_dir)
         
-        # Убеждаемся, что настройки Kafka загружены
-        if not config.kafka_bootstrap_servers:
-            # Если не загрузились, берем из переменных окружения вручную
-            import os
-            config.kafka_bootstrap_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS', '192.168.0.123:9092')
-            config.kafka_topic_urgent_tasks = os.getenv('KAFKA_TOPIC_URGENT_TASKS', 'urgent_tasks')
-            config.kafka_topic_task_status = os.getenv('KAFKA_TOPIC_TASK_STATUS', 'task_status')
-            config.kafka_consumer_group = 'telegram_bot'        
+        # Kafka бота использует адрес и топики из его текущей конфигурации.
+        config.kafka_bootstrap_servers = self.bot_config.kafka_bootstrap_servers
+        config.kafka_topic_urgent_tasks = self.bot_config.kafka_topic_urgent_tasks
+        config.kafka_topic_task_status = self.bot_config.kafka_topic_task_status
         
         return config
     

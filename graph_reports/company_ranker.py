@@ -106,93 +106,29 @@ class CompanyRanker:
     
     @staticmethod
     def rank_companies(companies: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-        """
-        Ранжирование компаний по правильному приоритету:
-        
-        1. Новые компании (без report_date) - ВЫСШИЙ ПРИОРИТЕТ
-        1.1. С update_date (самые свежие)
-        1.2. Без update_date, но с upload_date
-        1.3. Без дат
-        
-        2. Компании, требующие сравнения (есть report_date и update_date, где report_date < update_date)
-        2.1. С update_date (самые свежие)
-        2.2. Без update_date, но с upload_date
-        
-        3. Компании, уже бывшие в отчете (есть report_date, но нет update_date ИЛИ report_date >= update_date)
-        """
-        if not companies:
-            return []
-        
-        # Инициализируем группы в правильном порядке приоритета
-        group1_companies = []  # Новые компании (без report_date) - ВЫСШИЙ ПРИОРИТЕТ
-        group2_companies = []  # Требуют сравнения (report_date < update_date)
-        group3_companies = []  # Уже были в отчете (report_date >= update_date или нет update_date)
-        
+        """Общая очередь: первый отчёт по загрузке, повторный — по обновлению."""
+        new, updated = [], []
         for company in companies:
-            report_date = company.get("report_date")
-            update_date = company.get("update_date")
-            upload_date = company.get("upload_date")
-            
-            # Определяем статус компании
-            has_report_date = bool(report_date and str(report_date).strip())
-            has_update_date = bool(update_date and str(update_date).strip())
-            
-            if not has_report_date:
-                # 1. Новая компания (без report_date) - ВЫСШИЙ ПРИОРИТЕТ
-                sort_date = CompanyRanker.get_company_date_for_sorting(company)
-                group1_companies.append((company, sort_date))
-            elif has_report_date and has_update_date:
-                # Проверяем, требует ли сравнения
-                try:
-                    report_dt = CompanyRanker._parse_date(str(report_date))
-                    update_dt = CompanyRanker._parse_date(str(update_date))
-                    
-                    if report_dt and update_dt and report_dt < update_dt:
-                        # 2. Требует сравнения
-                        sort_date = update_dt
-                        group2_companies.append((company, sort_date))
-                    else:
-                        # 3. Уже была в отчете
-                        sort_date = CompanyRanker.get_company_date_for_sorting(company)
-                        group3_companies.append((company, sort_date))
-                except:
-                    # В случае ошибки парсинга
-                    sort_date = CompanyRanker.get_company_date_for_sorting(company)
-                    group3_companies.append((company, sort_date))
+            if company.get("data_update_in_progress") in (True, "true", "True"):
+                continue
+            report = company.get("report_date")
+            upload = CompanyRanker._parse_date(company.get("upload_date"))
+            update = CompanyRanker._parse_date(company.get("update_date"))
+            if not report or not str(report).strip():
+                new.append((company, upload))
+            elif company.get("report_version") and company.get("data_version"):
+                if company["report_version"] != company["data_version"]:
+                    updated.append((company, update))
             else:
-                # 3. Уже была в отчете (есть report_date, но нет update_date)
-                sort_date = CompanyRanker.get_company_date_for_sorting(company)
-                group3_companies.append((company, sort_date))
-        
-        # Сортируем группы по дате (самые свежие первые)
-        group1_companies.sort(key=lambda x: x[1] if x[1] else datetime.min, reverse=True)
-        group2_companies.sort(key=lambda x: x[1] if x[1] else datetime.min, reverse=True)
-        group3_companies.sort(key=lambda x: x[1] if x[1] else datetime.min, reverse=True)
-        
-        # Формируем итоговый список в правильном порядке приоритета
-        result_companies = []
-        
-        # 1. Сначала новые компании (самые свежие без report_date)
-        for company, _ in group1_companies:
-            result_companies.append(company)
-        
-        # 2. Затем компании, требующие сравнения
-        for company, _ in group2_companies:
-            result_companies.append(company)
-        
-        # 3. В конце компании, уже бывшие в отчете
-        for company, _ in group3_companies:
-            result_companies.append(company)
-        
-        # Применяем лимит
-        if limit > 0:
-            result_companies = result_companies[:limit]
-        
-        log.info(f"Ранжировано компаний: {len(result_companies)} из {len(companies)} (лимит: {limit})")
-        log.info(f"Группы: новые={len(group1_companies)}, требуют сравнения={len(group2_companies)}, уже в отчете={len(group3_companies)}")
-        
-        return result_companies
-    
+                report_dt = CompanyRanker._parse_date(report)
+                if report_dt and update and update > report_dt:
+                    updated.append((company, update))
+        key = lambda item: (item[1] is None, item[1] or datetime.max, str(item[0].get("id", "")))
+        new.sort(key=key)
+        updated.sort(key=key)
+        result = [company for company, _ in new + updated]
+        return result[:limit] if limit > 0 else result
+
     @staticmethod
     def get_company_status_for_report(company: Dict[str, Any]) -> str:
         """

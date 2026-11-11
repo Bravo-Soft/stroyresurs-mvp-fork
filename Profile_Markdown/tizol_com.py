@@ -26,6 +26,8 @@ def clean(soup: BeautifulSoup):
 def extract(html: str, base_url: str = '') -> str | None:
     soup = BeautifulSoup(html, 'lxml')
     clean(soup)
+    # Склейка краулера находится вне основного контейнера и Vue-слотов.
+    merged_tabs = [tab.extract() for tab in soup.select('section[data-tab]')]
 
     # Заголовок h1
     h1_tag = soup.find('h1', class_='product-page__title')
@@ -85,6 +87,11 @@ def extract(html: str, base_url: str = '') -> str | None:
             md = conv.convert(str(product_inner))
             if md.strip():
                 body_parts.append(md.strip())
+
+    for tab in merged_tabs:
+        tab_md = MarkdownConverter().convert(str(tab)).strip()
+        if tab_md:
+            body_parts.append(tab_md)
 
     content_parts.extend(body_parts)
 

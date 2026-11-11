@@ -1,0 +1,71 @@
+domain: vmp-holding.ru
+profile_version: 2
+profiled_at: '2026-09-03'
+confidence: 0.791
+source: mixed
+notes:
+- '2026-11-09: добавлены настройки сайта из config.py и рабочего профиля; показатели переписи и confidence
+  сохранены.'
+crawl:
+  render: html
+  equivalent_domains:
+  - vmp-anticor.ru
+  - vmp-goodline.ru
+  - vmp-plamcor.ru
+sections:
+  contacts_urls:
+  - /kont/
+  product_url_patterns:
+  - /products/[^/]+/[^/]+/?$
+  - /products/[^/]+/?$
+  - /products/[^/]+/[^/]+\.php/?$
+extract:
+  tier: llm
+baseline:
+  structure_hash: b1bf089ca747f4b84e07ea0c02100c60879635aa
+  selector_hit_rate: 1.0
+  pages_crawled: 58
+  product_pages: 50
+  product_cards: 42
+  jsonld_share: 0.06
+  cms_detected: generic-main
+  fetch_fail_rate: 0.0363
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.9767
+  sitemap_url_count: 111
+  extraction_path_share:
+    contacts_universal: 0.4118
+    universal: 0.5882
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts: &id001
+    main_page: 7
+    product: 50
+    contacts: 1
+census_evidence:
+  fetch_methods:
+    http_first: 209
+    aiohttp: 13
+    dynamic: 17
+  pages_by_category: *id001
+  alerts:
+  - 'секция distributor: 0 страниц'
+  top_urls:
+    product:
+    - https://vmp-holding.ru/products/antikorrozionnaya-zashchita-betona/vinikor-vinikor-bep-5297
+    - https://vmp-holding.ru/products/antikorrozionnaya-zashchita-metalla/izolep-235
+    - https://vmp-holding.ru/products/antikorrozionnaya-zashchita-metalla/izolep-eps
+    - https://vmp-holding.ru/products/antikorrozionnaya-zashchita-metalla/vinikor-nord
+    - https://vmp-holding.ru/products/antikorrozionnaya-zashchita-metalla/zinotan
+    - https://vmp-holding.ru/products/antikorrozionnaya-zashchita-metalla/izolep-sp-03
+    - https://vmp-holding.ru/products/antikorrozionnaya-zashchita-metalla/izolep-gidro
+    - https://vmp-holding.ru/products/antikorrozionnaya-zashchita-metalla/izolep-oil-250
+    - https://vmp-holding.ru/products/antikorrozionnaya-zashchita-metalla/izolep-oil-350-as
+    - https://vmp-holding.ru/products/antikorrozionnaya-zashchita-metalla/politon-zp
+    category: []
+    contacts:
+    - https://vmp-holding.ru/kont/
+    distributor: []
+    price_list: []

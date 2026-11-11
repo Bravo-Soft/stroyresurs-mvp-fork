@@ -1,0 +1,18 @@
+domain: pechi-keddy.ru
+profile_version: 1
+profiled_at: '2026-10-26'
+confidence: null
+source: manual
+notes:
+  - 'Пути подтверждены сохранённым HTML каталога от 23.10.2026: 24 товара на первой странице и пагинация 2/3.'
+  - 'Относительные адреса разрешаются по HTML base[href] в web_crawler.py. Живой повтор после исправления ещё не выполнен.'
+sections:
+  start_urls:
+    - /cat/
+  catalog_roots:
+    - /cat/
+  product_url_patterns:
+    - '^https?://(?:www\.)?pechi-keddy\.ru/pechi-kaminy/keddy/[^/?#]+\.html/?(?:[?#].*)?$'
+    - '^https?://(?:www\.)?pechi-keddy\.ru/cat/product-\d+\.html/?(?:[?#].*)?$'
+  product_url_antipatterns:
+    - '^https?://(?:www\.)?pechi-keddy\.ru/cat/?(?:[?#].*)?$'

@@ -11,4 +11,5 @@ extract:
   custom_module: tizol_com
 crawl:
   ajax_tabs: true
+  tab_selector: .product-page__section-btn
   tab_panel_selector: .product-page__section-content

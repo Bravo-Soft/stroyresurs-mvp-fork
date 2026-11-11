@@ -1,0 +1,14 @@
+domain: beton-zavod.ru
+profiled_at: '2026-11-02'
+source: manual
+notes:
+  - 'Лендинг: 34 товарных блока в #katalog. product__toggle раскрывает связанный product__spec; таблицы и метаданные уже в HTML.'
+  - 'Одна таблица может содержать несколько исполнений. Здесь сохраняется исходная группа и каждая ячейка, без автоматического разделения на отдельные модели.'
+  - 'Есть повторяющиеся названия и id spec-34. Идентичность задаёт сочетание обозначения и названия; пустая спецификация «Товарного бетона» не подменяется соседней.'
+crawl:
+  inline_products:
+    paths: ['/']
+    item_selector: '#katalog .product'
+    name_selector: '.product__title'
+    content_selectors: ['.product__spec']
+    name_prefix_selector: '.product__code'

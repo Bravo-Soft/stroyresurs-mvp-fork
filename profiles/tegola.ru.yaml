@@ -1,0 +1,36 @@
+domain: tegola.ru
+profile_version: 2
+profiled_at: '2026-10-30'
+source: mixed
+notes:
+  - 'Уточнение census-черновика от 29.10: /catalog — группы и марки; карточки — /product/<slug>.'
+  - 'SSR содержит характеристики и документы в window.__NUXT__; вкладки DOM пусты. Адаптер читает данные текущего товара без исполнения JavaScript.'
+  - 'Проверка на сохранённых HTML; новый живой обход и повторное LLM-извлечение требуют отдельного запуска.'
+crawl:
+  render: html
+  limits:
+    pages: 1000
+    product_pages: 900
+    depth: 6
+    sitemap_urls: 1000
+sections:
+  catalog_roots:
+    - /catalog
+  product_url_patterns:
+    - '/product/[^/?#]+/?(?:[?#].*)?$'
+  product_url_antipatterns:
+    - '/(?:catalog|solution|solutions|directions|lp|projects|help|page|press)(?:[/?#]|$)'
+  contacts_urls:
+    - /about/contacts
+    - /about/requisites
+  distributor_urls:
+    - /gde-kupit
+    - /lp/ofisy-korporacii-tegola
+  certificates_urls:
+    - /about/licenses
+  instructions_urls:
+    - /help/instructions
+extract:
+  tier: custom
+  custom_module: tegola_ru
+  needs_raw_html: true

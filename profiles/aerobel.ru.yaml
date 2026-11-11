@@ -11,6 +11,8 @@ extract:
   tier: custom
   custom_module: aerobel_ru
 crawl:
+  ignored_query_params: [region]
+  repair_region_entity: true
   exclude_paths:
   - /manufacturing/
   - /news/

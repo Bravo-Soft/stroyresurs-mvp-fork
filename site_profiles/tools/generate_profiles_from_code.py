@@ -3,12 +3,11 @@
 
 Источники:
   - адаптеры Profile_Markdown/ (через text_extractor._get_adapters): tier=custom + флаги;
-  - пер-доменные словари config.py: ajax_product_tabs_domains, bitrix_offers_domains,
-    exclude_url_patterns_by_domain, strict_www_domains, equivalent_domains;
+  - настройки обхода из существующих profiles/*.yaml;
   - ручные дополнения MANUAL (хардкоды из бизнес-логики, карта разделов aerobel из D98).
 
 Скрипт детерминирован и перезапускаем: перезаписывает <домен>.yaml целиком.
-В конце печатает кросс-отчёт покрытия словарей config и известных хардкодов.
+В конце печатает кросс-отчёт покрытия настроек YAML и известных хардкодов.
 """
 import sys
 from pathlib import Path
@@ -19,7 +18,6 @@ sys.path.insert(0, str(MVP))
 import yaml  # noqa: E402
 
 import text_extractor  # noqa: E402
-from config import Config  # noqa: E402
 from site_profiles import profile_from_dict  # noqa: E402
 
 PROFILED_AT = '2026-08-18'
@@ -91,8 +89,7 @@ def deep_merge(dst: dict, src: dict) -> dict:
 
 
 def build_profiles() -> dict:
-    """Возвращает {домен: dict-профиль} из адаптеров + config + MANUAL."""
-    config = Config()
+    """Возвращает {домен: dict-профиль} из адаптеров + существующих YAML + MANUAL."""
     profiles = {}
 
     def get(domain):
@@ -131,19 +128,11 @@ def build_profiles() -> dict:
                 extract[key] = True
         profile['notes'].append(f'Адаптер markdown: Profile_Markdown/{extract["custom_module"]}.py')
 
-    # 2. Пер-доменные словари config.py.
-    for domain in config.ajax_product_tabs_domains:
-        get(domain).setdefault('crawl', {})['ajax_tabs'] = True
-    for domain in config.bitrix_offers_domains:
-        get(domain).setdefault('crawl', {})['bitrix_offers'] = True
-    for domain, paths in config.exclude_url_patterns_by_domain.items():
-        crawl = get(domain).setdefault('crawl', {})
-        crawl['exclude_paths'] = sorted(set(crawl.get('exclude_paths', [])) | set(paths))
-    for domain in config.strict_www_domains:
-        get(domain).setdefault('crawl', {})['strict_www'] = True
-    for domain, aliases in config.equivalent_domains.items():
-        crawl = get(domain).setdefault('crawl', {})
-        crawl['equivalent_domains'] = sorted(set(crawl.get('equivalent_domains', [])) | set(aliases))
+    # 2. Сохраняем настройки существующих профилей после удаления дублей из Config.
+    for path in sorted((MVP / 'profiles').glob('*.yaml')):
+        if not path.name.startswith('_'):
+            data = yaml.safe_load(path.read_text(encoding='utf-8'))
+            deep_merge(get(data['domain']), data)
 
     # 3. Ручные дополнения.
     for domain, extra in MANUAL.items():
@@ -153,24 +142,16 @@ def build_profiles() -> dict:
 
 
 def coverage_report(profiles: dict):
-    """Кросс-отчёт: каждый элемент словарей config и известный хардкод покрыт профилем."""
-    config = Config()
+    """Кросс-отчёт: каждый параметр обхода YAML и известный хардкод покрыт профилем."""
     checks = []
-    for domain in config.ajax_product_tabs_domains:
-        checks.append((f'ajax_product_tabs_domains[{domain}]',
-                       profiles.get(domain, {}).get('crawl', {}).get('ajax_tabs') is True))
-    for domain in config.bitrix_offers_domains:
-        checks.append((f'bitrix_offers_domains[{domain}]',
-                       profiles.get(domain, {}).get('crawl', {}).get('bitrix_offers') is True))
-    for domain, paths in config.exclude_url_patterns_by_domain.items():
-        have = set(profiles.get(domain, {}).get('crawl', {}).get('exclude_paths', []))
-        checks.append((f'exclude_url_patterns_by_domain[{domain}]', set(paths) <= have))
-    for domain in config.strict_www_domains:
-        checks.append((f'strict_www_domains[{domain}]',
-                       profiles.get(domain, {}).get('crawl', {}).get('strict_www') is True))
-    for domain, aliases in config.equivalent_domains.items():
-        have = set(profiles.get(domain, {}).get('crawl', {}).get('equivalent_domains', []))
-        checks.append((f'equivalent_domains[{domain}]', set(aliases) <= have))
+    for path in sorted((MVP / 'profiles').glob('*.yaml')):
+        if path.name.startswith('_'):
+            continue
+        data = yaml.safe_load(path.read_text(encoding='utf-8'))
+        domain = data['domain']
+        for key, value in data.get('crawl', {}).items():
+            checks.append((f'{domain}: crawl.{key}',
+                           profiles.get(domain, {}).get('crawl', {}).get(key) == value))
     from site_profiles import normalize_domain
     for domain, module in text_extractor._get_adapters().items():
         module_name = module.__name__.split('.')[-1]

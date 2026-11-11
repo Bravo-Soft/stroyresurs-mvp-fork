@@ -97,6 +97,11 @@ def main():
               'process' in status and 'heartbeat_age_seconds' in status)
     expect('GET /runs', base, '/api/v1/runs', token, 200)
     expect('GET /logs/tail', base, '/api/v1/logs/tail?lines=20', token, 200)
+    expect('GET /logs/tail (все модули)', base, '/api/v1/logs/tail?lines=20&source=all', token, 200)
+    expect('GET /logs/tail (бот)', base, '/api/v1/logs/tail?lines=20&source=bot', token, 200)
+    expect('GET /logs/tail (пересборка бота)', base,
+           '/api/v1/logs/tail?lines=20&source=bot-rebuild', token, 200)
+    expect('GET /bot/status', base, '/api/v1/bot/status', token, 200)
     summary = expect('GET /metrics/summary', base, '/api/v1/metrics/summary', token, 200)
     if summary is not None:
         check('metrics/summary работает и без прогонов (fail-open §2)',

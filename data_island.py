@@ -17,6 +17,7 @@ import logging
 from typing import Optional, Dict, Any, List
 
 from bs4 import BeautifulSoup
+from product_interactions import tilda_product_links, product_panel_controls, panel_populated
 
 log = logging.getLogger("crawler")
 
@@ -291,6 +292,66 @@ def looks_like_product_shell(html: str, *, min_text: int = 1000,
         return False
 
 
+PRODUCT_TAB_SELECTOR = ('[role="tab"], [data-toggle="tab"], [data-bs-toggle="tab"], '
+                        '.tab, .tabs__item, .tabs-item')
+PRODUCT_TAB_LABEL = re.compile(r'характеристик|параметр|описани|документ|сертификат|инструкци|'
+                               r'размер|specification|technical|description|document|download', re.I)
+
+
+def has_unloaded_product_tabs(html: str) -> bool:
+    """Явная товарная вкладка с пустой/отсутствующей панелью требует клика.
+
+    Скрытый, но уже заполненный HTML не требует браузера. Обычные якоря,
+    отзывы и кнопки меню не считаем вкладками характеристик. Это гейт лестницы,
+    а также связанных аккордеонов и окон характеристик.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+
+    def populated(panel, label=''):
+        if panel is None:
+            return False
+        text = panel.get_text(' ', strip=True)
+        # В склеенной секции заголовок добавлен самим краулером, это не данные панели.
+        if label and text.casefold().startswith(label.casefold()):
+            text = text[len(label):].strip()
+        loading = re.fullmatch(r'(?:загрузка|загружается|loading|please wait)[\s.…!]*', text, re.I)
+        return bool((text and not loading) or panel.select_one('img[src], a[href]'))
+
+    merged = {section.get('data-tab', '').strip().casefold()
+              for section in soup.select('section[data-tab]')
+              if populated(section, section.get('data-tab', '').strip())}
+    for tab in soup.select(PRODUCT_TAB_SELECTOR):
+        label = tab.get_text(' ', strip=True)
+        if not PRODUCT_TAB_LABEL.search(label) or label.casefold() in merged:
+            continue
+        target = tab.get('aria-controls')
+        if not target:
+            ref = tab.get('data-bs-target') or tab.get('data-target') or tab.get('href') or ''
+            if not ref.startswith('#'):
+                continue
+            target = ref[1:]
+        if target and not populated(soup.find(id=target)):
+            return True
+    controls = list(product_panel_controls(soup))
+    tab_controls = soup.select(PRODUCT_TAB_SELECTOR)
+    targets_by_label = {}
+    for _, label, target in controls:
+        targets_by_label.setdefault(label.strip().casefold(), set()).add(target)
+    for control, label, target in controls:
+        # Старый AJAX-tabs снимок связан подписью, а не data-product-panel.
+        # Одна подпись не подтверждает сразу несколько разных панелей.
+        if (label.strip().casefold() in merged
+                and len(targets_by_label[label.strip().casefold()]) == 1
+                and any(control is tab for tab in tab_controls)):
+            continue
+        snapshot = soup.find('section', attrs={'data-product-panel': target})
+        if panel_populated(snapshot, label):
+            continue
+        if not panel_populated(soup.find(id=target), label):
+            return True
+    return False
+
+
 def is_unrendered_store_listing(html: str) -> bool:
     """True для Tilda store-ЛИСТИНГА (каталога), плитки товаров которого рисуются JS.
 
@@ -310,4 +371,8 @@ def is_unrendered_store_listing(html: str) -> bool:
         return False
     if 'var product' in html:
         return False  # страница одиночного товара, а не листинг
+    soup = BeautifulSoup(html, 'html.parser')
+    if (not soup.select_one('.js-store-grid-cont, .t-store__grid, .t-store__card')
+            and tilda_product_links(soup, 'https://catalog.invalid/')):
+        return False  # Публичные окна уже дают адреса товаров, JS-сетка не нужна.
     return re.search(r'tproduct[/-]\d', html) is None

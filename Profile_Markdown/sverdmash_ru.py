@@ -65,50 +65,9 @@ def _is_drawing_table(table) -> bool:
     return False
 
 
-def _row_has_hspan(row) -> bool:
-    """В строке есть соседние ОДИНАКОВЫЕ непустые ячейки — признак сгруппированной шапки
-    (значение colspan-ячейки размножено денормализацией). У баннера на всю ширину такого нет
-    (текст только в первой ячейке), поэтому баннеры под правило не попадают."""
-    return any(row[i] and row[i] == row[i - 1] for i in range(1, len(row)))
-
-
-def _row_looks_like_data(row) -> bool:
-    """Строка похожа на ДАННЫЕ (а не на подзаголовки): половина+ непустых ячеек — чисто
-    числовые/прочерк. Нужна, чтобы не «склеить» шапку со строкой данных."""
-    vals = [c.strip() for c in row if c and c.strip()]
-    if not vals:
-        return False
-    nums = sum(1 for c in vals if re.fullmatch(r'[\d\s.,\-–—]+', c))
-    return nums >= max(2, len(vals) // 2)
-
-
 def _spec_table_md(table, conv) -> str:
-    """Таблица характеристик → markdown с ОБЪЕДИНЕНИЕМ двухуровневой шапки (группа +
-    подстолбец) в один ряд УНИКАЛЬНЫХ заголовков «Группа: Подстолбец». Так одноимённые
-    подстолбцы под разными группами (напр. «Частота вращения» и у насоса, и у
-    электродвигателя) не сливаются и LLM не теряет значения (потеря значений недопустима).
-    Таблицы с обычной одноуровневой шапкой не меняются. Объединённые ячейки данных
-    (rowspan/colspan) уже развёрнуты денормализацией."""
-    flat = conv._denormalize_table_matrix(conv._parse_table(table))
-    if not flat:
-        return ''
-    if len(flat) >= 3 and _row_has_hspan(flat[0]) and not _row_looks_like_data(flat[1]):
-        group, sub = flat[0], flat[1]
-        header = []
-        for g, s in zip(group, sub):
-            g = (g or '').strip()
-            s = (s or '').strip()
-            header.append(f"{g}: {s}" if (g and s and g != s) else (s or g))
-        body = flat[2:]
-    else:
-        header, body = flat[0], flat[1:]
-
-    def _row_md(r):
-        return "| " + " | ".join(c if c else " " for c in r) + " |"
-
-    lines = [_row_md(header), "| " + " | ".join("---" for _ in header) + " |"]
-    lines += [_row_md(r) for r in body]
-    return "\n".join(lines)
+    """Общая обработка групп, всех уровней шапки и абзацев ячеек."""
+    return conv.convert_table(table, '').strip()
 
 
 def extract(html: str, base_url: str = '') -> str | None:
@@ -121,6 +80,7 @@ def extract(html: str, base_url: str = '') -> str | None:
 
     container = _content_container(h1)
     conv = MarkdownConverter(heading_style='ATX', bullets='-')
+    conv.structured_tables = True
     h1_text = h1.get_text(' ', strip=True)
     parts = [f"# {h1_text}"]
 

@@ -6,6 +6,7 @@ claude_work/Анализ системы/АРХИТЕКТУРА_ПРОФИЛИР�
 """
 from dataclasses import dataclass, field, fields as dc_fields
 from typing import Optional
+import re
 
 
 # Допустимые значения enum-полей (единственный источник истины для валидатора).
@@ -36,15 +37,34 @@ class CrawlLimits:
 
 
 @dataclass
+class InlineProductsProfile:
+    """Опубликованные товары внутри одной страницы; выбор подтверждён профилем."""
+    paths: list = field(default_factory=lambda: ['/'])
+    item_selector: str = ''
+    name_selector: str = ''
+    content_selectors: list = field(default_factory=list)
+    id_pattern: Optional[str] = None  # DOM-id; без него — стандартный текстовый якорь по названию
+    name_prefix_selector: Optional[str] = None  # подпись перед названием для различения одноимённых товаров
+
+
+@dataclass
 class CrawlProfile:
     render: Optional[str] = None          # None|html|browser (browser = сразу Playwright, SPA)
     antibot: str = 'none'                 # none|impersonate|warmup|blocked
     ajax_tabs: bool = False               # <- config.ajax_product_tabs_domains (D01)
     bitrix_offers: bool = False           # <- config.bitrix_offers_domains (D82)
+    contact_ready_selector: Optional[str] = None  # готовность динамических контактов/дилеров
+    tab_selector: Optional[str] = None  # кнопки AJAX-вкладок конкретного сайта
     tab_panel_selector: Optional[str] = None  # пер-сайтовый селектор панели вкладки
+    inline_products: Optional[InlineProductsProfile] = None
     equivalent_domains: list = field(default_factory=list)  # <- config.equivalent_domains
+    file_hosts: list = field(default_factory=list)  # точные CDN-хосты, только файлы/картинки
     strict_www: bool = False              # <- config.strict_www_domains
     subdomain_collapse: list = field(default_factory=list)  # ['*.hms.ru'] -> hms.ru
+    ignored_query_params: list = field(default_factory=list)  # подтверждённый шум этого сайта
+    query_noise_paths: list = field(default_factory=list)    # точные пути; [] = весь сайт
+    strip_ru_prefix_paths: list = field(default_factory=list) # префиксы путей без /ru
+    repair_region_entity: bool = False                       # D98: только ®ion=, не произвольный ®
     exclude_paths: list = field(default_factory=list)       # <- config.exclude_url_patterns_by_domain
     limits: CrawlLimits = field(default_factory=CrawlLimits)
     load: LoadProfile = field(default_factory=LoadProfile)
@@ -195,21 +215,56 @@ def _build_crawl(data, errors) -> CrawlProfile:
             _err(errors, 'crawl.antibot', f'допустимо: {ANTIBOT_VALUES}')
         else:
             cp.antibot = data['antibot']
-    for name in ('ajax_tabs', 'bitrix_offers', 'strict_www'):
+    for name in ('ajax_tabs', 'bitrix_offers', 'strict_www', 'repair_region_entity'):
         if name in data:
             setattr(cp, name, _check_bool(errors, f'crawl.{name}', data[name]))
-    if 'tab_panel_selector' in data and data['tab_panel_selector'] is not None:
-        if not isinstance(data['tab_panel_selector'], str):
-            _err(errors, 'crawl.tab_panel_selector', 'ожидается строка или null')
-        else:
-            cp.tab_panel_selector = data['tab_panel_selector']
-    for name in ('equivalent_domains', 'subdomain_collapse', 'exclude_paths'):
+    for name in ('tab_selector', 'tab_panel_selector', 'contact_ready_selector'):
+        if name in data and data[name] is not None:
+            if not isinstance(data[name], str):
+                _err(errors, f'crawl.{name}', 'ожидается строка или null')
+            else:
+                setattr(cp, name, data[name])
+    for name in ('equivalent_domains', 'file_hosts', 'subdomain_collapse', 'exclude_paths',
+                 'ignored_query_params', 'query_noise_paths', 'strip_ru_prefix_paths'):
         if name in data:
             setattr(cp, name, _check_str_list(errors, f'crawl.{name}', data[name]))
     if 'limits' in data:
         cp.limits = _build_limits(data['limits'], errors)
     if 'load' in data:
         cp.load = _build_load(data['load'], errors)
+    if data.get('inline_products') is not None:
+        raw = data['inline_products']
+        path = 'crawl.inline_products'
+        if not isinstance(raw, dict):
+            _err(errors, path, 'ожидается объект или null')
+        else:
+            _pop_known(errors, path, raw, tuple(f.name for f in dc_fields(InlineProductsProfile)))
+            inline = InlineProductsProfile()
+            for name in ('item_selector', 'name_selector'):
+                if not isinstance(raw.get(name), str) or not raw[name].strip():
+                    _err(errors, f'{path}.{name}', 'ожидается непустой CSS-селектор')
+                else:
+                    setattr(inline, name, raw[name])
+            for name in ('paths', 'content_selectors'):
+                value = _check_str_list(errors, f'{path}.{name}', raw.get(name, getattr(inline, name)))
+                if not value or any(not x.strip() for x in value):
+                    _err(errors, f'{path}.{name}', 'ожидается непустой список')
+                setattr(inline, name, value)
+            pattern = raw.get('id_pattern')
+            if raw.get('name_prefix_selector') is not None:
+                if not isinstance(raw['name_prefix_selector'], str) or not raw['name_prefix_selector'].strip():
+                    _err(errors, f'{path}.name_prefix_selector', 'ожидается CSS-селектор или null')
+                else:
+                    inline.name_prefix_selector = raw['name_prefix_selector']
+            if pattern is not None:
+                try:
+                    if not isinstance(pattern, str) or not pattern:
+                        raise ValueError()
+                    re.compile(pattern)
+                    inline.id_pattern = pattern
+                except (ValueError, re.error):
+                    _err(errors, f'{path}.id_pattern', 'ожидается регулярное выражение или null')
+            cp.inline_products = inline
     return cp
 
 

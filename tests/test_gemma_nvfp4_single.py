@@ -1,4 +1,4 @@
-"""Контракт внедрения v37: один запрос, зафиксированный промпт и совместимость старых моделей."""
+"""Контракт внедрения v39: один запрос, зафиксированный промпт и совместимость старых моделей."""
 import asyncio
 import hashlib
 import json
@@ -10,10 +10,10 @@ from ai_integration import AITunnelClient
 from gemma_nvfp4_single_prompt import SYSTEM, USER_TEMPLATE
 
 
-def test_prompt_is_frozen_v37():
+def test_prompt_is_frozen_v39():
     source = Path(__file__).resolve().parents[1] / 'gemma_nvfp4_single_prompt.py'
     assert hashlib.sha256(source.read_bytes()).hexdigest() == (
-        '9fad9b841bcec547cc40c0bee9b296790ca15d2a511e4d477115eb8b2a678862')
+        'ce3d0ed9f3230b98a78eb03ab6ab9d2c66a21271d13c98b49d360d73c3a18007')
 
 
 @pytest.mark.parametrize('reply', [
@@ -22,7 +22,7 @@ def test_prompt_is_frozen_v37():
         'nominal_voltage': '220 В', 'Цена': '1200 руб.', 'Длина': '120 мм'}}},
     None,
 ])
-def test_nvfp4_dispatches_one_call_with_v37_and_keeps_result_contract(reply):
+def test_nvfp4_dispatches_one_call_with_v39_and_keeps_result_contract(reply):
     requests = []
     text = '# Панель\n' + 'Данные {с фигурными скобками}\n' * 5000
     page_url = 'https://example.com/catalog/panel/'

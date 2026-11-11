@@ -1,5 +1,5 @@
 domain: kolpa-san.ru
-profile_version: 1
+profile_version: 2
 profiled_at: '2026-08-18'
 source: manual
 confidence: 1.0
@@ -9,3 +9,7 @@ extract:
   tier: custom
   custom_module: kolpa_san_ru
   needs_raw_html: true
+crawl:
+  file_hosts: [kolpa-files.ru]
+sections:
+  distributor_urls: ['https://kolpa-san.ru/stores']

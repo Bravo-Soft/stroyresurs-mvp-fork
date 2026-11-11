@@ -162,3 +162,64 @@ class ProductIDManager:
         valid_ids = {id_ for id_ in existing_ids if self.validate_product_id(id_)}
         self.processed_ids.update(valid_ids)
         log.info(f"Загружено {len(valid_ids)} существующих product_id")
+
+def restore_source_variant_name(ai_data: Dict[str, Any], html: str, source_url: str) -> None:
+    """Восстанавливает серии НЗМК, режимы ГМС и цвет mix исполнения Tegola.
+
+    Остальные имена и алгоритм ID не меняются. Отличитель нужен и для ID,
+    и для имени папки карточки; источник проверяет принадлежность Nuxt текущему URL.
+    """
+    _restore_nzmk_variant_name(ai_data, html, source_url)
+    from Profile_Markdown.hms_livgidromash_ru import restore_model_name
+    restore_model_name(ai_data, html, source_url)
+    from Profile_Markdown.tegola_ru import _product
+
+    source = _product(html, source_url)
+    product = ai_data.get('product')
+    if not source or not isinstance(product, dict):
+        return
+    variants = source.get('variants') or []
+    if len(variants) != 1 or not isinstance(variants[0], dict):
+        return
+    variant_title = variants[0].get('title') or ''
+    match = re.search(r'\(([^()]*\bmix)\)', variant_title, re.IGNORECASE)
+    name = product.get('product_name')
+    if not match or not isinstance(name, str) or not name.strip():
+        return
+    qualifier = match.group(1).strip()
+    words = lambda text: re.findall(r'[a-zа-яё0-9]+', text.casefold())
+    if set(words(qualifier)).issubset(words(name)):
+        return
+    # Суффикс производителя остаётся последним, как требует контракт карточки.
+    suffix = re.search(r'\s+(\([^()]+\))\s*$', name)
+    if suffix:
+        product['product_name'] = name[:suffix.start()] + ' (' + qualifier + ')' + name[suffix.start():]
+    else:
+        product['product_name'] = name.rstrip() + ' (' + qualifier + ')'
+
+
+def _restore_nzmk_variant_name(ai_data, html, source_url):
+    """Различает серии одинакового семейства по явным маркам исходной таблицы."""
+    from urllib.parse import urlparse
+    if (urlparse(source_url).hostname or '').lower().removeprefix('www.') != 'nzmk22.ru':
+        return
+    product = ai_data.get('product')
+    if not isinstance(product, dict) or not isinstance(product.get('product_name'), str):
+        return
+    from source_product_tables import extract_source_tables
+    tables = extract_source_tables(html, source_url)
+    marks = list(dict.fromkeys(row[0] for table in tables
+                              if table['headers'][0] == 'Марка изделия'
+                              for row in table['rows'] if row[0]))
+    if not marks:
+        return
+    name = product['product_name']
+    missing = [mark for mark in marks if mark.casefold() not in name.casefold()]
+    if not missing:
+        return
+    qualifier = ', '.join(missing)
+    suffix = re.search(r'\s+(\([^()]+\))\s*$', name)
+    if suffix:
+        product['product_name'] = name[:suffix.start()] + ' (' + qualifier + ')' + name[suffix.start():]
+    else:
+        product['product_name'] = name.rstrip() + ' (' + qualifier + ')'

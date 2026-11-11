@@ -71,7 +71,7 @@ class BaseReportGenerator:
             elif analysis_status == ChangeType.EDITING:
                 return "Есть изменения"
             elif analysis_status == ChangeType.NO_CHANGES:
-                return "Нет изменений"
+                return "Изменений нет"
             elif analysis_status == ChangeType.SITE_NOT_WORKING:
                 return "Сайт не найден"
             elif analysis_status == ChangeType.NEW_DATA:
@@ -88,7 +88,7 @@ class BaseReportGenerator:
         elif status_str == ChangeType.EDITING.value or status_str == "Есть изменения":
             return "Есть изменения"
         elif status_str == ChangeType.NO_CHANGES.value or status_str == "Нет изменений":
-            return "Нет изменений"
+            return "Изменений нет"
         elif status_str == ChangeType.SITE_NOT_WORKING.value or status_str == "Сайт не найден":
             return "Сайт не найден"
         elif status_str == ChangeType.NEW_DATA.value or status_str == "Новые данные":
@@ -96,7 +96,7 @@ class BaseReportGenerator:
         elif status_str == ChangeType.DATA_NOT_FOUND.value or status_str == "Данные не найдены":
             return "Данные не найдены"
         
-        return "Нет изменений"
+        return "Изменений нет"
     
     def _extract_head_office_contact(self, contacts: Any, debug_info: str = "") -> str:
         """Извлечение контакта главного офиса по ключевым словам с удалением префикса"""

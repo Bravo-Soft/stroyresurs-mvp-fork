@@ -2,6 +2,7 @@
 import aiohttp
 import asyncio
 import logging
+from datetime import datetime
 import json
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
@@ -91,92 +92,13 @@ class ApiClient:
                 log.error(f"Превышено количество попыток: {e}")
                 return False
     
-    async def update_company_report_date(self, company_id: str, report_date: str) -> bool:
-        """
-        Обновление report_date для компании
-        
-        Args:
-            company_id: ID компании
-            report_date: Новая дата отчета (ISO формат с временем)
-            
-        Returns:
-            bool: Успех операции
-        """
-        try:
-            payload = {
-                "companies": [{
-                    "id": company_id,
-                    "report_date": report_date
-                }],
-                "verification_date": report_date
-            }
-            
-            success = await self._send_add_request(payload)
-            
-            if success:
-                log.info(f"report_date обновлен для компании {company_id}: {report_date}")
-                return True
-            else:
-                log.error(f"Не удалось обновить report_date для компании {company_id}")
-                return False
-                
-        except Exception as e:
-            log.error(f"Ошибка обновления report_date для компании {company_id}: {e}")
-            return False
-    
-    async def update_companies_report_dates(self, company_ids: List[str], report_date: str) -> Tuple[bool, str]:
-        """
-        Массовое обновление report_date для списка компаний
-        
-        Args:
-            company_ids: Список ID компаний
-            report_date: Новая дата отчета (ISO формат с временем)
-            
-        Returns:
-            Tuple[bool, str]: (успех, сообщение)
-        """
-        try:
-            if not company_ids:
-                return True, "Нет компаний для обновления"
-            
-            # Используем чанки по 5 компаний (как для продуктов)
-            chunk_size = 5
-            total_updated = 0
-            
-            for i in range(0, len(company_ids), chunk_size):
-                chunk = company_ids[i:i + chunk_size]
-                
-                companies_payload = []
-                for company_id in chunk:
-                    companies_payload.append({
-                        "id": company_id,
-                        "report_date": report_date
-                    })
-                
-                payload = {
-                    "companies": companies_payload,
-                    "verification_date": report_date
-                }
-                
-                success = await self._send_add_request(payload)
-                
-                if success:
-                    total_updated += len(chunk)
-                    log.debug(f"Обновлено {len(chunk)} компаний в чанке {i//chunk_size + 1}")
-                else:
-                    log.warning(f"Ошибка при обновлении чанка {i//chunk_size + 1}")
-            
-            log.info(f"report_date обновлен для {total_updated} из {len(company_ids)} компаний")
-            
-            if total_updated == len(company_ids):
-                return True, f"Даты отчетов обновлены для всех {total_updated} компаний"
-            else:
-                return False, f"Даты отчетов обновлены для {total_updated} из {len(company_ids)} компаний"
-                
-        except Exception as e:
-            log.error(f"Ошибка массового обновления report_date: {e}")
-            return False, f"Ошибка обновления дат: {str(e)}"
-    
+    async def confirm_report_version(self, company_id, report_date, version):
+        return await self._send_add_request({
+            "companies": [{"id": company_id, "report_date": report_date,
+                           "report_version": version}],
+            "verification_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+
     async def upload_archive(self, archive_path: Path, date_str: str, user_id: str) -> Tuple[bool, str, Optional[str]]:
         """
         Загрузка архива на сервер.
@@ -191,7 +113,8 @@ class ApiClient:
             upload_path = f"{date_str}/{user_id}"
             full_url = f"{self.upload_url}/{upload_path}"
 
-            log.info(f"Загрузка архива: {archive_path.name} -> {full_url}")
+            archive_size_mb = archive_path.stat().st_size / (1024 * 1024)
+            log.info(f"Загрузка архива: {archive_path.name} ({archive_size_mb:.2f} МБ) -> {full_url}")
 
             async with await self._create_session() as session:
                 with open(archive_path, 'rb') as f:
@@ -215,7 +138,18 @@ class ApiClient:
                             return True, "Архив успешно загружен", download_url
 
                         elif response.status == 413:
-                            return False, "Файл слишком большой (максимум 200 MB)", None
+                            log.error(
+                                "Загрузка архива отклонена (HTTP 413): размер=%.2f МБ; "
+                                "настройка бота=%s МБ; Server=%r; Content-Type=%r; ответ=%r",
+                                archive_size_mb, self.config.max_archive_size_mb,
+                                response.headers.get('Server'),
+                                response.headers.get('Content-Type'), response_text[:2000]
+                            )
+                            return False, (
+                                f"Сервер или прокси отклонил архив размером {archive_size_mb:.2f} МБ "
+                                f"(HTTP 413). В настройках бота указано {self.config.max_archive_size_mb} МБ; "
+                                "фактический лимит загрузки нужно проверить на сервере."
+                            ), None
 
                         elif response.status == 500:
                             return False, f"Ошибка сервера: {response_text}", None

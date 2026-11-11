@@ -8,6 +8,7 @@ import tempfile
 import subprocess
 from typing import Dict, Any, List, Union, Tuple, Optional
 from collections import Counter
+from urllib.parse import urlparse
 
 from docx import Document
 from docx.shared import Inches, Pt
@@ -189,7 +190,8 @@ class DOCXGenerator:
             # Градус, набранный НУЛЁМ в суперскрипте («уставок, ^0С» с сайтов с <sup>0</sup>С):
             # каретка с нулём перед С/C — значок градуса, не степень (далее сводится к ' C').
             line = re.sub(r'\^0(?=[ \t]*[СCсc](?![А-Яа-яёЁA-Za-z]))', '°', line)
-            line = re.sub('[ \t]*[°˚º⁰\u030a][ \t]*[СCсc](?![А-Яа-яёЁA-Za-z])', ' C', line)
+            # U+25E6 («65◦С») тоже используется как градус; в Windows-1251 его нет.
+            line = re.sub('[ \t]*[°˚º⁰ᵒ\u030a◦][ \t]*[СCсc](?![А-Яа-яёЁA-Za-z])', ' C', line)
             line = re.sub(r"[{}\[\]º˚®©°⁰#*∗™«»" "\u030a" "]", "", line)
             # Кавычки убираем, НО дюймовую метку после цифры («2"», «3/4"», ← из «2″») щадим.
             line = line.replace("'", "")
@@ -249,6 +251,55 @@ class DOCXGenerator:
         except Exception as e:
             log.warning(f"Не удалось задать ширину таблицы на 100%: {e}")
 
+    @staticmethod
+    def _expand_product_name(name: str, source_url: str) -> str:
+        """Расшифровка АОГВ в карточке Конорда без изменения модели и product_id."""
+        if (urlparse(source_url).hostname or '').removeprefix('www.') != 'konord.com':
+            return name
+        expansion = 'Аппарат отопительный газовый водогрейный'
+        if expansion.casefold() in name.casefold():
+            return name
+        name = re.sub(r'^Кот[её]л\s+(?=АОГВ\b)', '', name, flags=re.I)
+        return re.sub(r'\bАОГВ\b', lambda match: expansion + ' ' + match.group(), name, flags=re.I)
+
+    @staticmethod
+    def _group_aksa_specifications(specifications: Dict[str, Any], source_url: str) -> Dict[str, Any]:
+        """Единые блоки Aksa для отображения; исходный JSON остаётся неизменным."""
+        if (urlparse(source_url).hostname or '').removeprefix('www.') != 'aksa.com.ru':
+            return specifications
+        groups = {
+            'Двигатель': {
+                'Производитель двигателя', 'Модель двигателя', 'Страна происхождения',
+                'Страна сборки', 'Страна происхождения двигателя', 'Страна сборки двигателя',
+                'Мощность', 'Мощность двигателя', 'Количество цилиндров', 'Расположение цилиндров',
+                'Рабочий объем двигателя', 'Система впуска воздуха',
+                'Частота вращения вала двигателя', 'Диаметр цилиндра', 'Ход поршня',
+            },
+            'Альтернатор': {
+                'Производитель генератор', 'Производитель генератора', 'Модель генератора',
+                'Страна сборки генератора', 'Тип альтернатора', 'Ток', 'Род тока',
+                'Номинальный коэффициент мощности', 'Класс изоляции',
+            },
+            'Топливная система': {
+                'Топливный бак', 'Расход топлива при 50% нагрузке',
+                'Расход топлива при 75% нагрузке', 'Расход топлива при 100% нагрузке',
+            },
+            'Масляная система': {'Объем системы смазки', 'Рекомендуемый тип масла', 'Удельный расход масла'},
+            'Система охлаждения': {'Емкость системы охлаждения', 'Минимальная t C запуска (без подогревателя ОЖ)'},
+        }
+        grouped = specifications.copy()
+        for section, fields in groups.items():
+            existing = grouped.get(section, {})
+            if not isinstance(existing, dict):
+                continue
+            attributes = existing.copy()
+            for key in list(grouped):
+                if key in fields and key not in attributes:
+                    attributes[key] = grouped.pop(key)
+            if attributes:
+                grouped[section] = attributes
+        return grouped
+
     async def generate_product_card(self, product_data: Dict[str, Any],
                                 company_data: Dict[str, Any],
                                 product_folder: str) -> str:
@@ -290,7 +341,9 @@ class DOCXGenerator:
             self._setup_document_styles(doc)
 
             # Наименование товара
-            product_name = products_data.get('product_name', product_data.get('name', 'Неизвестный товар'))
+            source_url = product_data.get('source_url', '')
+            product_name = self._expand_product_name(
+                products_data.get('product_name', product_data.get('name', 'Неизвестный товар')), source_url)
             display_product_name = re.sub(r'\s*\([^)]*\)\s*$', '', product_name).strip()
             display_product_name = display_product_name.replace('/', '-').replace('\\', '-')
             if not display_product_name:
@@ -316,12 +369,18 @@ class DOCXGenerator:
 
             # Технические характеристики
             if specifications and self._is_valid_specifications(specifications):
-                self._add_specifications(doc, specifications)
+                display_specs = self._group_aksa_specifications(specifications, source_url)
+                self._add_specifications(doc, display_specs, ai_data.get('_table_layouts', []))
 
             # Варианты
             variants = products_data.get('variants', [])
             if variants:
                 self._add_variants(doc, variants)
+
+            colors = products_data.get('colors', [])
+            if colors:
+                self._add_generic_field(doc, "Цвета", '\n'.join(
+                    f'- {color.strip()}' for color in colors if color and color.strip()))
 
             # Дополнительные блоки (complectation, applications, ...)
             fields_order = [
@@ -343,7 +402,6 @@ class DOCXGenerator:
                     self._add_generic_field(doc, display_name, value)
 
             # Добавляем источник
-            source_url = product_data.get('source_url', '')
             if source_url:
                 self._add_source_url(doc, source_url)
 
@@ -491,11 +549,11 @@ class DOCXGenerator:
                 return False
         return True
 
-    def _flatten_nested_dict(self, nested_dict: Dict[str, Any], parent_key: str = "") -> List[Tuple[str, str]]:
+    def _flatten_nested_dict(self, nested_dict: Dict[str, Any], parent_key: str = "") -> List[Tuple[str, Any]]:
         """
         Рекурсивно разворачивает вложенный словарь в список пар (ключ, значение) для двухстолбцовой таблицы.
         Если значение – словарь, то рекурсивно обходит его, формируя составной ключ через разделитель " → ".
-        Возвращает список кортежей (key, value), где value – уже строка (может быть многострочной).
+        Сохраняет исходные значения: разделители и списки обрабатываются при заполнении ячейки.
         """
         items = []
         for k, v in nested_dict.items():
@@ -508,9 +566,7 @@ class DOCXGenerator:
                 else:
                     items.extend(self._flatten_nested_dict(v, full_key))
             else:
-                # Преобразуем значение в многострочный текст, если нужно
-                clean_value = self._clean_text(str(v))
-                items.append((full_key, clean_value))
+                items.append((full_key, v))
         return items
 
     def _add_text_block_from_dict(self, doc: Document, outer_key: str, inner_dict: Dict[str, Any]):
@@ -551,7 +607,7 @@ class DOCXGenerator:
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             p.paragraph_format.left_indent = Inches(0.25)
-            run = p.add_run(f"- {self._clean_text(self._strip_dup_suffix(name))}")
+            run = p.add_run(self._normalize_list_text(f"- {self._clean_text(self._strip_dup_suffix(name))}"))
             run.font.name = 'Calibri'
             run.font.size = Pt(12)
                 
@@ -739,6 +795,79 @@ class DOCXGenerator:
         # Одна пустая строка после блока
         doc.add_paragraph()
 
+    def _normalize_list_text(self, text: str, field_name: str = '') -> str:
+        """Оформляет перечни; одиночный текст и инструкцию выводит без маркеров."""
+        def finish_item(line):
+            item = line.rstrip().rstrip(',;')
+            # Точка сокращения («шт.», «т.д.») относится к тексту пункта.
+            if not re.search(r'(?:\b(?:шт|мм|см|м|кг|г|л|т)|\b\w+\.\w+)\.$', item):
+                item = item.rstrip('.')
+            return item + ';'
+        lines = str(text).split('\n')
+        unordered = re.compile(r'^[ \t]*[-–—•*·][ \t]+(?=\S)')
+        marker = re.compile(r'^[ \t]*(?:[-–—•*·]|\d+[.)])[ \t]+.+')
+        # Модель также помечает дефисом обычные абзацы. Один пункт в текстовом
+        # разделе не образует перечень; действия инструкции выводим строками.
+        if field_name and (field_name == 'Инструкции по применению'
+                           or sum(bool(marker.match(line)) for line in lines) == 1):
+            lines = [unordered.sub('', line) for line in lines]
+        for idx, line in enumerate(lines):
+            if not marker.match(line):
+                continue
+            end = idx
+            # Строка с отступом без нового маркера продолжает тот же пункт.
+            while (end + 1 < len(lines) and lines[end + 1].strip()
+                   and lines[end + 1].startswith((' ', '\t'))
+                   and not marker.match(lines[end + 1])):
+                end += 1
+            lines[end] = finish_item(lines[end])
+        return '\n'.join(lines)
+
+    def _normalize_complectation_text(self, text: str) -> str:
+        """Отделяет название компонента от явно указанного количества: «Блоки: 50 шт.».
+
+        Ищем количество в конце пункта или перед пояснением в скобках.
+        Перечисленные через запятую «компоненты» обрабатываем раздельно.
+        Числа в названиях и «м^3» сохраняем.
+        Пункты без количества и связные фразы «по 50 шт.» сохраняем.
+        """
+        number = r'\d+(?:[ \u00a0]\d{3})*(?:[.,][ \t]*\d+)?'
+        amount = rf'{number}(?:[ \t]*[-–—][ \t]*{number})?'
+        amount = rf'{amount}(?:[ \t]+(?:или|и)[ \t]+{amount})*'
+        unit = (r'(?:шт\.?|штук(?:а|и)?|компл\.?|комплект(?:а|ов|ы)?|'
+                r'упак\.?|упаков(?:ка|ки|ок)|кг|г|т|мл|л\.?|'
+                r'пог\.?[ \t]*м\.?|м(?:\^[23]|[²³23])?\.?)')
+        quantity = rf'{amount}[ \t]*{unit}(?:[ \t]+(?:или|и)[ \t]+{amount}[ \t]*{unit})*'
+        tail = r'((?:[ \t]*\([^()\n]*\))?[.,;]?[ \t]*)'
+        pattern = re.compile(rf'(.+?)[ \t]+({quantity}){tail}$', re.IGNORECASE)
+        attached = re.compile(rf'(.+?)[-–—:]({quantity}){tail}$', re.IGNORECASE)
+        # Явный разделитель после индекса компонента сильнее похожего на диапазон числа:
+        # «Компонент А 1 – 22,9 кг» означает компонент А 1 и количество 22,9.
+        separated = re.compile(rf'(.+?)[ \t]+[-–—:][ \t]+({quantity}){tail}$', re.IGNORECASE)
+        abbreviation = re.compile(
+            r'(?:(?<![^\W\d_])(?:шт|мм|см|м|кг|г|л|т|компл|упак|пог)|\b\w+\.\w+)\.$',
+            re.IGNORECASE)
+        lines = str(text).split('\n')
+        for idx, line in enumerate(lines):
+            parts = re.split(r'(,[ \t]*(?=компонент\b))', line, flags=re.IGNORECASE)
+            for part_idx, part in enumerate(parts):
+                # Сначала пробел: «KIT-08 - 1 шт.» не должен стать количеством «08-1 шт.».
+                match = (separated.fullmatch(part) or pattern.fullmatch(part)
+                         or attached.fullmatch(part))
+                if not match:
+                    continue
+                name = match.group(1).rstrip()
+                if (not re.search(r'[^\W\d_]', name)
+                        or re.search(r'\b(?:по|из|от|до)$', name, re.IGNORECASE)):
+                    continue
+                name = name.rstrip(': \t-–—')
+                # Точку конца фразы убираем, точки сокращений («2 шт.») сохраняем.
+                if not abbreviation.search(name):
+                    name = name.rstrip('.')
+                parts[part_idx] = name + ': ' + match.group(2) + match.group(3)
+            lines[idx] = ''.join(parts)
+        return '\n'.join(lines)
+
     def _add_generic_field(self, doc: Document, field_name: str, field_value: str):
         """
         Добавление текстового блока с сохранением форматирования + поддержка таблиц.
@@ -753,11 +882,13 @@ class DOCXGenerator:
             return
 
         try:
-            # Пробуем преобразовать в число (строки вида "0", "0.0", "0 кг" -> отбросим).
-            # Десятичная запятая: «0,5 кг» — это 0.5 (не 0), такое поле НЕ отбрасываем.
-            numeric_part = re.search(r'\d+(?:[.,]\d+)?', str(field_value))
+            # Отбрасываем только целиком нулевую заглушку, а не первое число текста:
+            # «Температура применения, C: 0/+45» содержит допустимую нулевую границу.
+            numeric_part = re.fullmatch(
+                r'([+-]?\d+(?:[.,]\d+)?)\s*(?:кг|г|т|мм|см|м|мл|л)?\.?',
+                str(field_value).strip(), re.IGNORECASE)
             if numeric_part:
-                num = float(numeric_part.group().replace(',', '.'))
+                num = float(numeric_part.group(1).replace(',', '.'))
                 if num == 0.0:
                     log.info(f"Поле '{field_name}' имеет значение 0 – пропускаем")
                     return
@@ -769,7 +900,7 @@ class DOCXGenerator:
 
         # Какие блоки должны быть выровнены строго слева
         left_aligned_fields = [
-            "Комплектация", "Область применения", "Преимущества",
+            "Цвета", "Комплектация", "Область применения", "Преимущества",
             "Совместимость", "Инструкции по применению", "Условия эксплуатации", 
             "Условия хранения", "Меры безопасности", "Габариты", "Вес"
         ]
@@ -790,7 +921,9 @@ class DOCXGenerator:
             else:
                 p.paragraph_format.first_line_indent = Inches(0.25)
 
-            self._add_text_runs(p, text_block)
+            if field_name == "Комплектация":
+                text_block = self._normalize_complectation_text(text_block)
+            self._add_text_runs(p, self._normalize_list_text(text_block, field_name))
 
         def is_table_line(line: str) -> bool:
             """Определяет, является ли строка строкой таблицы Markdown"""
@@ -836,8 +969,9 @@ class DOCXGenerator:
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
-                    cell_text = self._separate_multivalues(text)  # перечни «0,5 0,7» -> «0,5; 0,7»
+                    cell_text = text
                     if c_idx > 0 and r_idx > 0:
+                        cell_text = self._separate_multivalues(cell_text)
                         # D49: ключ-перечень в первой ячейке («…: — …; — …») → «3 1» -> «3; 1»
                         cell_text = self._separate_subitem_values(row_key, cell_text)
                     self._add_text_runs(p, cell_text, bold=(r_idx == 0))  # первая строка — заголовок
@@ -941,12 +1075,56 @@ class DOCXGenerator:
         return list(groups.values())
     
     def _separate_multivalues(self, text: str) -> str:
-        """Перечень числовых значений в одной ячейке таблицы -> разделитель "; ".
-        «0,55 0,7 1,0» -> «0,55; 0,7; 1,0». Скоуп узкий и безопасный: ТОЛЬКО запятично-десятичные
-        токены (\\d+,\\d+) через пробел — это однозначно несколько значений. Целые через пробел НЕ
-        трогаем намеренно: это время/дата («07 11») и разделитель тысяч («10 000» -> НЕ «10; 000»).
-        Применяется во всех табличных путях (спецификации и markdown-таблицы описаний)."""
-        return re.sub(r'(\d+,\d+)\s+(?=\d+,\d+)', r'\1; ', str(text))
+        """Разделители перечня в значении ячейки -> "; " до общей очистки текста.
+        Сохраняет десятичные запятые без пробела, запятые внутри скобок/кавычек,
+        тысячи и даты. Слитный числовой перечень «4,5,5,6,7» неоднозначен:
+        его границы должны приходить из исходных данных, здесь их не угадываем.
+        """
+        text = str(text)
+        # Придаточное или поясняющее предложение не является перечнем значений.
+        if re.search(r',\s*(?:котор\w*|что|если|при этом|поскольку|так как|потому что|чтобы|когда|где)\b',
+                     text, re.IGNORECASE):
+            return text
+        if '\n' in text:
+            text = re.sub(r'(?m)^[ \t]*(?:[-–—•*·]|\d+[.)])[ \t]+', '', text)
+            text = "; ".join(line.strip().rstrip(';') for line in text.splitlines() if line.strip())
+        # Пунктуация внутри номера ГОСТ принадлежит идентификатору, не перечню.
+        standard_commas = set()
+        for match in re.finditer(
+                r'\bГОСТ(?:[ \t]+(?:Р|ИСО|ISO|МЭК|IEC)(?:/(?:ИСО|ISO|МЭК|IEC))?)*[ \t]+'
+                r'\d+(?:[.,][ \t]*\d+)*[ \t]*[-–—][ \t]*\d+', text, re.IGNORECASE):
+            standard_commas.update(match.start() + i for i, char in enumerate(match.group()) if char == ',')
+        # Диапазоны, размеры и десятичные с точкой позволяют различить запятые.
+        numeric_separators = set()
+        numeric_lists = (r'(?<![\d,])\d+[-–]\d+(?:,\d+[-–]\d+)+(?![\d,])'
+                         r'|(?<![\d,])\d+(?:[хxX×]\d+)+(?:,\d+(?:[хxX×]\d+)+)+(?![\d,])'
+                         r'|(?<![\w,.])\d+(?:\.\d+)?(?:,\d+(?:\.\d+)?)+(?![\d,.])')
+        for match in re.finditer(numeric_lists, text):
+            if (re.search(r'[-–.хxX×]', match.group())
+                    and not re.fullmatch(r'\d{1,3}(?:\.\d{3})+,\d+', match.group())):
+                numeric_separators.update(match.start() + i for i, c in enumerate(match.group()) if c == ',')
+        result = []
+        depth = 0
+        quote = None
+        for idx, char in enumerate(text):
+            if quote:
+                if char == quote:
+                    quote = None
+            elif char == '«' or (char == '"' and (idx == 0 or not text[idx - 1].isdigit())):
+                quote = '»' if char == '«' else char
+            elif char in '([{':
+                depth += 1
+            elif char in ')]}':
+                depth = max(0, depth - 1)
+            elif char == ',' and depth == 0 and idx not in standard_commas:
+                decimal = (idx > 0 and text[idx - 1].isdigit()
+                           and idx + 1 < len(text) and text[idx + 1].isdigit())
+                if not decimal or idx in numeric_separators:
+                    char = ';'
+            result.append(char)
+        text = ''.join(result)
+        text = re.sub(r'(\d+,\d+)[ \t]+(?=\d+,\d+)', r'\1; ', text)
+        return re.sub(r'[ \t]*;[ \t]*', '; ', text).rstrip()
 
     def _separate_subitem_values(self, key: Any, value: str) -> str:
         """Ячейка с НЕСКОЛЬКИМИ значениями под ключ-перечень (ВЭМЗ, требование заказчика 2026-07-07):
@@ -962,7 +1140,7 @@ class DOCXGenerator:
             return value
         return re.sub(r'(?<=\d)[ \t]+(?=\d)', '; ', str(value))
 
-    def _split_spec_value(self, value: str) -> List[str]:
+    def _split_spec_value(self, value: str, parameter: str = '') -> List[str]:
         """
         Преобразует строку для отображения в ячейке таблицы:
         - добавляет пробелы между числом и единицей измерения (10см → 10 см);
@@ -998,12 +1176,10 @@ class DOCXGenerator:
             pattern = rf'(\d+(?:[.,]\d+)?)({re.escape(unit)})(?![а-яА-Яa-zA-Z0-9])'
             text = re.sub(pattern, r'\1 \2', text, flags=re.IGNORECASE)
 
-        # ---- 2.5. Несколько числовых значений в одной ячейке -> разделитель "; " ----
-        text = self._separate_multivalues(text)
-
         # ---- 3. Разделение слитных буквенно-цифровых групп через "; " ----
         # НЕ выполняем, если строка похожа на размер (содержит разделитель размеров: х/Х/x/X/×)
-        if not re.search(r'[хХxX×]', text):
+        # KTA50G3 и QSX15G8 — буквальные обозначения моделей, а не перечни классов.
+        if not re.search(r'модел', str(parameter), re.I) and not re.search(r'[хХxX×]', text):
             prev = None
             while prev != text:
                 prev = text
@@ -1022,26 +1198,22 @@ class DOCXGenerator:
     def _format_table_value(self, value: Any) -> str:
         """
         Форматирование значения для ячейки многостолбчатой таблицы.
-        В конце применяется _clean_text для нормализации степеней.
+        Разделители нормализуются до _clean_text, чтобы «4, 5,5» не стало «4,5,5».
         """
         if value is None:
             return ""
         if isinstance(value, list):
-            return "\n".join(self._clean_text(str(v)) for v in value if str(v).strip() != "")
+            return "; ".join(self._format_table_value(v) for v in value
+                             if v is not None and str(v).strip() != "")
         if isinstance(value, dict):
             parts = []
             for k, v in value.items():
                 if v is None or str(v).strip() == "":
                     continue
-                if isinstance(v, list):
-                    sub = "\n".join(self._clean_text(str(x)) for x in v if str(x).strip() != "")
-                    parts.append(f"{k}: {sub}")
-                else:
-                    # D49: внутренний ключ-перечень («…: — для главных ножей; — для заземляющих»)
-                    # → значения «3 1» разделяются «; » и во вложенной форме «ключ: значение»
-                    parts.append(f"{k}: {self._separate_subitem_values(k, self._clean_text(str(v)))}")
-            return "\n".join(parts)
-        return self._clean_text(str(value))
+                # D49: внутренний ключ-перечень → значения «3 1» разделяются «; ».
+                parts.append(f"{self._clean_text(k)}: {self._separate_subitem_values(k, self._format_table_value(v))}")
+            return "; ".join(parts)
+        return self._clean_text(self._separate_multivalues(str(value)))
 
     def _build_multi_column_table(self, doc: Document, title: str, specs: Dict[str, Dict[str, Any]]) -> None:
         """
@@ -1100,7 +1272,7 @@ class DOCXGenerator:
                         continue
                     rows.append((k, v))
                 if rows:
-                    self._add_two_column_table(doc, rows, add_header=True)
+                    self._add_two_column_table(doc, rows, add_header=True, first_value_is_name=True)
                 continue
 
             # Все характеристики в группе одинаковые, можно взять из первого
@@ -1130,7 +1302,7 @@ class DOCXGenerator:
                     for idx, name in enumerate(names, start=1):
                         value = group[name].get(param, "")
                         formatted = self._separate_subitem_values(param, self._format_table_value(value))
-                        lines = self._split_spec_value(formatted)
+                        lines = self._split_spec_value(formatted, param)
                         cell_text = "\n".join(lines)
                         self._set_cell_style(row_cells[idx], cell_text, bold=False)
 
@@ -1163,7 +1335,7 @@ class DOCXGenerator:
                     for idx, param in enumerate(param_keys, start=1):
                         value = attrs.get(param, "")
                         formatted = self._separate_subitem_values(param, self._format_table_value(value))
-                        lines = self._split_spec_value(formatted)
+                        lines = self._split_spec_value(formatted, param)
                         cell_text = "\n".join(lines)
                         self._set_cell_style(row_cells[idx], cell_text, bold=False)
 
@@ -1193,7 +1365,7 @@ class DOCXGenerator:
                         for idx, name in enumerate(chunk_names, start=1):
                             value = group[name].get(param, "")
                             formatted = self._separate_subitem_values(param, self._format_table_value(value))
-                            lines = self._split_spec_value(formatted)
+                            lines = self._split_spec_value(formatted, param)
                             self._set_cell_style(row_cells[idx], "\n".join(lines), bold=False)
 
     def _build_specifications_table(self, doc: Document, specifications: Dict[str, Any]):
@@ -1218,10 +1390,10 @@ class DOCXGenerator:
                 continue
 
             # Очищаем текст от нежелательных символов и нормализуем степени
-            clean_value = self._clean_text(text_value)
+            clean_value = self._format_table_value(value)
             clean_value = self._separate_subitem_values(key, clean_value)
             # Разбиваем значение на строки
-            formatted_lines = self._split_spec_value(clean_value)
+            formatted_lines = self._split_spec_value(clean_value, key)
             formatted_text = "\n".join(formatted_lines)
 
             # Создаём строку таблицы
@@ -1234,11 +1406,12 @@ class DOCXGenerator:
             self._set_cell_style(row_cells[1], formatted_text, bold=False)
 
     def _add_two_column_table(self, doc: Document, rows: List[Tuple[str, Optional[str]]],
-                          add_header: bool = True) -> None:
+                          add_header: bool = True, first_value_is_name: bool = False) -> None:
         """
         Построение двухстолбцовой таблицы.
         Если value == None, то создаётся строка с объединённой ячейкой (заголовок группы).
         Заголовок группы выводится обычным шрифтом (не жирным).
+        first_value_is_name: первая правая ячейка содержит название марки/варианта, а не перечень.
         """
         if not rows:
             return
@@ -1251,7 +1424,7 @@ class DOCXGenerator:
             self._set_cell_style(header_cells[0], "Параметр", bold=True)
             self._set_cell_style(header_cells[1], "Значение", bold=True)
 
-        for key, value in rows:
+        for idx, (key, value) in enumerate(rows):
             row_cells = table.add_row().cells
             if value is None:
                 # Объединённая ячейка на две колонки – обычный шрифт
@@ -1265,12 +1438,55 @@ class DOCXGenerator:
                 if value is None or str(value).strip() == "":
                     formatted = ""
                 else:
-                    formatted = self._separate_subitem_values(key, self._format_table_value(value))
-                    lines = self._split_spec_value(formatted)
+                    formatted = (self._clean_text(str(value)) if idx == 0 and first_value_is_name
+                                 else self._separate_subitem_values(key, self._format_table_value(value)))
+                    lines = self._split_spec_value(formatted, key)
                     formatted = "\n".join(lines)
                 self._set_cell_style(row_cells[1], formatted, bold=False)
 
-    def _add_specifications(self, doc: Document, specifications: Dict[str, Any]) -> None:
+    def _render_source_table(self, doc, records, layout, rendered_headers=None):
+        """Одна модель — параметры строками; несколько записей — исходная матрица."""
+        columns = layout['columns']
+        labels = dict(zip(columns, layout.get('labels', columns)))
+        if rendered_headers is None:
+            rendered_headers = set()
+        title = self._clean_text(layout['title'])
+        section = ' '.join(title.split())
+        if (section, '') not in rendered_headers:
+            self._add_section_heading(doc, title)
+            rendered_headers.add((section, ''))
+        axis = self._clean_text(layout.get('column_axis', ''))
+        axis_key = (section, ' '.join(axis.split()))
+        if axis and axis_key not in rendered_headers:
+            doc.add_paragraph(axis)
+            rendered_headers.add(axis_key)
+        if len(records) == 1 and not layout.get('column_axis'):
+            name, attrs = next(iter(records.items()))
+            rows = [(layout['row_header'], name)]
+            rows.extend((labels[column], attrs.get(column, '')) for column in columns)
+            self._add_two_column_table(doc, rows, first_value_is_name=True)
+        else:
+            chunk_size = self.spec_table_chunk_size
+            for start in range(0, len(columns), chunk_size):
+                if start:
+                    doc.add_paragraph()
+                chunk = columns[start:start + chunk_size]
+                table = doc.add_table(rows=0, cols=1 + len(chunk))
+                table.style = 'Table Grid'
+                self._set_table_full_width(table)
+                header = table.add_row().cells
+                self._set_cell_style(header[0], self._clean_text(layout['row_header']), bold=True)
+                for i, column in enumerate(chunk, 1):
+                    self._set_cell_style(header[i], self._clean_text(labels[column]), bold=True)
+                for name, attrs in records.items():
+                    cells = table.add_row().cells
+                    self._set_cell_style(cells[0], self._clean_text(name))
+                    for i, column in enumerate(chunk, 1):
+                        self._set_cell_style(cells[i], self._format_table_value(attrs.get(column, '')))
+        for note in layout.get('notes', []):
+            self._add_generic_field(doc, '', note)
+
+    def _add_specifications(self, doc: Document, specifications: Dict[str, Any], table_layouts=None) -> None:
         """
         Добавление блока технических характеристик.
         - Все плоские одиночные словари объединяются в одну таблицу со скалярными.
@@ -1282,6 +1498,16 @@ class DOCXGenerator:
         if not specifications:
             return
 
+        source_tables = []
+        specifications = specifications.copy()
+        for layout in table_layouts or []:
+            records = specifications.get(layout.get('path'))
+            if (isinstance(records, dict) and records
+                    and all(isinstance(attrs, dict) for attrs in records.values())):
+                source_tables.append((records, layout))
+                specifications.pop(layout['path'])
+        from product_tables import take_record_lists
+        specifications, record_tables = take_record_lists(specifications)
         dict_specs = {k: v for k, v in specifications.items() if isinstance(v, dict)}
         scalar_specs = {k: v for k, v in specifications.items() if not isinstance(v, dict)}
 
@@ -1315,7 +1541,7 @@ class DOCXGenerator:
             flattened = self._flatten_nested_dict(inner_dict)
             if flattened:
                 rows = [("Марка", self._clean_text(self._strip_dup_suffix(outer_key)))] + flattened
-                self._add_two_column_table(doc, rows, add_header=True)
+                self._add_two_column_table(doc, rows, add_header=True, first_value_is_name=True)
                 parts_output.append('nested')
 
         # 3. Варианты (многостолбцовая таблица)
@@ -1334,6 +1560,18 @@ class DOCXGenerator:
 
             self._add_text_block_from_dict(doc, outer_key, inner_dict)
             parts_output.append('text')
+
+        sections = {}
+        for records, layout in source_tables + record_tables:
+            section = ' '.join(self._clean_text(layout['title']).split())
+            sections.setdefault(section, []).append((records, layout))
+        for tables in sections.values():
+            rendered_headers = set()
+            for records, layout in tables:
+                if parts_output:
+                    doc.add_paragraph()
+                self._render_source_table(doc, records, layout, rendered_headers)
+                parts_output.append('source_table')
 
         # 5. Заключительная пустая строка после всего раздела
         if parts_output:
@@ -1461,12 +1699,12 @@ class DOCXGenerator:
                     if v is not None and str(v).strip():
                         rows.append((k, v))
                 if rows:
-                    self._add_two_column_table(doc, rows, add_header=True)
+                    self._add_two_column_table(doc, rows, add_header=True, first_value_is_name=True)
             else:
                 flattened = self._flatten_nested_dict(inner_dict)
                 if flattened:
                     rows = [("Вариант", self._clean_text(self._strip_dup_suffix(str(outer_key))))] + flattened
-                    self._add_two_column_table(doc, rows, add_header=True)
+                    self._add_two_column_table(doc, rows, add_header=True, first_value_is_name=True)
             parts_output.append('single')
 
         # ---- 6. Группы вариантов с одинаковыми ключами (многостолбцовые таблицы) ----

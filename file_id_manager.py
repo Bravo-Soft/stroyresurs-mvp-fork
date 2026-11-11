@@ -94,7 +94,7 @@ class FileIDManager:
                 'id': file_id,
                 'path': file_path,
                 'hash': file_hash,
-                'download_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'download_date': datetime.fromtimestamp(file_stats.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
                 'file_size': file_stats.st_size,
                 'last_modified': datetime.fromtimestamp(file_stats.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
                 'exists': True

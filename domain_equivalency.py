@@ -2,7 +2,7 @@
 import logging
 import re
 from collections import namedtuple
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, urljoin
 import aiohttp
 import asyncio
 from typing import Optional
@@ -90,6 +90,50 @@ def hosts_equivalent(host1: str, host2: str) -> bool:
     return desktop_host(host1) == desktop_host(host2) and bool(desktop_host(host1))
 
 
+def scope_host(url: str) -> str:
+    """Хост HTTP(S) без userinfo; IDN и завершающая точка приводятся к одной форме."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https') or parsed.username is not None or parsed.password is not None:
+            return ''
+        if parsed.port is not None and not 0 < parsed.port <= 65535:
+            return ''
+        host = to_ascii_host((parsed.hostname or '').rstrip('.').lower())
+        return '' if any(c.isspace() for c in host) else host
+    except (ValueError, TypeError):
+        return ''
+
+
+def url_in_scope(url: str, base_url: str, *, profile_domains=(),
+                 profile_suffixes=(), file_hosts=(), resource='page') -> bool:
+    """Общий периметр: исходный сайт, явный профиль; CDN разрешён только для файлов.
+
+    Группа глобального config и ссылки страницы сами по себе не расширяют обход.
+    Разрешения профиля применимы только к компании, входящей в этот профиль.
+    """
+    if resource not in ('page', 'sitemap', 'file'):
+        return False
+    host, base = scope_host(url), scope_host(base_url)
+    if not host or not base:
+        return False
+    def same_host(left, right):
+        # Старый hosts_equivalent режет порт по ':', поэтому IPv6 сравниваем точно.
+        return left == right or (':' not in left and ':' not in right
+                                 and left.removeprefix('www.') == right.removeprefix('www.'))
+    if same_host(host, base):
+        return True
+    domains = [scope_host('https://' + str(domain)) for domain in profile_domains]
+    suffixes = [scope_host('https://' + str(suffix).lstrip('*.')) for suffix in profile_suffixes]
+    def in_profile(candidate):
+        return (any(domain and same_host(candidate, domain) for domain in domains)
+                or any(suffix and candidate.endswith('.' + suffix) for suffix in suffixes))
+    if not in_profile(base):
+        return False
+    if in_profile(host):
+        return True
+    return resource == 'file' and host in {scope_host('https://' + str(item)) for item in file_hosts}
+
+
 def registrable_domain(host: str) -> str:
     """Регистрируемый домен: два последних уровня (example.ru у shop.example.ru).
     Публичные суффиксы второго уровня (com.ru и т.п.) не разбираются — для списка
@@ -175,7 +219,7 @@ class DomainEquivalencyManager:
         self.profile_strict_www = None
         # P05 U3: пер-сайтовый периметр из профиля — домен профиля и его
         # crawl.equivalent_domains (зеркала, бренд-домены группы) плюс суффиксы
-        # crawl.subdomain_collapse ('*.gexa.ru'). Пусто = только config.equivalent_domains.
+        # crawl.subdomain_collapse ('*.gexa.ru'). Пусто = только исходный хост и www.
         self.profile_domains = set()
         self.profile_suffixes = ()
 
@@ -347,9 +391,8 @@ class DomainEquivalencyManager:
           комбинации схема x www;
         - кандидат подтверждается ТОЛЬКО ответом 200 с содержательным телом без маркеров
           заглушки хостера; 206 на наш Range перепроверяется запросом без Range;
-        - конечный URL после редиректов принимается только при эквивалентном хосте (апекс/www;
-          мобильное зеркало m./mobile./touch. схлопывается к десктопной форме), смена хоста —
-          в INFO, база обхода остаётся на домене компании;
+        - каждый редирект проверяется до запроса: исходный хост/www либо явное
+          разрешение профиля; сторонний хост не становится базой обхода;
         - сначала все кандидаты с проверкой TLS; отпавшие ИМЕННО по сертификату
           перепроверяются вторым проходом без проверки TLS (с пометкой «TLS-имя не совпало»),
           чтобы сайт с истёкшим сертификатом на своём домене не потерялся, но и не перебивал
@@ -450,13 +493,9 @@ class DomainEquivalencyManager:
         if answer.status is None:
             log.info(f"Кандидат {variant}: проба не удалась ({answer.error}){tls_note}")
             return CandidateProbe(False, variant, answer.error, answer.tls_error, False, None)
-        if answer.status != 200:
-            log.info(f"Кандидат {variant}: статус {answer.status} — не подтверждён{tls_note}")
-            return CandidateProbe(False, variant, f'статус {answer.status}', False, True, None)
-
         requested_host = urlparse(variant).netloc
         final_host = urlparse(answer.final_url or variant).netloc
-        if final_host and not hosts_equivalent(final_host, requested_host):
+        if not self._url_allowed(answer.final_url or variant, variant):
             # Редирект увёл на чужой хост: парковка хостера или сайт-редиректор. Базой обхода
             # такой адрес не становится, обход остаётся на домене компании (D167).
             site_status = self._foreign_host_status(answer.final_url)
@@ -465,7 +504,11 @@ class DomainEquivalencyManager:
             return CandidateProbe(False, variant, f'редирект на чужой хост {final_host}',
                                   False, True, site_status)
 
-        reason, site_status = self._content_verdict(answer.body, variant)
+        if answer.status != 200:
+            log.info(f"Кандидат {variant}: статус {answer.status} — не подтверждён{tls_note}")
+            return CandidateProbe(False, variant, f'статус {answer.status}', False, True, None)
+
+        reason, site_status = self._content_verdict(answer.body, answer.final_url or variant)
         if reason:
             log.info(f"Кандидат {variant}: 200, но {reason} — не подтверждён{tls_note}")
             return CandidateProbe(False, variant, reason, False, True, site_status)
@@ -547,6 +590,10 @@ class DomainEquivalencyManager:
             headers['User-Agent'] = user_agent
         return headers
 
+    def _url_allowed(self, url: str, base_url: str) -> bool:
+        return url_in_scope(url, base_url, profile_domains=self.profile_domains,
+                            profile_suffixes=self.profile_suffixes)
+
     async def _probe_variant_impersonate(self, variant: str, headers: dict,
                                          verify_tls: bool) -> Optional[HttpAnswer]:
         """Проба варианта URL браузерным TLS-отпечатком (curl_cffi impersonate).
@@ -559,8 +606,19 @@ class DomainEquivalencyManager:
         timeout_total = getattr(self.config, 'working_url_probe_timeout', 20)
         sess = _CurlAsyncSession(impersonate=impersonate, verify=verify_tls, timeout=timeout_total)
         try:
-            resp = await sess.get(variant, headers=headers, allow_redirects=True)
-            return HttpAnswer(resp.status_code, resp.text or '', str(resp.url), None, False)
+            target = variant
+            for _ in range(6):
+                if not self._url_allowed(target, variant):
+                    return HttpAnswer(302, '', target, 'редирект вне периметра', False)
+                resp = await sess.get(target, headers=headers, allow_redirects=False)
+                final = str(resp.url)
+                if not self._url_allowed(final, variant):
+                    return HttpAnswer(302, '', final, 'ответ вне периметра', False)
+                if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get('Location'):
+                    target = urljoin(final, resp.headers['Location'])
+                    continue
+                return HttpAnswer(resp.status_code, resp.text or '', final, None, False)
+            return HttpAnswer(None, '', target, 'слишком много редиректов', False)
         except Exception as e:
             text = f'{type(e).__name__}: {e}'
             if _is_tls_error_text(text):
@@ -578,9 +636,20 @@ class DomainEquivalencyManager:
         timeout = aiohttp.ClientTimeout(total=timeout_total)
         try:
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.get(variant, headers=headers, allow_redirects=True) as response:
-                    body = await response.text(errors='replace')
-                    return HttpAnswer(response.status, body, str(response.url), None, False)
+                target = variant
+                for _ in range(6):
+                    if not self._url_allowed(target, variant):
+                        return HttpAnswer(302, '', target, 'редирект вне периметра', False)
+                    async with session.get(target, headers=headers, allow_redirects=False) as response:
+                        final = str(response.url)
+                        if not self._url_allowed(final, variant):
+                            return HttpAnswer(302, '', final, 'ответ вне периметра', False)
+                        if response.status in (301, 302, 303, 307, 308) and response.headers.get('Location'):
+                            target = urljoin(final, response.headers['Location'])
+                            continue
+                        body = await response.text(errors='replace')
+                        return HttpAnswer(response.status, body, final, None, False)
+                return HttpAnswer(None, '', target, 'слишком много редиректов', False)
         except asyncio.TimeoutError:
             return HttpAnswer(None, '', variant, f'таймаут {timeout_total}с', False)
         except aiohttp.ClientSSLError as e:

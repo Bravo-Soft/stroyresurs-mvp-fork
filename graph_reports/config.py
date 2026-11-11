@@ -11,7 +11,7 @@ class ReportConfig:
     logs_dir: str = '/home/user/stroy-resurs/mvp/logs'
 
     # Параметры Graph DB API
-    graph_db_api_url: str = "http://192.168.0.123:4242"
+    graph_db_api_url: str = "https://stroy-resurs-db.bravo-soft.ru/api/companies"
     graph_db_request_timeout: int = 600
     
     # Параметры отчетов

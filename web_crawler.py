@@ -3,19 +3,23 @@ import re
 import os
 import gc
 import gzip
+import xml.etree.ElementTree as ET
 import time
 import json
 import hashlib
+from file_download_cache import FileDownloadCache, atomic_write, file_sha256
 import psutil
 import aiohttp
 import asyncio
+from async_timeout import timeout as async_deadline
 import logging
 import aiofiles
 from datetime import datetime
+from uuid import uuid4
 from contextlib import nullcontext
 from collections import deque
 from dataclasses import dataclass
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Tag, Comment
 from asyncio import Semaphore, Lock
 from typing import Dict, Any, List, Tuple, Optional, Union
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse, unquote
@@ -31,13 +35,20 @@ except Exception:
     _CurlAsyncSession = None
     _CURL_CFFI_AVAILABLE = False
 
+from fetch_outcome import (FetchOutcome, fetch_observer, observe_fetch,
+                           retry_after_seconds, is_soft_not_found)
+from inline_products import inline_product_links
+from product_interactions import (product_state_key, tilda_product_links, isolate_product_state,
+                                  expand_product_panels)
+from contact_interactions import collect_contact_panels, needs_contact_interaction
 from config import Config
 from product_utils import sanitize_filename
 from temp_storage_manager import TempStorageManager
 from domain_equivalency import (DomainEquivalencyManager, hosts_equivalent,
-                                same_registrable_domain)
+                                url_in_scope)
 from data_island import (needs_javascript, has_product_island, is_unrendered_store_listing,
-                         looks_like_product_shell)
+                         looks_like_product_shell, has_unloaded_product_tabs,
+                         PRODUCT_TAB_SELECTOR, PRODUCT_TAB_LABEL)
 
 # Профили сайтов (mvp/profiles/*.yaml): пер-сайтовые стратегии краулинга.
 # Импорт защищён (fail-open): без пакета/зависимостей краулер работает как раньше.
@@ -92,11 +103,9 @@ def read_memory_usage_mb() -> float:
         return psutil.Process().memory_info().rss / 1024 / 1024
 
 
-PERMANENT_ERRORS = [
-    400, 401, 402, 403, 404, 405, 406, 407, 409, 410, 
-    411, 412, 413, 414, 415, 416, 417, 418, 421, 422, 
-    423, 424, 425, 426, 428, 431, 451, 501, 505, 510
-]
+# Только подтверждённое отсутствие ресурса; WAF/auth и временные отказы
+# не доказывают, что другой транспорт не сможет загрузить страницу.
+PERMANENT_ERRORS = {404, 410}
 
 # Реалистичные браузерные заголовки для HTTP-impersonate. User-Agent выставляет сам
 # curl_cffi через impersonate — здесь его НЕ задаём, иначе разъедется с TLS/HTTP2-отпечатком.
@@ -137,6 +146,20 @@ def sanitize_href(href: str) -> str:
     return f"{last.group(1).lower()}//{path_part[last.end():].lstrip('/')}{tail}"
 
 
+def document_base_url(soup: BeautifulSoup, page_url: str) -> str:
+    """База относительных ссылок: первый HTML base[href] или адрес документа."""
+    base = soup.find('base', href=True)
+    if base is not None:
+        try:
+            resolved = urljoin(page_url, base['href'].strip())
+            parsed = urlparse(resolved)
+            if parsed.scheme in ('http', 'https') and parsed.netloc:
+                return resolved
+        except ValueError:
+            pass
+    return page_url
+
+
 # D157 (P04 U4 п.4): адрес перехода, записанный не в href, а в обработчике onclick
 # ("window.location.href='/catalog/x/'", "document.location=...") — так устроена
 # навигация плиток каталога в части Bitrix-шаблонов (Москабельмет).
@@ -169,6 +192,118 @@ def extract_element_url(element) -> str:
         return ''
 
 
+class PageContent(str):
+    """HTML с адресом конкретного ответа; str-совместимость для прежних потребителей."""
+    requested_url: str
+    final_url: str
+    status: int
+    headers: Dict[str, str]
+    method: str
+
+    def __new__(cls, html: str, requested_url: str, final_url: str,
+                status: int = 200, headers: Optional[Dict[str, str]] = None,
+                method: str = ''):
+        value = super().__new__(cls, html)
+        value.requested_url = requested_url
+        value.final_url = final_url or requested_url
+        value.status = status
+        value.headers = dict(headers or {})
+        value.method = method
+        return value
+
+
+def page_error_reason(content) -> Optional[str]:
+    """Общий барьер перед обработкой HTML; номера моделей и текст статей не ошибки."""
+    status = getattr(content, 'status', 200)
+    if status != 200:
+        return f'HTTP {status}'
+    if not content or not content.strip():
+        return 'empty'
+    soup = BeautifulSoup(content, 'html.parser')
+    if soup.find(id=re.compile(r'^(?:challenge-form|cf-challenge|cf-error-details)$', re.I)):
+        return 'challenge'
+    # Проверяем заголовки документа, а не произвольные упоминания в ссылках/описаниях.
+    error = re.compile(
+        r'^(?:error|ошибка)\s*[: -]?\s*(?:40[0348]|410|429|50[0-4])\s*[.!]?$|'
+        r'^(?:(?:error|ошибка)\s*[: -]?\s*)?(?:40[0348]|410|429|50[0-4])'
+        r'\s*[-:–—]?\s*(?:not found|gone|forbidden|bad request|too many requests|'
+        r'internal server error|bad gateway|service unavailable|gateway time.?out|'
+        r'страница не найдена|доступ запрещ[её]н)(?:\b|$)|'
+        r'^(?:page not found|not found|access denied|forbidden|service unavailable|'
+        r'bad gateway|internal server error|gateway time.?out|too many requests|'
+        r'страница не найдена|страница удалена|доступ запрещ[её]н|сайт временно недоступен|'
+        r'сайт на техническом обслуживании|технические работы)(?:\s*[.!:|–—-].*)?$', re.I)
+    challenge = re.compile(
+        r'^(?:just a moment|attention required|checking your browser|verify you are human|'
+        r'проверяем браузер|проверка браузера|подтвердите, что вы человек)(?:[.!…]|\s|$)', re.I)
+    headings = [' '.join(tag.stripped_strings) for tag in soup.find_all(['title', 'h1'])]
+    # Короткий ответ сервера может быть обычным текстом без title/h1.
+    if not headings:
+        visible = ' '.join(soup.stripped_strings)
+        if len(visible) <= 160:
+            headings = [visible]
+    for heading in headings:
+        if challenge.search(heading):
+            return 'challenge'
+        if error.search(heading):
+            return 'error_page'
+    return None
+
+
+def _track_document_response(page):
+    """Статус основного документа, включая навигацию при клике по вкладке."""
+    state = {'response': None}
+    def received(response):
+        if response.request.is_navigation_request() and response.frame == page.main_frame:
+            state['response'] = response
+            state.pop('failed_url', None)
+    def failed(request):
+        if request.is_navigation_request() and request.frame == page.main_frame:
+            state['failed_url'] = request.url
+    page.on('response', received)
+    page.on('requestfailed', failed)
+    return state
+
+
+def _observe_browser_failure(url, method, error, state, allowed_url):
+    """Блокировка редиректа до ответа — отказ периметра, а не сетевой сбой."""
+    failed_url = state.get('blocked_url') or state.get('failed_url')
+    if failed_url and allowed_url and not allowed_url(failed_url, base_url=url):
+        observe_fetch(url, method, final_url=failed_url, reason='out_of_scope')
+    else:
+        observe_fetch(url, method, error=error)
+
+
+def _browser_content(html, url, page, state, method):
+    response = state['response']
+    # Нет подтверждённого документа — не выдаём синтетический HTTP 200.
+    status = response.status if response is not None else 0
+    headers = getattr(response, 'headers', {}) if response is not None else {}
+    content = PageContent(html or '', url, page.url, status, headers=headers, method=method)
+    observe_fetch(url, method, status=status, final_url=page.url, headers=headers, html=content)
+    return content
+
+
+async def _release_browser_resources(pool, context, page, cleanup_guard):
+    """После отмены не зависаем в finally; слот пула возвращается отдельно."""
+    try:
+        try:
+            async with async_deadline(2):
+                if cleanup_guard:
+                    await cleanup_guard()
+                if page:
+                    await pool.close_page(page)
+        except asyncio.TimeoutError:
+            log.warning("Истёк срок очистки страницы/маршрута браузера")
+    finally:
+        if context:
+            try:
+                async with async_deadline(3):
+                    await pool.return_browser(context)
+            except asyncio.TimeoutError:
+                log.warning("Истёк срок возврата контекста браузера")
+
+
 @dataclass
 class ParseResult:
     soup: BeautifulSoup
@@ -176,6 +311,10 @@ class ParseResult:
     additional_links: List[Tuple[str, str, int]]
     content_type: str
     elements_found: Dict[str, int]
+    url: str = ''                    # фактический адрес документа
+    requested_url: str = ''          # адрес исходного запроса для аудита
+    canonical_url: Optional[str] = None  # подсказка, не база относительных ссылок
+    fetch_method: str = ''            # ступень, давшая принятый документ
 
 
 @dataclass
@@ -231,6 +370,7 @@ class BrowserPool:
         Название метода сохранено для обратной совместимости.
         """
         await self._context_semaphore.acquire()
+        context = None
         try:
             if self.stealth_enabled:
                 # Реалистичный контекст вместо «голого» — снижает детект автоматизации
@@ -240,6 +380,7 @@ class BrowserPool:
                     locale="ru-RU",
                     timezone_id="Europe/Moscow",
                     viewport={"width": 1920, "height": 1080},
+                    service_workers="block",
                 )
                 try:
                     await context.add_init_script(
@@ -248,10 +389,17 @@ class BrowserPool:
                 except Exception:
                     pass
             else:
-                context = await self._browser.new_context()
+                context = await self._browser.new_context(service_workers="block")
             return context
-        except Exception:
-            self._context_semaphore.release()
+        except (Exception, asyncio.CancelledError):
+            try:
+                if context is not None:
+                    async with async_deadline(3):
+                        await context.close()
+            except Exception as exc:
+                log.warning(f"Контекст после отмены инициализации не закрылся: {exc}")
+            finally:
+                self._context_semaphore.release()
             raise
         
     async def return_browser(self, context):
@@ -311,49 +459,118 @@ class DynamicContentExtractor:
     Автоматически определяет тип элементов и извлекает HTML после кликов.
     """
 
-    def __init__(self, browser_pool: BrowserPool, config: Config, extra_tab_panel_selector: str = None):
+    def __init__(self, browser_pool: BrowserPool, config: Config, extra_tab_panel_selector: str = None,
+                 guard_browser_page=None, allowed_url=None, accept_cookie_consent=None, tab_selector=None, ready_selector=None):
         self.browser_pool = browser_pool
         self.config = config
         # Пер-сайтовый селектор панели вкладки из профиля (crawl.tab_panel_selector) —
         # добавляется к глобальному списку config.dynamic_tab_panel_selectors.
         self.extra_tab_panel_selector = extra_tab_panel_selector
+        self.guard_browser_page = guard_browser_page
+        self.allowed_url = allowed_url
+        self.accept_cookie_consent = accept_cookie_consent
+        self.tab_selector = tab_selector
+        self.ready_selector = ready_selector
+        self.product_tabs_only = False  # автоэскалация не нажимает произвольные button
 
-    async def extract(self, url: str) -> Union[List[str], str]:
+    async def extract(self, url: str) -> Union[List[PageContent], PageContent]:
         """
         Загружает страницу, определяет динамические элементы и возвращает:
-        - список HTML (каждый для одной вкладки), если найдены вкладки,
-        - один HTML (после раскрытия всех аккордеонов) в противном случае.
+        Полный снимок связанных панелей; для вкладок сохраняется совместимый
+        список из одного HTML. Состояния не перезаписывают один URL по очереди.
         """
+        if self.allowed_url and not self.allowed_url(url, base_url=url):
+            return None
         context = await self.browser_pool.get_browser()
         page = None
+        cleanup_guard = None
+        state = {}
+        self.incomplete_render = False
 
         try:
             page = await context.new_page()
+            state = _track_document_response(page)
+            if self.guard_browser_page:
+                cleanup_guard = await self.guard_browser_page(page, url, navigation_state=state)
             # ИЗМЕНЕНО: wait_until='domcontentloaded', таймаут 20 сек
-            await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+            response = await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+            state['response'] = response
+            initial = _browser_content(await page.content(), url, page, state, 'dynamic')
+            if page_error_reason(initial):
+                return None
             # ДОБАВЛЕНО: короткий networkidle (3 сек) – необязателен
             try:
                 await page.wait_for_load_state('networkidle', timeout=3000)
             except Exception:
                 pass
 
+            if self.allowed_url and not self.allowed_url(page.url, base_url=url):
+                return None
+            # Согласие может перезагрузить документ: готовность проверяем ПОСЛЕ него.
+            if (self.accept_cookie_consent and needs_contact_interaction(
+                    await page.content(), self.config.dynamic_tab_selectors + self.config.dynamic_accordion_selectors)):
+                await self.accept_cookie_consent(page)
+            if self.ready_selector:
+                try:
+                    await page.wait_for_selector(self.ready_selector, state='attached', timeout=10000)
+                except PlaywrightTimeoutError:
+                    self.incomplete_render = True
+                    observe_fetch(url, 'dynamic', reason='incomplete_render')
+                    return None
+            # Дожидаемся окончания перестановки меню/списков после AJAX.
+            try:
+                await page.wait_for_function("""ready => {
+                    if (ready && !document.querySelector(ready)) {
+                        delete window.__crawlerContactReady;
+                        return false;
+                    }
+                    const content = document.body.cloneNode(true);
+                    content.querySelectorAll('script,style,jdiv,iframe').forEach(el => el.remove());
+                    const signature = content.textContent + JSON.stringify(
+                        Array.from(content.querySelectorAll('a[href]'), a => a.getAttribute('href')));
+                    const now = performance.now();
+                    const previous = window.__crawlerContactReady;
+                    if (!previous || previous.signature !== signature) {
+                        window.__crawlerContactReady = {signature, since: now};
+                        return false;
+                    }
+                    return now - previous.since >= 1000;
+                }""", arg=self.ready_selector, timeout=10000 if self.ready_selector else 5000, polling=250)
+            except PlaywrightTimeoutError:
+                self.incomplete_render = True
+                observe_fetch(url, 'dynamic', reason='incomplete_render')
+                return None
             # Определяем тип элементов
             if await self._has_tabs(page):
                 # Вкладки: кликаем по каждой и собираем HTML
-                results = await self._process_tabs(page)
+                results = await self._process_tabs(page, requested_url=url, response_state=state)
             else:
                 # Аккордеоны: кликаем по всем и возвращаем финальный DOM
-                await self._process_accordions(page)
-                results = await page.content()
+                try:
+                    html = await self._process_accordions(page)
+                except Exception:
+                    self.incomplete_render = True
+                    observe_fetch(url, 'dynamic', reason='incomplete_render')
+                    return None
+                if self.allowed_url and not self.allowed_url(page.url, base_url=url):
+                    return None
+                results = _browser_content(html, url, page, state, 'dynamic')
+                if page_error_reason(results):
+                    return None
 
+            if self.ready_selector:
+                snapshots = results if isinstance(results, list) else [results]
+                if any(not BeautifulSoup(str(item), 'lxml').select_one(self.ready_selector) for item in snapshots):
+                    self.incomplete_render = True
+                    observe_fetch(url, 'dynamic', reason='incomplete_render')
+                    return None
             return results
         except Exception as e:
+            _observe_browser_failure(url, 'dynamic', e, state, self.allowed_url)
             log.error(f"Ошибка при обработке динамического контента {url}: {e}")
             return []
         finally:
-            if page:
-                await self.browser_pool.close_page(page)
-            await self.browser_pool.return_browser(context)
+            await _release_browser_resources(self.browser_pool, context, page, cleanup_guard)
 
     async def _has_tabs(self, page) -> bool:
         """Проверяет, есть ли на странице элементы, похожие на вкладки."""
@@ -367,74 +584,82 @@ class DynamicContentExtractor:
                 return True
         return False
 
-    async def _process_tabs(self, page) -> List[str]:
-        """Кликает по каждой вкладке и возвращает HTML после каждого клика."""
-        # Пытаемся закрыть мешающие диалоги
+    async def _process_tabs(self, page, requested_url: str = None, *, response_state) -> List[PageContent]:
+        """Объединяет связанные AJAX-панели в один полный снимок страницы."""
+        requested_url = requested_url or page.url
         try:
-            await page.evaluate("""
-                document.querySelectorAll('dialog[open]').forEach(d => {
-                    if (typeof d.close === 'function') d.close();
-                    else d.remove();
-                });
-                // Отключаем перекрывающие элементы
-                document.querySelectorAll('[class*="modal"], [class*="popup"], [role="dialog"]').forEach(el => {
-                    el.style.pointerEvents = 'none';
-                    el.style.visibility = 'hidden';
-                });
-            """)
-            await page.wait_for_timeout(500)
-        except Exception as e:
-            log.debug(f"Не удалось закрыть диалоги: {e}")
+            html = await collect_contact_panels(page, self.config.dynamic_tab_selectors
+                                               + self.config.dynamic_accordion_selectors)
+        except Exception:
+            self.incomplete_render = True
+            failed_url = response_state.get('blocked_url') or response_state.get('failed_url')
+            if failed_url and self.allowed_url and not self.allowed_url(failed_url, base_url=requested_url):
+                observe_fetch(requested_url, 'dynamic', final_url=failed_url, reason='out_of_scope')
+            else:
+                observe_fetch(requested_url, 'dynamic', reason='incomplete_render')
+            return []
+        content = _browser_content(html, requested_url, page, response_state, 'dynamic')
+        return [] if page_error_reason(content) else [content]
 
-        results = []
-        selectors = self.config.dynamic_tab_selectors
-
-        # Собираем уникальные элементы вкладок
-        all_tabs = []
-        for sel in selectors:
-            tabs = await page.query_selector_all(sel)
-            for tab in tabs:
-                if tab not in all_tabs:
-                    all_tabs.append(tab)
-
-        for idx, tab in enumerate(all_tabs):
-            try:
-                if not await tab.is_visible():
-                    continue
-
-                await tab.click()
-                await page.wait_for_timeout(self.config.dynamic_click_delay_ms)
-
-                html = await page.content()
-                results.append(html)
-                log.info(f"Извлечён контент вкладки {idx+1}")
-            except Exception as e:
-                log.warning(f"Ошибка при клике на вкладку {idx}: {e}")
-
-        return results
-
-    async def extract_product_tabs_merged(self, url: str) -> Optional[str]:
+    async def extract_product_tabs_merged(self, url: str) -> Optional[PageContent]:
         """D01: товарная страница с AJAX-вкладками (опт-ин по домену).
         Кликает по каждой вкладке и СКЛЕИВАЕТ контент панелей в ОДИН HTML
         (базовый DOM + <section data-tab="..."> на вкладку). Один HTML → одна
         карточка со всеми характеристиками; отдельные #tab-страницы не создаются
         (иначе дедуп по имени товара терял характеристики — регресс РУФ-135).
         Возвращает склеенный HTML или None (страница не отдалась/вкладок нет)."""
+        if self.allowed_url and not self.allowed_url(url, base_url=url):
+            return None
         context = await self.browser_pool.get_browser()
         page = None
+        cleanup_guard = None
+        state = {}
         try:
             page = await context.new_page()
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            state = _track_document_response(page)
+            if self.guard_browser_page:
+                cleanup_guard = await self.guard_browser_page(page, url, navigation_state=state)
+            response = await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            state['response'] = response
+            initial = _browser_content(await page.content(), url, page, state, 'ajax_tabs')
+            if page_error_reason(initial):
+                return None
             try:
                 await page.wait_for_load_state('networkidle', timeout=5000)
             except Exception:
                 pass
 
-            base_html = await page.content()
+            if self.allowed_url and not self.allowed_url(page.url, base_url=url):
+                return None
+            base_html = _browser_content(await page.content(), url, page, state, 'ajax_tabs')
+            if page_error_reason(base_html):
+                return None
+
+            if self.accept_cookie_consent:
+                await self.accept_cookie_consent(page)
+
+            try:
+                panel_sections = await expand_product_panels(page)
+            except Exception:
+                failed_url = state.get('blocked_url') or state.get('failed_url')
+                if failed_url and self.allowed_url and not self.allowed_url(failed_url, base_url=url):
+                    observe_fetch(url, 'ajax_tabs', final_url=failed_url, reason='out_of_scope')
+                else:
+                    observe_fetch(url, 'ajax_tabs', reason='incomplete_render')
+                return None
+            if panel_sections:
+                current = _browser_content(await page.content(), url, page, state, 'ajax_tabs')
+                if page_error_reason(current):
+                    return None
+                block = '\n'.join(panel_sections)
+                base_html = PageContent(str(base_html).replace('</body>', block + '</body>'),
+                                        url, base_html.final_url, base_html.status, method='ajax_tabs')
 
             # Кандидаты-вкладки: видимые элементы по селекторам вкладок
             tabs = []
-            for sel in self.config.dynamic_tab_selectors:
+            selectors = ([PRODUCT_TAB_SELECTOR] if self.product_tabs_only else
+                         [self.tab_selector] if self.tab_selector else self.config.dynamic_tab_selectors)
+            for sel in selectors:
                 for el in await page.query_selector_all(sel):
                     if el not in tabs:
                         tabs.append(el)
@@ -447,18 +672,19 @@ class DynamicContentExtractor:
                 _panel_list.append(self.extra_tab_panel_selector)
             panel_selectors = ", ".join(_panel_list)
 
-            async def visible_panel_html() -> str:
+            async def visible_panel_html(target_id=None) -> str:
                 try:
                     return await page.evaluate(
-                        """(sels) => {
-                            const els = document.querySelectorAll(sels);
+                        """({sels, target}) => {
+                            const els = target ? [document.getElementById(target)] : document.querySelectorAll(sels);
                             for (const el of els) {
+                                if (!el) continue;
                                 const r = el.getBoundingClientRect();
                                 if (r.width > 0 && r.height > 0 && el.innerText.trim().length > 0)
                                     return el.innerHTML;
                             }
                             return '';
-                        }""", panel_selectors)
+                        }""", {'sels': panel_selectors, 'target': target_id})
                 except Exception:
                     return ""
 
@@ -470,7 +696,19 @@ class DynamicContentExtractor:
                     if not await tab.is_visible():
                         continue
                     label = ((await tab.inner_text()) or "").strip()[:80]
-                    await tab.click()
+                    if self.product_tabs_only and not PRODUCT_TAB_LABEL.search(label):
+                        continue
+                    target_id = None
+                    if self.product_tabs_only:
+                        target_id = await tab.get_attribute('aria-controls')
+                        if not target_id:
+                            ref = (await tab.get_attribute('data-bs-target')
+                                   or await tab.get_attribute('data-target')
+                                   or await tab.get_attribute('href') or '')
+                            target_id = ref[1:] if ref.startswith('#') else None
+                        if not target_id:
+                            continue
+                    await tab.click(timeout=5000)
                     await page.wait_for_timeout(self.config.dynamic_click_delay_ms)
                     # страховка: клик мог оказаться навигацией (меню/ссылка) — возвращаемся
                     if page.url != base_page_url:
@@ -478,8 +716,13 @@ class DynamicContentExtractor:
                         await page.go_back(wait_until='domcontentloaded', timeout=15000)
                         await page.wait_for_timeout(300)
                         continue
-                    panel = await visible_panel_html()
-                    h = hash(panel)
+                    current = _browser_content(await page.content(), url, page, state, 'ajax_tabs')
+                    if page_error_reason(current):
+                        return None
+                    panel = await visible_panel_html(target_id)
+                    if page_error_reason(panel):
+                        continue
+                    h = (target_id, hash(panel)) if self.product_tabs_only else hash(panel)
                     if not panel or h in seen_panels:
                         continue  # клик не дал нового контента (не вкладка/дубль)
                     seen_panels.add(h)
@@ -487,6 +730,8 @@ class DynamicContentExtractor:
                     log.info(f"Вкладка товара склеена ({idx+1}: {label!r}): {url}")
                 except Exception as e:
                     log.warning(f"Ошибка при клике на вкладку товара {idx}: {e}")
+                    observe_fetch(url, 'ajax_tabs', reason='incomplete_render')
+                    return None
 
             if not sections:
                 return base_html
@@ -497,27 +742,17 @@ class DynamicContentExtractor:
                 merged = merged[:insert_at] + block + merged[insert_at:]
             else:
                 merged += block
-            return merged
+            return PageContent(merged, url, base_html.final_url, base_html.status, method='ajax_tabs')
         except Exception as e:
+            _observe_browser_failure(url, 'ajax_tabs', e, state, self.allowed_url)
             log.error(f"Ошибка при склейке вкладок товара {url}: {e}")
             return None
         finally:
-            if page:
-                await self.browser_pool.close_page(page)
-            await self.browser_pool.return_browser(context)
+            await _release_browser_resources(self.browser_pool, context, page, cleanup_guard)
 
     async def _process_accordions(self, page):
-        """Кликает по всем аккордеонам (раскрывашкам)."""
-        selectors = self.config.dynamic_accordion_selectors
-        for sel in selectors:
-            elements = await page.query_selector_all(sel)
-            for el in elements:
-                try:
-                    if await el.is_visible():
-                        await el.click()
-                        await page.wait_for_timeout(self.config.dynamic_click_delay_ms)
-                except Exception:
-                    continue
+        """Сохраняет связанные панели; произвольные кнопки не нажимаются."""
+        return await collect_contact_panels(page, self.config.dynamic_accordion_selectors)
 
 class URLCategorizer:
     """Классификатор URL"""
@@ -981,6 +1216,8 @@ class URLCategorizer:
         и отдаёт ссылки; он влияет только на приоритет очереди и на резерв товарной
         квоты. Сознательно узкий: '/catalog/truboprovodnaya-armatura/' с дефисом в
         последнем сегменте листингом не считается — недобор безопаснее перебора."""
+        if product_state_key(url):
+            return False
         try:
             parsed = urlparse(url)
         except Exception:
@@ -1317,15 +1554,6 @@ class URLCategorizer:
             return 'excluded', 0
         
         parsed = urlparse(url)
-        query_params = parse_qs(parsed.query)
-        for param in query_params.keys():
-            if (param.startswith('filter_')
-                    or param.lower() in ['sort', 'order', 'limit',
-                                         # D51: сортировка/вид листинга (Bitrix) — дубли каталожной страницы
-                                         'orderby', 'sortby', 'sort_by', 'order_by', 'display', 'set_filter']):
-                log.debug(f"Исключаем URL с параметром фильтра: {url}")
-                return 'excluded', 0
-            
         # Сначала проверяем на файлы для скачивания
         if self.is_downloadable_file(url):
             return 'excluded', 0
@@ -1394,7 +1622,8 @@ class URLCategorizer:
             # catalog_roots: только сам корень каталога (точный путь) — подстраницы
             # идут обычной классификацией (иначе товарные URL стали бы категориями)
             _roots = [r.rstrip('/') for r in (s.lower() for s in _sec.catalog_roots)]
-            if _p_path.rstrip('/') in [r if r.startswith('/') else '/' + r for r in _roots if r]:
+            if (not product_state_key(url) and
+                    _p_path.rstrip('/') in [r if r.startswith('/') else '/' + r for r in _roots if r]):
                 return 'category', self.priority_levels['category']
 
         # Проверка на исключаемые паттерны (P04 U1: посегментно, без хоста и без
@@ -1412,6 +1641,9 @@ class URLCategorizer:
             else:
                 self._defer_excluded(url, link_text, 'pattern')
                 return 'excluded2', 0
+
+        if product_state_key(url) and not profile_not_product:
+            return 'product', self.priority_levels['product']
 
         # Проверка на главную страницу
         parsed_url = urlparse(url)
@@ -1668,22 +1900,11 @@ class SmartURLNormalizer:
     
     def __init__(self, url_categorizer=None):  
         self.url_categorizer = url_categorizer
-        self.params_to_remove = {
-            'sessionid', 'sid', 'token', 'csrf', 'auth', 'key',
-            'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
-            'fbclid', 'gclid', 'msclkid', 'yclid', 'ref', 'source', 'from',
-            'redirect', 'cache', 'timestamp', 'time', 'date', 'version',
-            'sort', 'order', 'filter', 'view', 'format', 'type',
-            # D51 (Полигон/Bitrix): сортировка/вид листинга — та же страница; без фильтра
-            # каталожная страница сохранялась 6 раз и сжигала бюджет товарных страниц
-            'orderby', 'sortby', 'sort_by', 'order_by', 'display', 'set_filter',
-            # D98 (АэроБел/Bitrix): региональный фасет ?region=belgorod|kursk не влияет
-            # на контент, но дублирует каждую страницу ×2 и в связке с порчей &reg;→®
-            # (парсер декодирует &reg;) плодит бесконечное пространство URL
-            # (®ion=...®ion=...), сжигающее весь бюджет краула до товаров. Канонизируем прочь.
-            'region',
-        }
-        
+        # Только однозначные метки аналитики. Остальные параметры могут выбирать товар.
+        self.params_to_remove = {'utm_source', 'utm_medium', 'utm_campaign', 'utm_term',
+                                 'utm_content', 'utm_id', 'fbclid', 'gclid', 'dclid',
+                                 'msclkid', 'yclid', '_openstat'}
+
         # Пагинационные параметры с ограничением глубины.
         # D245 (Гомельобои): 'p' из списка убран — в WordPress это идентификатор записи
         # (?p=5845 — товарный пермалинк), а не номер страницы. Считая его пагинацией,
@@ -1706,45 +1927,34 @@ class SmartURLNormalizer:
         # сервер видел адрес с '%20' на конце. Ключ дедупликации тоже расходился.
         url = url.strip()
 
-        # D98 (АэроБел): где-то в пайплайне html.unescape декодирует «&region» в URL как
-        # legacy-сущность &reg; → «®ion» (®=U+00AE, %C2%AE). Сайт таких URL НЕ отдаёт —
-        # это мусор регионального фасета, плодящий бесконечное пространство ссылок
-        # (…®ion=belgorod®ion=kursk…) и сжигающий бюджет краула до товаров. ® может осесть
-        # в пути, в имени или в значении параметра — срезаем URL от первого ® (в любой
-        # кодировке) до конца: все варианты схлопываются к чистому префиксу и дедупятся.
-        # Остаточный «чистый» ?region= убирается ниже через params_to_remove.
-        url = re.split(r'®|%[Cc]2%[Aa][Ee]', url, maxsplit=1)[0].rstrip('?&')
+        policy = _get_profile_resolver().resolve(url).crawl if _get_profile_resolver else None
+        # Известная порча &region -> ®ion исправляется только в профиле АэроБел.
+        # Произвольный знак ® и последующие смысловые параметры не отбрасываем.
+        if policy and policy.repair_region_entity:
+            match = re.search(r'(?:®|%c2%ae)ion=', url, re.I)
+            if match:
+                prefix, tail = url[:match.start()], url[match.start():]
+                separator = '&' if '?' in prefix else '?'
+                tail = re.sub(r'(?:®|%c2%ae)ion=', '&region=', tail, flags=re.I)
+                url = prefix + separator + tail[1:]
 
         try:
-            original_parsed = urlparse(url)
-            original_scheme = original_parsed.scheme
-
-            if (self.url_categorizer and 
-                self.url_categorizer.domain_equivalency and
-                self.url_categorizer.config and
-                self.url_categorizer.config.domain_equivalency_enabled):
-                
-                canonical_url = self.url_categorizer.domain_equivalency.get_canonical_url(url)
-                parsed = urlparse(canonical_url)
-                
-                # ВАЖНО: Сохраняем оригинальную схему, если она была
-                if original_scheme:
-                    parsed = parsed._replace(scheme=original_scheme)
-                # Если не было схемы, оставляем ту, что в каноническом URL
-            else:
-                # стандартная нормализация
-                parsed = original_parsed
-            
-            # Базовая нормализация
-            parsed = parsed._replace(fragment="")
+            parsed = urlparse(url)
+            # Эквивалентность www сохраняется; порт и фактический хост не теряются.
+            categorizer = self.url_categorizer
+            if (categorizer and categorizer.domain_equivalency and categorizer.config
+                    and categorizer.config.domain_equivalency_enabled
+                    and parsed.hostname and ':' not in parsed.hostname and not parsed.username):
+                host = categorizer.domain_equivalency.normalize_domain(parsed.hostname)
+                port = ':' + str(parsed.port) if parsed.port is not None else ''
+                parsed = parsed._replace(netloc=host + port)
+            parsed = parsed._replace(fragment=product_state_key(url) or '')
             path = parsed.path
-            # D41: русский языковой префикс — та же страница под двумя URL
-            # (/ru/katalog/... и /katalog/...); без нормализации обе версии
-            # обходятся и дают ДУБЛЬ товара (LLM даёт чуть разные имена → разные id).
-            # Срезаем ведущий сегмент /ru/ до единого вида (только 'ru' — прочие
-            # языки отсекает языковой фильтр категоризатора).
-            if path:
-                path = re.sub(r'^/ru(?=/|$)', '', path, flags=re.I)
+            # Подтверждённые языковые алиасы — только в указанных путях профиля.
+            if policy and path.startswith('/ru/'):
+                without_ru = path[3:]
+                if any(without_ru.startswith(prefix) for prefix in policy.strip_ru_prefix_paths):
+                    path = without_ru
             if path:
                 # D198 (Костромской силикатный): раньше путям, кончающимся цифрами,
                 # принудительно дописывался слеш (/product/102 -> /product/102/).
@@ -1757,14 +1967,18 @@ class SmartURLNormalizer:
                 path = '/'
             
             # Обрабатываем параметры запроса
-            query_params = parse_qs(parsed.query, keep_blank_values=True)
+            query_params = parse_qs(parsed.query, keep_blank_values=True, errors='surrogateescape')
             filtered_params = {}
-            
+            ignored = set(self.params_to_remove)
+            if policy and (not policy.query_noise_paths or
+                           path.rstrip('/') in {p.rstrip('/') for p in policy.query_noise_paths}):
+                ignored.update(key.lower() for key in policy.ignored_query_params)
+
             for key, values in query_params.items():
                 key_lower = key.lower()
 
                 # Удаляем трекерные параметры
-                if key_lower in self.params_to_remove:
+                if key_lower in ignored:
                     continue
                     
                 # D245: пагинационный параметр НЕ вырезаем. Молчаливое удаление
@@ -1775,7 +1989,7 @@ class SmartURLNormalizer:
             
             # Сортируем параметры
             sorted_params = sorted(filtered_params.items())
-            normalized_query = urlencode(sorted_params, doseq=True)
+            normalized_query = urlencode(sorted_params, doseq=True, errors='surrogateescape')
             
             # Собираем URL обратно
             normalized_url = urlunparse((
@@ -1784,7 +1998,7 @@ class SmartURLNormalizer:
                 path,
                 parsed.params,
                 normalized_query,
-                ""
+                parsed.fragment
             ))
             
             # Ищем в кэше по нормализованному виду
@@ -1818,6 +2032,8 @@ class SmartURLNormalizer:
     def extract_canonical_url(self, soup: BeautifulSoup, current_url: str) -> str:
         """Извлечение canonical URL из HTML мета-тегов"""
         try:
+            if product_state_key(current_url):
+                return self.normalize_url(current_url)
             # Ищем canonical link
             canonical_link = soup.find('link', rel='canonical')
             if canonical_link and canonical_link.get('href'):
@@ -1861,7 +2077,7 @@ class SmartURLNormalizer:
 class SiteMapParser:
     """Парсер карт сайта для извлечения товарных URL"""
     
-    def __init__(self, config: Config, url_categorizer: URLCategorizer, url_normalizer: SmartURLNormalizer):
+    def __init__(self, config: Config, url_categorizer: URLCategorizer, url_normalizer: SmartURLNormalizer, allowed_url=None):
         self.config = config
         self.url_categorizer = url_categorizer
         self.url_normalizer = url_normalizer
@@ -1877,8 +2093,26 @@ class SiteMapParser:
             '/rss.xml', '/feed.xml', '/atom.xml'
         ]
         
+        self._allowed_url = allowed_url
         # Кэш для избежания повторной обработки
         self._processed_sitemaps = set()
+        self._results = {}
+        self._states = {}
+        self._loading = {}
+        self._dependencies = {}
+        self._completed = {}
+        self._xml_trees = {}
+        self._html_trees = {}
+        self._documents = {}
+        self._document_tasks = {}
+        self._root_tasks = []
+        self.phase_timed_out = False
+        self._scope_base = None
+        self._request_count = 0
+        self._http_slots = asyncio.Semaphore(getattr(config, 'sitemap_http_concurrency', 4))
+        self._map_slots = asyncio.Semaphore(max(1, getattr(config, 'sitemap_http_concurrency', 4) - 1))
+        from contextvars import ContextVar
+        self._current_map = ContextVar('sitemap_current_map', default=None)
 
     # D144/D208: разделы, которые товарных карточек не дают, но в карте сайта
     # конкурируют за кэп sitemap_max_urls с настоящими карточками.
@@ -1914,19 +2148,16 @@ class SiteMapParser:
     _SITEMAP_GOOD_TOKENS = ('product', 'catalog', 'katalog', 'shop', 'iblock', 'tovar')
     _SITEMAP_BAD_TOKENS = ('attachment', 'media', 'news', 'blog', 'author', 'tag', 'feed')
 
+    def _allows_url(self, url, base_url=None):
+        base = self._scope_base or base_url
+        if self._allowed_url is not None:
+            return self._allowed_url(url, resource='sitemap', base_url=base)
+        manager = self.url_categorizer.domain_equivalency
+        return url_in_scope(url, base, profile_domains=getattr(manager, 'profile_domains', ()),
+                            profile_suffixes=getattr(manager, 'profile_suffixes', ()))
+
     def _is_own_sitemap_host(self, sitemap_url: str, base_url: str) -> bool:
-        """D143: карта принадлежит этому сайту? Равенство доменов считает
-        DomainEquivalencyManager, поэтому домены холдинга из config.equivalent_domains
-        остаются своими. Fail-open: при выключенной эквивалентности сравниваем netloc
-        напрямую (is_main_domain в этом режиме возвращает None и отбросил бы всё)."""
-        try:
-            if self.url_categorizer.is_main_domain(sitemap_url, base_url):
-                return True
-            if not getattr(self.config, 'domain_equivalency_enabled', True):
-                return urlparse(sitemap_url).netloc.lower() == urlparse(base_url).netloc.lower()
-        except Exception:
-            return True
-        return False
+        return self._allows_url(sitemap_url, base_url)
 
     def _sitemap_source_rank(self, sitemap_url: str, base_url: str):
         """D164/D240: детерминированный порядок карт вместо list(set(...)).
@@ -1941,182 +2172,442 @@ class SiteMapParser:
                 1 if any(token in name for token in self._SITEMAP_BAD_TOKENS) else 0,
                 sitemap_url)
 
-    async def discover_sitemap_urls(self, base_url: str) -> List[str]:
-        """Обнаружение карт сайта по стандартным путям и через robots.txt.
+    async def reset_run(self):
+        """Завершает задачи прошлого прохода и очищает только оперативный кэш."""
+        tasks = list(self._loading.values()) + list(self._document_tasks.values()) + [task for _, task in self._root_tasks]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._loading.clear()
+        self._xml_trees.clear()
+        self._html_trees.clear()
+        self._documents.clear()
+        self._document_tasks.clear()
+        self._root_tasks.clear()
+        self._results.clear()
+        self._states.clear()
+        self._dependencies.clear()
+        self._completed.clear()
+        self._processed_sitemaps.clear()
+        self.phase_timed_out = False
+        self._scope_base = None
+        self._request_count = 0
+        self._http_slots = asyncio.Semaphore(getattr(self.config, 'sitemap_http_concurrency', 4))
+        self._map_slots = asyncio.Semaphore(max(1, getattr(self.config, 'sitemap_http_concurrency', 4) - 1))
 
-        D214: кандидат принимается по фактическому адресу после редиректов.
-        D143: карты на чужом registrable-домене отбрасываются (равенство доменов
-        считает DomainEquivalencyManager, поэтому домены холдинга из
-        config.equivalent_domains остаются разрешёнными).
-        D164/D240: порядок карт детерминированный."""
-        sitemap_urls = []
-        parsed_base = urlparse(base_url)
-
-        # 1. Проверка стандартных путей
-        for path in self.sitemap_paths:
-            sitemap_url = f"{parsed_base.scheme}://{parsed_base.netloc}{path}"
-            effective_url = await self._check_sitemap_exists(sitemap_url)
-            if effective_url:
-                sitemap_urls.append(effective_url)
-
-        # 2. Извлечение из robots.txt
-        robots_url = f"{parsed_base.scheme}://{parsed_base.netloc}/robots.txt"
-        robots_sitemaps = await self._extract_sitemaps_from_robots(robots_url)
-        sitemap_urls.extend(robots_sitemaps)
-
-        # 3. Поиск ссылок на карту сайта на главной странице
-        html_sitemaps = await self._find_sitemap_links_in_html(base_url)
-        sitemap_urls.extend(html_sitemaps)
-
-        # D143: фильтр принадлежности — карта чужого домена (дорвей в robots.txt,
-        # ссылка на сервис-агрегатор) приносит чужие адреса и жжёт товарную квоту
-        own_urls = []
-        for sitemap_url in sitemap_urls:
-            if self._is_own_sitemap_host(sitemap_url, base_url):
-                own_urls.append(sitemap_url)
-            else:
-                log.info(f"Карта сайта на чужом домене отброшена: {sitemap_url}")
-
-        # Удаление дубликатов с сохранением детерминированного порядка
-        unique_urls = list(dict.fromkeys(own_urls))
-        unique_urls.sort(key=lambda u: self._sitemap_source_rank(u, base_url))
-        return unique_urls
-
-    async def _check_sitemap_exists(self, url: str) -> Optional[str]:
-        """Проверка существования карты сайта. D214: возвращает ФАКТИЧЕСКИЙ адрес карты
-        (после редиректов) либо None. Раньше метод отдавал bool по HEAD без редиректов
-        (у aiohttp для HEAD allow_redirects=False по умолчанию), и 301 на живую карту
-        читался как «карты нет»; часть хостеров к тому же отвечает на HEAD 405."""
-        timeout = aiohttp.ClientTimeout(total=self.config.sitemap_timeout_seconds)
-        try:
+    async def _request(self, url, method='GET'):
+        """Общий бюджет HTTP; тело ограничивается во время чтения и распаковки."""
+        import zlib
+        base = self._scope_base or url
+        if not self._allows_url(url, base):
+            raise ValueError(f'Карта вне периметра: {url}')
+        async with self._http_slots:
+            if self._request_count >= getattr(self.config, 'sitemap_max_requests', 128):
+                raise ValueError('Исчерпан лимит HTTP-запросов карт сайта')
+            self._request_count += 1
+            timeout = aiohttp.ClientTimeout(total=self.config.sitemap_timeout_seconds)
             connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.head(url, timeout=timeout, allow_redirects=True) as response:
-                    if 200 <= response.status < 300:
-                        return str(response.url)
-                    if 300 <= response.status < 400:
-                        location = response.headers.get('Location')
-                        return urljoin(url, location) if location else None
-                    if response.status not in (400, 403, 405, 501):
-                        return None
-                # HEAD не поддержан хостером — пробуем GET
-                async with session.get(url, timeout=timeout, allow_redirects=True) as response:
-                    if 200 <= response.status < 300:
-                        return str(response.url)
+            async with aiohttp.ClientSession(connector=connector, auto_decompress=False) as session:
+                for redirect in range(6):
+                    if not self._allows_url(url, base):
+                        raise ValueError(f'Редирект карты вне периметра: {url}')
+                    if redirect:
+                        if self._request_count >= getattr(self.config, 'sitemap_max_requests', 128):
+                            raise ValueError('Исчерпан лимит HTTP-запросов карт сайта')
+                        self._request_count += 1
+                    async with session.request(method, url, timeout=timeout, allow_redirects=False,
+                                               headers={'Accept-Encoding': 'identity'}) as response:
+                        if not self._allows_url(str(response.url), base):
+                            raise ValueError(f'Ответ карты вне периметра: {response.url}')
+                        if response.status in (301, 302, 303, 307, 308) and response.headers.get('Location'):
+                            url = urljoin(str(response.url), response.headers['Location'])
+                            if redirect == 5:
+                                raise ValueError('Слишком много редиректов карты сайта')
+                            continue
+                        if method == 'HEAD' or response.status != 200:
+                            return response.status, str(response.url), response.headers, b''
+                        compressed_limit = getattr(self.config, 'sitemap_max_compressed_bytes', 8 * 1024 * 1024)
+                        decoded_limit = getattr(self.config, 'sitemap_max_decompressed_bytes', 32 * 1024 * 1024)
+                        raw_count = 0
+                        output = bytearray()
+                        decoder = None
+                        prefix = bytearray()
+                        async for chunk in response.content.iter_chunked(65536):
+                            raw_count += len(chunk)
+                            if raw_count > compressed_limit:
+                                raise ValueError('Превышен лимит сжатого тела карты сайта')
+                            if decoder is None and len(prefix) < 2:
+                                prefix.extend(chunk)
+                                if len(prefix) < 2:
+                                    continue
+                                chunk = bytes(prefix)
+                                decoder = zlib.decompressobj(16 + zlib.MAX_WBITS) if chunk[:2] == b'\x1f\x8b' else False
+                            if decoder:
+                                chunk = decoder.decompress(chunk, decoded_limit - len(output) + 1)
+                                if decoder.unconsumed_tail or decoder.unused_data:
+                                    raise ValueError('Превышен лимит или лишние данные gzip карты сайта')
+                            output.extend(chunk)
+                            if len(output) > decoded_limit:
+                                raise ValueError('Превышен лимит распакованного тела карты сайта')
+                        if decoder is None:
+                            output.extend(prefix)
+                        elif decoder and not decoder.eof:
+                            raise ValueError('Усечённый gzip карты сайта')
+                        return response.status, str(response.url), response.headers, bytes(output)
+
+    async def collect_sitemap_urls(self, base_url, max_depth=3):
+        """Одна фаза обнаружения и разбора; при таймауте сохраняются готовые карты."""
+        async def collect():
+            urls = await self.discover_sitemap_urls(base_url)
+            known = {url for url, _ in self._root_tasks}
+            self._root_tasks.extend((url, asyncio.create_task(self.parse_sitemap(url, max_depth=max_depth)))
+                                    for url in urls if url not in known)
+            if self._root_tasks:
+                await asyncio.gather(*(task for _, task in self._root_tasks))
+        self._scope_base = base_url
+        self._collecting = True
+        self._collect_depth = max_depth
+        try:
+            await asyncio.wait_for(collect(), self.config.sitemap_phase_timeout_seconds)
+        except asyncio.TimeoutError:
+            self.phase_timed_out = True
+            log.warning('Исчерпан общий бюджет обнаружения и разбора карт сайта')
+        finally:
+            self._collecting = False
+            tasks = list(self._loading.values()) + list(self._document_tasks.values()) + [task for _, task in self._root_tasks]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            # Отменённая до первого шага coroutine не выполняет свой finally.
+            self._loading.clear()
+            self._document_tasks.clear()
+            self._root_tasks.clear()
+            for key, state in self._states.items():
+                if state == 'loading':
+                    self._states[key] = 'error'
+        return [self._completed[url] for url in sorted(
+            self._completed, key=lambda url: self._sitemap_source_rank(url, base_url))]
+
+    async def discover_sitemap_urls(self, base_url: str) -> List[str]:
+        self._scope_base = base_url
+        parsed = urlparse(base_url)
+        origin = f'{parsed.scheme}://{parsed.netloc}'
+        found = []
+        # robots проверяется первым, найденные карты сразу разбираются: медленные
+        # стандартные пути не должны лишать нас уже полученных результатов.
+        robots = await self._extract_sitemaps_from_robots(origin + '/robots.txt')
+        for url in sorted(dict.fromkeys(robots), key=lambda u: self._sitemap_source_rank(u, base_url))[:getattr(self.config, 'sitemap_max_requests', 128)]:
+            if self._is_own_sitemap_host(url, base_url):
+                found.append(url)
+                if getattr(self, '_collecting', False):
+                    self._root_tasks.append((url, asyncio.create_task(
+                        self.parse_sitemap(url, max_depth=self._collect_depth))))
+        # Разбор идёт одновременно с резервными пробами; _map_slots оставляет
+        # один HTTP-слот обнаружению, чтобы медленная карта не скрыла быстрый fallback.
+        for path in self.sitemap_paths:
+            effective = await self._check_sitemap_exists(origin + path)
+            if effective and self._is_own_sitemap_host(effective, base_url):
+                found.append(effective)
+                if getattr(self, '_collecting', False):
+                    self._root_tasks.append((effective, asyncio.create_task(
+                        self.parse_sitemap(effective, max_depth=self._collect_depth))))
+        found.extend(await self._find_sitemap_links_in_html(base_url))
+        return sorted({u for u in found if self._is_own_sitemap_host(u, base_url)},
+                      key=lambda u: self._sitemap_source_rank(u, base_url))
+
+    async def _check_sitemap_exists(self, url):
+        try:
+            status, effective, headers, _ = await self._request(url, 'HEAD')
+            if 200 <= status < 300:
+                return effective
+            if 300 <= status < 400:
+                return urljoin(url, headers.get('Location', '')) or None
+            if status in (400, 403, 405, 501):
+                status, effective, _, _ = await self._request(url)
+                if status == 200:
+                    return effective
         except Exception as e:
-            log.debug(f"Карта сайта {url} недоступна: {e}")
+            log.debug(f'Карта сайта {url} недоступна: {e}')
         return None
 
-    async def _extract_sitemaps_from_robots(self, robots_url: str) -> List[str]:
-        """Извлечение карт сайта из robots.txt"""
+    async def _extract_sitemaps_from_robots(self, robots_url):
         try:
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(robots_url, timeout=10) as response:
-                    if response.status == 200:
-                        content = await response.text()
-                        sitemaps = []
-                        for line in content.split('\n'):
-                            line = line.strip()
-                            if line.lower().startswith('sitemap:'):
-                                sitemap_url = line.split(':', 1)[1].strip()
-                                sitemaps.append(sitemap_url)
-                        return sitemaps
-        except:
-            pass
-        return []
-    
-    async def _find_sitemap_links_in_html(self, base_url: str) -> List[str]:
-        """Поиск ссылок на карту сайта в HTML главной страницы"""
-        try:
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(base_url, timeout=10) as response:
-                    if response.status == 200:
-                        html = await response.text()
-                        soup = BeautifulSoup(html, 'html.parser')
-                        
-                        sitemap_links = []
-                        sitemap_keywords = ['карта сайта', 'sitemap', 'site map', 'карта-сайта']
-                        
-                        for link in soup.find_all('a', href=True):
-                            link_text = link.get_text().lower()
-                            href = sanitize_href(link['href'])  # D257
-                            
-                            # Проверка по тексту ссылки
-                            if any(keyword in link_text for keyword in sitemap_keywords):
-                                full_url = urljoin(base_url, href)
-                                sitemap_links.append(full_url)
-                        
-                        return sitemap_links
-        except:
-            pass
-        return []
-    
-    async def parse_sitemap(self, sitemap_url: str, depth: int = 0, max_depth: int = 3) -> List[Tuple[str, str, str, int]]:
-        """Рекурсивный парсинг карты сайта с ограничением глубины.
-
-        D120/D219/D198: элемент результата — четвёрка
-        (опубликованный адрес, нормализованный ключ, категория, приоритет).
-        Опубликованный адрес — ровно тот, что стоит в карте сайта; именно он уходит
-        в очередь и на фетч. Нормализованный вид остаётся ТОЛЬКО ключом дедупликации
-        (visited_urls / product_urls / гейт дублей)."""
-        if depth > max_depth or sitemap_url in self._processed_sitemaps:
-            return []
-            
-        self._processed_sitemaps.add(sitemap_url)
-        log.info(f"Парсинг карты сайта: {sitemap_url} (глубина: {depth})")
-        
-        try:
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(sitemap_url, timeout=10) as response:
-                    if response.status != 200:
-                        return []
-
-                    # D196: тело читаем как БАЙТЫ. Раньше .text() всегда декодировал
-                    # ответ как текст, и .gz-карта валила парсер на первом же байте.
-                    raw = await response.read()
-                    content = self._decode_sitemap_body(raw, sitemap_url)
-                    if content is None:
-                        # Битый .gz — та же карта часто лежит и без расширения
-                        if sitemap_url.lower().endswith('.gz'):
-                            log.warning(f"Не удалось распаковать {sitemap_url}, "
-                                        f"пробуем тот же адрес без .gz")
-                            return await self.parse_sitemap(sitemap_url[:-3], depth, max_depth)
-                        return []
-
-                    # Определение типа карты сайта по content-type или расширению
-                    content_type = response.headers.get('content-type', '').lower()
-
-                    if 'xml' in content_type or sitemap_url.endswith('.xml') or '/sitemap' in sitemap_url.lower():
-                        return await self._parse_xml_sitemap(content, sitemap_url, depth, max_depth)
-                    elif 'html' in content_type or any(ext in sitemap_url for ext in ['.html', '.htm']):
-                        return await self._parse_html_sitemap(content, sitemap_url)
-                    else:
-                        if content.strip().startswith('<?xml') or '<urlset' in content or '<sitemapindex' in content:
-                            return await self._parse_xml_sitemap(content, sitemap_url, depth, max_depth)
-                        else:
-                            return await self._parse_text_sitemap(content, sitemap_url)
-                        
-        except asyncio.TimeoutError:
-            log.warning(f"Таймаут при парсинге карты сайта: {sitemap_url}")
+            status, effective, _, body = await self._request(robots_url)
+            if status == 200:
+                urls = []
+                for item_number, line in enumerate(body.decode('utf-8-sig', errors='replace').splitlines()):
+                    if item_number % 128 == 0:
+                        await asyncio.sleep(0)
+                    if line.strip().lower().startswith('sitemap:'):
+                        urls.append(urljoin(effective, line.split(':', 1)[1].strip()))
+                return urls
         except Exception as e:
-            log.error(f"Ошибка парсинга карты сайта {sitemap_url}: {e}")
-        
+            log.debug(f'Не удалось прочитать robots.txt: {e}')
         return []
-    
-    @staticmethod
-    def _decode_sitemap_body(raw: bytes, sitemap_url: str) -> Optional[str]:
-        """D196: распаковывает gzip по сигнатуре 0x1f 0x8b или расширению .gz и
-        декодирует тело карты сайта. None — тело не читается (битый .gz)."""
+
+    async def _find_sitemap_links_in_html(self, base_url):
         try:
-            if raw[:2] == b'\x1f\x8b' or sitemap_url.lower().endswith('.gz'):
+            status, effective, _, body = await self._request(base_url)
+            if status == 200:
+                soup = await self._html_tree(body.decode('utf-8-sig', errors='replace'), effective)
+                return [urljoin(effective, sanitize_href(link['href']))
+                        for link in soup.find_all('a', href=True)
+                        if any(word in link.get_text().lower()
+                               for word in ('карта сайта', 'sitemap', 'site map', 'карта-сайта'))]
+        except Exception as e:
+            log.debug(f'Не удалось найти HTML-карту: {e}')
+        return []
+
+    async def parse_sitemap(self, sitemap_url, depth=0, max_depth=3):
+        if self._scope_base is None:
+            self._scope_base = sitemap_url
+        if not self._allows_url(sitemap_url):
+            log.info(f'Карта вне периметра пропущена: {sitemap_url}')
+            return []
+        if depth > max_depth:
+            return []
+        key = (sitemap_url, max_depth - depth)
+        parent = self._current_map.get()
+        if key in self._results:
+            return self._results[key]
+        if parent is not None:
+            # Не ждём задачу, которая уже прямо или косвенно ждёт нас.
+            def reaches(node, target, seen):
+                if node == target:
+                    return True
+                if node in seen:
+                    return False
+                seen.add(node)
+                return any(reaches(child, target, seen) for child in self._dependencies.get(node, ()))
+            if reaches(key, parent, set()):
+                return []
+            self._dependencies.setdefault(parent, set()).add(key)
+        if key not in self._loading:
+            self._states[key] = 'loading'
+            self._loading[key] = asyncio.create_task(self._load_sitemap(sitemap_url, depth, max_depth, key))
+        try:
+            rows = await asyncio.shield(self._loading[key])
+            if parent is not None and self._states.get(key) == 'error':
+                self._states[parent] = 'error'
+            return rows
+        finally:
+            if parent is not None:
+                self._dependencies.get(parent, set()).discard(key)
+
+    async def _xml_tree(self, content, sitemap_url):
+        if sitemap_url in self._xml_trees:
+            return self._xml_trees[sitemap_url]
+        parser = ET.XMLPullParser(events=('start',))
+        root = None
+        content = content.lstrip('\ufeff \t\r\n')
+        for offset in range(0, len(content), 65536):
+            parser.feed(content[offset:offset + 65536])
+            for _, node in parser.read_events():
+                if root is None:
+                    root = node
+            await asyncio.sleep(0)
+        parser.close()
+        self._xml_trees[sitemap_url] = root
+        return root
+
+    async def _html_tree(self, content, sitemap_url):
+        if sitemap_url in self._html_trees:
+            return self._html_trees[sitemap_url]
+        # Один HTMLParser сохраняет состояние между порциями (включая теги,
+        # разрезанные границей блока); builder.feed создавал бы новый парсер.
+        from bs4.builder._htmlparser import BeautifulSoupHTMLParser
+        soup = BeautifulSoup('', 'html.parser')
+        parser = BeautifulSoupHTMLParser(soup)
+        for offset in range(0, len(content), 65536):
+            parser.feed(content[offset:offset + 65536])
+            await asyncio.sleep(0)
+        parser.close()
+        self._html_trees[sitemap_url] = soup
+        return soup
+
+    async def _body_kind(self, content, content_type, sitemap_url):
+        stripped = content.lstrip('\ufeff \t\r\n')
+        if stripped.startswith('<'):
+            parser = ET.XMLPullParser(events=('start',))
+            try:
+                for offset in range(0, len(stripped), 65536):
+                    parser.feed(stripped[offset:offset + 65536])
+                    for _, node in parser.read_events():
+                        name = node.tag.rsplit('}', 1)[-1]
+                        if name in ('urlset', 'sitemapindex'):
+                            return 'xml'
+                        return self._sitemap_format('<' + name + '>', content_type, sitemap_url)
+                    await asyncio.sleep(0)
+            except ET.ParseError:
+                return self._sitemap_format(stripped[:4096], content_type, sitemap_url)
+            return None
+        if not stripped.startswith(('{', '[')) and '<' in stripped:
+            first_tag = stripped.find('<')
+            return self._sitemap_format(stripped[first_tag:first_tag + 4096], content_type, sitemap_url)
+        found = False
+        for item_number, line in enumerate(content.splitlines()):
+            if item_number % 128 == 0:
+                await asyncio.sleep(0)
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parsed = urlparse(line)
+            if parsed.scheme not in ('http', 'https', '') or not parsed.netloc or re.search(r'\s', line):
+                return None
+            found = True
+        return 'text' if found else None
+
+    async def _document(self, sitemap_url):
+        """Один HTTP/разбор тела на URL; глубина влияет только на обход индекса."""
+        try:
+            async with self._map_slots:
+                status, effective, headers, raw = await self._request(sitemap_url)
+            if not self._allows_url(effective, sitemap_url):
+                raise ValueError(f'Ответ карты вне периметра: {effective}')
+            if status != 200:
+                raise ValueError(f'HTTP {status}')
+            # gzip уже распакован потоковым читателем; повторно не распаковываем.
+            content = self._decode_sitemap_body(raw, effective, decompress=False)
+            kind = await self._body_kind(content, headers.get('content-type', '').lower(), effective) if content is not None else None
+            if kind == 'xml':
+                await self._xml_tree(content, effective)
+            if kind == 'html' and self._is_sitemap_error_html(await self._html_tree(content, effective)):
+                self._html_trees.pop(effective, None)
+                raise ValueError('HTML-заглушка вместо карты')
+            result = (effective, content, kind)
+            if kind:
+                self._documents[sitemap_url] = result
+            return result
+        finally:
+            self._document_tasks.pop(sitemap_url, None)
+
+    async def _load_sitemap(self, sitemap_url, depth, max_depth, key):
+        token = self._current_map.set(key)
+        try:
+            if sitemap_url in self._documents:
+                effective, content, kind = self._documents[sitemap_url]
+            else:
+                if sitemap_url not in self._document_tasks:
+                    self._document_tasks[sitemap_url] = asyncio.create_task(self._document(sitemap_url))
+                try:
+                    effective, content, kind = await asyncio.shield(self._document_tasks[sitemap_url])
+                except Exception as e:
+                    import zlib
+                    if isinstance(e, zlib.error) or str(e) == 'Усечённый gzip карты сайта':
+                        effective, content, kind = sitemap_url, None, None
+                    else:
+                        raise
+            if kind == 'xml':
+                # Невалидный XML не становится успешным пустым кэшем.
+                await self._xml_tree(content, effective)
+                rows = await self._parse_xml_sitemap(content, effective, depth, max_depth)
+            elif kind == 'html':
+                if self._is_sitemap_error_html(await self._html_tree(content, effective)):
+                    raise ValueError('HTML-заглушка вместо карты')
+                rows = await self._parse_html_sitemap(content, effective)
+            elif kind == 'text':
+                rows = await self._parse_text_sitemap(content, effective)
+            else:
+                parsed = urlparse(sitemap_url)
+                if parsed.path.lower().endswith('.gz'):
+                    rows = await self.parse_sitemap(urlunparse(parsed._replace(path=parsed.path[:-3])), depth, max_depth)
+                else:
+                    raise ValueError('Неизвестный формат карты')
+            # Индекс с отказавшей подкартою можно вызвать повторно: готовые
+            # документы переиспользуются, ошибочные HTTP-запросы повторяются.
+            failed_child = self._states.get(key) == 'error' or any(self._states.get(child) == 'error'
+                               for child in self._dependencies.get(key, ()))
+            if not failed_child:
+                self._results[key] = rows
+            if kind and (kind != 'xml' or self._xml_trees[effective].tag.rsplit('}', 1)[-1] != 'sitemapindex'):
+                self._completed[sitemap_url] = rows
+            self._states[key] = 'error' if failed_child else 'success'
+            if not failed_child:
+                self._processed_sitemaps.add(sitemap_url)
+            return rows
+        except asyncio.CancelledError:
+            self._states[key] = 'error'
+            raise
+        except Exception as e:
+            self._states[key] = 'error'
+            log.warning(f'Ошибка карты сайта {sitemap_url}: {e}')
+            return []
+        finally:
+            self._current_map.reset(token)
+            self._loading.pop(key, None)
+
+    @staticmethod
+    def _decode_sitemap_body(raw: bytes, sitemap_url: str, decompress=True) -> Optional[str]:
+        """Распаковывает только фактический gzip: HTTP-клиент мог уже снять сжатие."""
+        try:
+            if decompress and raw[:2] == b'\x1f\x8b':
                 raw = gzip.decompress(raw)
-            return raw.decode('utf-8', errors='replace')
+            if raw.startswith((b'\xff\xfe\x00\x00', b'\x00\x00\xfe\xff')):
+                return raw.decode('utf-32')
+            if raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+                return raw.decode('utf-16')
+            return raw.decode('utf-8-sig', errors='replace')
         except Exception as e:
             log.warning(f"Не удалось прочитать тело карты сайта {sitemap_url}: {e}")
             return None
+
+    @staticmethod
+    def _sitemap_format(content: str, content_type: str, sitemap_url: str) -> Optional[str]:
+        """Тело определяет формат; MIME/расширение лишь помогают распознать HTML-фрагмент."""
+        content = content.lstrip('\ufeff \t\r\n')
+        if not content:
+            return None
+        if content.startswith('<'):
+            # XML-парсер сохраняет настоящее имя корня и namespace. Одного наличия
+            # <url> внутри RSS/Error недостаточно, чтобы считать документ картой.
+            root = BeautifulSoup(content, 'xml').find(True)
+            if root is not None and root.name in ('urlset', 'sitemapindex'):
+                return 'xml'
+            root_name = root.name.lower() if root is not None else ''
+        else:
+            root_name = ''
+        html_roots = {'html', 'head', 'body', 'title', 'meta', 'link', 'base', 'script', 'style',
+                      'a', 'div', 'nav', 'main', 'section', 'article', 'header', 'footer',
+                      'ul', 'ol', 'li', 'dl', 'dt', 'dd', 'table', 'p', 'span',
+                      'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'br'}
+        if root_name in html_roots:
+            return 'html'
+        # Не переинтерпретируем XML с чужим корнем даже при text/html или .html.
+        if root_name:
+            return None
+        if (not content.startswith(('{', '[')) and
+                ('<' in content or 'html' in content_type or
+                 urlparse(sitemap_url).path.lower().endswith(('.html', '.htm')))):
+            first = BeautifulSoup(content, 'html.parser').find(True)
+            if first is not None and first.name in html_roots:
+                return 'html'
+        lines = [line.strip() for line in content.splitlines()
+                 if line.strip() and not line.lstrip().startswith('#')]
+        if lines and all(urlparse(line).scheme in ('http', 'https', '') and urlparse(line).netloc
+                         and not re.search(r'\s', line) for line in lines):
+            return 'text'
+        return None
+
+    def _is_sitemap_error_html(self, soup: BeautifulSoup) -> bool:
+        """Известные заглушки; слова 404/captcha в ссылках карты не являются отказом."""
+        headings = [' '.join(tag.stripped_strings).lower() for tag in soup.find_all(['title', 'h1'])]
+        error_heading = re.compile(
+            r'^(?:40[034]\b|50[0234]\b|(?:error|ошибка)\s*[: -]?\s*[45]\d\d\b|'
+            r'not found\b|access denied\b|forbidden\b|just a moment\b|attention required\b|'
+            r'страница не найдена|доступ запрещ[её]н|проверка браузера)')
+        if any(error_heading.search(text) for text in headings):
+            return True
+        if soup.find(id=re.compile(r'^(?:challenge-form|cf-challenge|cf-error-details)$', re.I)):
+            return True
+        # Маркеры хостера проверяем вне подписей ссылок: карта может ссылаться на
+        # справочную статью с таким названием. Технические маркеры — в form/script/link.
+        visible = ' '.join(str(node) for node in soup.find_all(string=True)
+                           if not isinstance(node, Comment) and not node.find_parent(['a', 'script', 'style'])).lower()
+        technical = ''.join(str(tag) for tag in soup.find_all(['title', 'script', 'form', 'link'])).lower()
+        return any(marker.lower() in visible or marker.lower() in technical
+                   for marker in (getattr(self.config, 'hoster_stub_markers', None) or []) if marker)
 
     @staticmethod
     def _repair_loc(loc: str, sitemap_url: str) -> Optional[str]:
@@ -2146,18 +2637,31 @@ class SiteMapParser:
 
     async def _parse_xml_sitemap(self, content: str, sitemap_url: str, depth: int, max_depth: int) -> List[Tuple[str, str, str, int]]:
         """Парсинг XML карты сайта (включая sitemap index)"""
+        if self._scope_base is None:
+            self._scope_base = sitemap_url
         try:
-            soup = BeautifulSoup(content, 'xml')
+            # BeautifulSoup восстанавливает битый XML; здесь не принимаем усечённую
+            # или постороннюю структуру как корректную карту с частичным результатом.
+            root = await self._xml_tree(content, sitemap_url)
+            root_name = root.tag.rsplit('}', 1)[-1]
+            if root_name not in ('urlset', 'sitemapindex'):
+                log.warning(f"Неподдерживаемый корень XML карты сайта: {sitemap_url}")
+                return []
             all_urls = []
             
             # Проверка на sitemap index
-            sitemap_tags = soup.find_all('sitemap')
-            if sitemap_tags:
+            if root_name == 'sitemapindex':
+                sitemap_tags = [node for node in root if node.tag.rsplit('}', 1)[-1] == 'sitemap']
                 # Это индексный файл - парсим вложенные карты сайта.
                 # D154: жёсткий срез [:5] заменён конфиг-параметром (по умолчанию — все);
                 # при действующем лимите первыми берутся товарные подкарты.
-                locs = [tag.find('loc').text.strip() for tag in sitemap_tags
-                        if tag.find('loc') and tag.find('loc').text]
+                locs = []
+                for item_number, tag in enumerate(sitemap_tags):
+                    if item_number % 128 == 0:
+                        await asyncio.sleep(0)
+                    loc = next((node for node in tag if node.tag.rsplit('}', 1)[-1] == 'loc'), None)
+                    if loc is not None and loc.text:
+                        locs.append(loc.text.strip())
                 limit = self.config.sitemap_max_submaps
                 if limit and len(locs) > limit:
                     chosen = sorted(locs, key=self._submap_rank)[:limit]
@@ -2167,25 +2671,34 @@ class SiteMapParser:
                 else:
                     chosen = locs
                     log.info(f"Индекс {sitemap_url}: {len(locs)} карт, разобраны все")
-                tasks = [self.parse_sitemap(loc, depth + 1, max_depth) for loc in chosen]
+                # Не создаём неограниченное число задач для большого индекса.
+                chosen = sorted(dict.fromkeys(chosen), key=self._submap_rank)[:getattr(self.config, 'sitemap_max_requests', 128)]
+                tasks = [self.parse_sitemap(urljoin(sitemap_url, loc), depth + 1, max_depth) for loc in chosen]
 
                 if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
+                    unique_rows = {}
                     for result in results:
                         if isinstance(result, list):
-                            all_urls.extend(result)
+                            for item_number, row in enumerate(result):
+                                if item_number % 128 == 0:
+                                    await asyncio.sleep(0)
+                                previous = unique_rows.get(row[1])
+                                if previous is None or row[3] > previous[3]:
+                                    unique_rows[row[1]] = row
+                    all_urls = list(unique_rows.values())
                 return all_urls
             
-            # Обычная карта сайта с URL. D144/D208: категоризуем адреса карты (до потолка
-            # сканирования) и режем по кэпу ПОСЛЕ ранжирования — прежде срез
-            # url_tags[:sitemap_max_urls] шёл в порядке документа, до категоризации, и
-            # товарные карточки из хвоста карты не попадали в обход вовсе.
-            url_tags = soup.find_all('url')
+            # Технический потолок чтения отделён от квоты обхода: сохраняем
+            # ранжированные кандидаты, включая резерв для пополнения очереди.
+            url_tags = [node for node in root if node.tag.rsplit('}', 1)[-1] == 'url']
             scanned_tags = url_tags[:self.config.sitemap_max_scan_urls]
             broken_locs = 0
-            for url_tag in scanned_tags:
-                loc_tag = url_tag.find('loc')
-                if loc_tag and loc_tag.text:
+            for item_number, url_tag in enumerate(scanned_tags):
+                if item_number % 128 == 0:
+                    await asyncio.sleep(0)
+                loc_tag = next((node for node in url_tag if node.tag.rsplit('}', 1)[-1] == 'loc'), None)
+                if loc_tag is not None and loc_tag.text:
                     url = loc_tag.text.strip()
                     # D151: <loc> без хоста чиним по адресу самой карты ДО категоризации
                     # и до постановки в очередь; неисправимые отбрасываем
@@ -2216,11 +2729,6 @@ class SiteMapParser:
                 log.warning(f"Карта сайта {sitemap_url}: {len(url_tags)} адресов, "
                             f"просканировано {len(scanned_tags)} (потолок sitemap_max_scan_urls)")
             all_urls.sort(key=self._sitemap_rank_key)
-            if len(all_urls) > self.config.sitemap_max_urls:
-                log.info(f"Карта сайта {sitemap_url}: {len(all_urls)} адресов после "
-                         f"категоризации, в кэп {self.config.sitemap_max_urls} берём лучшие по рангу")
-                all_urls = all_urls[:self.config.sitemap_max_urls]
-
             log.info(f"Извлечено {len(all_urls)} URL из XML карты сайта")
             return all_urls
             
@@ -2231,12 +2739,17 @@ class SiteMapParser:
     async def _parse_html_sitemap(self, content: str, sitemap_url: str) -> List[Tuple[str, str, str, int]]:
         """Парсинг HTML карты сайта"""
         try:
-            soup = BeautifulSoup(content, 'html.parser')
+            soup = await self._html_tree(content, sitemap_url)
+            if self._is_sitemap_error_html(soup):
+                log.warning(f"Вместо HTML карты сайта получена заглушка: {sitemap_url}")
+                return []
             all_urls = []
             base_domain = urlparse(sitemap_url).scheme + "://" + urlparse(sitemap_url).netloc
             
             # Ищем все ссылки в HTML
-            for link in soup.find_all('a', href=True)[:self.config.sitemap_max_urls]:
+            for item_number, link in enumerate(soup.find_all('a', href=True)[:self.config.sitemap_max_scan_urls]):
+                if item_number % 128 == 0:
+                    await asyncio.sleep(0)
                 href = sanitize_href(link['href'])  # D257/D233
                 if href and not href.startswith(('#', 'javascript:', 'mailto:')):
                     full_url = urljoin(base_domain, href)
@@ -2265,7 +2778,9 @@ class SiteMapParser:
             all_urls = []
             base_domain = urlparse(sitemap_url).scheme + "://" + urlparse(sitemap_url).netloc
             
-            for line in content.split('\n')[:self.config.sitemap_max_urls]:
+            for item_number, line in enumerate(content.split('\n')[:self.config.sitemap_max_scan_urls]):
+                if item_number % 128 == 0:
+                    await asyncio.sleep(0)
                 line = line.strip()
                 if line and not line.startswith('#') and self._is_valid_url(line):
                     full_url = urljoin(base_domain, line) if not line.startswith('http') else line
@@ -2321,11 +2836,12 @@ class ProductGridParser:
         product_links = []
         
         try:
+            link_base = document_base_url(soup, current_url)
             for selector in self.product_grid_selectors:
                 try:
                     grid_elements = soup.select(selector)
                     for element in grid_elements:
-                        links = self._extract_links_from_element(element, base_url, current_url)
+                        links = self._extract_links_from_element(element, base_url, link_base)
                         product_links.extend(links)
                 except Exception as e:
                     log.debug(f"Ошибка в селекторе {selector}: {e}")
@@ -2379,6 +2895,8 @@ class FileDownloadManager:
         self.config = config
         self.processed_tabs = set()
         self.downloaded_files_cache = set()
+        self.download_cache = FileDownloadCache(config.base_dir)
+        self._download_locks = {}
         self.supported_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.rtf']
         # Общий лимит одновременных скачиваний файлов/картинок: при потоковой обработке
         # скачивания идут параллельно с краулом того же домена, суммарную нагрузку на сайт
@@ -2392,7 +2910,40 @@ class FileDownloadManager:
 
     def _is_same_domain(self, url: str, base_domain: str) -> bool:
         """Проверяет, принадлежит ли URL тому же домену"""
-        return self.crawler.url_categorizer._is_same_domain(url, base_domain)
+        return self.crawler._is_allowed_url(url, resource='file', base_url=base_domain)
+
+    def _file_response(self, session, method: str, url: str, *, resource='file', base_url=None, conditional_url=None, **kwargs):
+        """Проверяет каждый HTTP-переход до запроса и отклоняет HTML."""
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def checked_response():
+            current = url
+            for _ in range(11):
+                if not self.crawler._is_allowed_url(current, resource=resource, base_url=base_url):
+                    raise ValueError(f'Файл вне периметра компании: {current}')
+                request_kwargs = dict(kwargs)
+                if conditional_url and current != conditional_url:
+                    request_kwargs['headers'] = {key: value for key, value in kwargs.get('headers', {}).items()
+                                                 if key not in {'If-None-Match', 'If-Modified-Since'}}
+                async with session.request(method, current, allow_redirects=False, **request_kwargs) as response:
+                    final_url = str(response.url)
+                    if not self.crawler._is_allowed_url(final_url, resource=resource, base_url=base_url):
+                        raise ValueError(f'Ответ файла вне периметра компании: {final_url}')
+                    if response.status in (301, 302, 303, 307, 308):
+                        location = response.headers.get('Location')
+                        if not location:
+                            raise ValueError('Редирект файла без Location')
+                        current = urljoin(final_url, location)
+                        continue
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    if response.status != 304 and resource == 'file' and ('text/html' in content_type or 'application/xhtml+xml' in content_type):
+                        raise ValueError(f'HTML вместо файла: {final_url}')
+                    yield response
+                    return
+            raise ValueError('Слишком много редиректов файла')
+
+        return checked_response()
 
     def should_download_file(self, url: str, response_headers: dict = None, page_category: str = None) -> bool:
         """Определяет, нужно ли скачивать файл на основе категории страницы"""
@@ -2569,7 +3120,7 @@ class FileDownloadManager:
                 }
             ) as session:
                 
-                async with session.head(image_url, allow_redirects=True) as response:
+                async with self._file_response(session, 'HEAD', image_url) as response:
                     if response.status == 200:
                         # Пробуем получить размер из Content-Length
                         content_length = response.headers.get('Content-Length')
@@ -2579,7 +3130,7 @@ class FileDownloadManager:
                         # Если размер не указан в заголовках, получаем небольшой кусок для анализа
                         try:
                             # Делаем GET запрос с ограниченным размером
-                            async with session.get(image_url, headers={'Range': 'bytes=0-1024'}) as partial_response:
+                            async with self._file_response(session, 'GET', image_url, headers={'Range': 'bytes=0-1024'}) as partial_response:
                                 if partial_response.status in (200, 206):
                                     # Если поддерживается частичная загрузка, получаем общий размер
                                     content_range = partial_response.headers.get('Content-Range')
@@ -2608,7 +3159,7 @@ class FileDownloadManager:
     async def download_image_with_size_check(self, image_url: str, save_dir: str, page_category: str = 'ai_image') -> Optional[str]:
         """
         Скачивание изображения с единственной проверкой — минимальный размер файла.
-        Не проверяет расширение, не фильтрует URL, не блокирует скачивание.
+        Периметр URL и тип ответа проверяются при каждом HTTP-запросе.
         """
         try:
             # 1. Пытаемся получить размер изображения
@@ -2690,6 +3241,8 @@ class FileDownloadManager:
                 if next_page_url:
                     try:
                         # ИЗМЕНЕНО: переход с domcontentloaded + короткий networkidle
+                        if not self.crawler._is_allowed_url(next_page_url, base_url=base_url):
+                            break
                         await page.goto(next_page_url, wait_until='domcontentloaded', timeout=20000)
                         try:
                             await page.wait_for_load_state('networkidle', timeout=3000)
@@ -2812,7 +3365,9 @@ class FileDownloadManager:
                     # Проверяем, существует ли страница
                     try:
                         async with aiohttp.ClientSession() as session:
-                            async with session.head(next_url, timeout=5) as response:
+                            async with self._file_response(
+                                    session, 'HEAD', next_url, resource='page',
+                                    base_url=base_url, timeout=5) as response:
                                 if response.status == 200:
                                     return next_url
                     except:
@@ -2890,7 +3445,7 @@ class FileDownloadManager:
             for link_info in all_links:
                 file_url = link_info['url']
                 if (self.is_downloadable_file(file_url) and
-                    self.crawler.url_categorizer.is_main_domain(file_url, base_url) and  # <-- замена
+                    self._is_same_domain(file_url, base_url) and
                     self._has_supported_extension(file_url)):
                     file_links.append(link_info)
             
@@ -2940,12 +3495,13 @@ class FileDownloadManager:
             soup = BeautifulSoup(html, 'html.parser')
         links, seen = [], set()
         for a in soup.find_all('a', href=True):
-            full_url = urljoin(page_url, a['href'].strip()).split('#', 1)[0]
+            full_url = urljoin(document_base_url(soup, page_url), a['href'].strip()).split('#', 1)[0]
             if not full_url or full_url in seen:
                 continue
             seen.add(full_url)
             path = urlparse(full_url).path.lower()
-            if any(path.endswith(ext) for ext in self.supported_extensions):
+            if (any(path.endswith(ext) for ext in self.supported_extensions)
+                    and self._is_same_domain(full_url, page_url)):
                 links.append(full_url)
         return links
 
@@ -2968,14 +3524,25 @@ class FileDownloadManager:
 
     async def _download_aiohttp(self, file_url: str, save_dir: str, page_category: str = None) -> Optional[str]:
         """Универсальное скачивание файлов через aiohttp (под общим лимитом скачиваний)"""
-        async with self.download_semaphore:
-            await self._file_throttle(file_url)
-            return await self._download_aiohttp_unlimited(file_url, save_dir, page_category)
+        # Один файл/каталог не записывается одновременно из нескольких карточек.
+        key = os.path.abspath(save_dir)
+        async with self._download_locks.setdefault(key, asyncio.Lock()):
+            async with self.download_semaphore:
+                await self._file_throttle(file_url)
+                return await self._download_aiohttp_unlimited(file_url, save_dir, page_category)
 
     async def _download_aiohttp_unlimited(self, file_url: str, save_dir: str, page_category: str = None) -> Optional[str]:
         """Универсальное скачивание файлов через aiohttp (из Fallback)"""
         try:
             _ptt_t0 = time.perf_counter()
+            entry = self.download_cache.load(save_dir, file_url)
+            local = self.download_cache.usable_path(save_dir, entry)
+            conditional_headers = {}
+            if local:
+                if entry.get('etag'):
+                    conditional_headers['If-None-Match'] = entry['etag']
+                elif entry.get('last_modified'):
+                    conditional_headers['If-Modified-Since'] = entry['last_modified']
             timeout = aiohttp.ClientTimeout(total=self._file_timeout(30))
             connector = aiohttp.TCPConnector(limit=5, ssl=False)
             
@@ -2991,7 +3558,15 @@ class FileDownloadManager:
             }
             ) as session:
                 
-                async with session.get(file_url, allow_redirects=True) as response:
+                async with self._file_response(session, 'GET', file_url, headers=conditional_headers,
+                                               conditional_url=entry.get('response_url', file_url)) as response:
+                    if response.status == 304:
+                        if (local and conditional_headers
+                                and str(response.url) == entry.get('response_url', file_url)):
+                            log.info("Файл не изменился (304): %s", file_url)
+                            return str(local)
+                        log.warning("304 без проверенной локальной копии: %s", file_url)
+                        return None
                     if response.status == 200:
                         # Получаем имя файла
                         file_name = self._extract_filename_from_response(file_url, response.headers)
@@ -2999,32 +3574,55 @@ class FileDownloadManager:
                             log.warning(f"Не удалось извлечь имя файла для {file_url}")
                             return None
                         
-                        # Создаем полный путь
-                        file_path = os.path.join(save_dir, file_name)
-                        
-                        # Проверяем, не скачан ли файл уже
-                        if os.path.exists(file_path):
-                            log.info(f"Файл уже существует: {file_path}")
-                            return file_path
-                        
+                        file_path = self.download_cache.destination(save_dir, file_url, file_name, entry)
+                        if file_path is None:
+                            log.warning("Небезопасное имя файла: %s", file_name)
+                            return None
+
                         # Скачиваем контент
                         content = await response.read()
-                        
+                        if not content:
+                            return None
+                        prefix = content[:2048].decode('utf-8-sig', errors='replace').lower()
+                        prefix = re.sub(r'^\s*(?:(?:<!--.*?-->|<\?xml.*?\?>)\s*)*', '', prefix, flags=re.S)
+                        if (re.match(r'<(?:!doctype\s+html|html|head|body)(?:\s|>)', prefix)
+                                or not self.crawler._is_allowed_url(str(response.url), resource='file')):
+                            return None
+
                         # Проверяем размер файла
                         file_size_mb = len(content) / 1024 / 1024
                         if file_size_mb > self.config.max_file_size_mb:
                             log.warning(f"Файл {file_name} превышает максимальный размер: {file_size_mb:.2f} MB")
                             return None
                         
-                        # Сохраняем файл
-                        async with aiofiles.open(file_path, 'wb') as f:
-                            await f.write(content)
-                        
+                        digest = hashlib.sha256(content).hexdigest()
+                        # Сервер может игнорировать условные заголовки. Сверяем полные байты,
+                        # включая старые файлы без метаданных, не меняя время равной копии.
+                        if local and entry.get('sha256') == digest:
+                            result_path = local
+                        elif file_path.is_file() and file_sha256(file_path) == digest:
+                            result_path = file_path
+                        else:
+                            self.download_cache.archive(file_path)
+                            atomic_write(file_path, content)
+                            result_path = file_path
+                        previous_digest = entry.get('sha256')
+                        if previous_digest != digest:
+                            entry = {}
+                        entry.update(url=file_url, response_url=str(response.url), filename=file_path.name, sha256=digest,
+                                     etag=response.headers.get('ETag'),
+                                     last_modified=response.headers.get('Last-Modified'),
+                                     checked_at=datetime.now().isoformat())
+                        try:
+                            self.download_cache.save(save_dir, file_url, entry)
+                        except OSError as error:
+                            log.warning("Файл сохранён, но кэш загрузки недоступен: %s", error)
+
                         log.info(f"Файл успешно скачан: {file_name} ({file_size_mb:.2f} MB)")
                         _ptt = getattr(self.crawler, 'processing_tracker', None)
                         if _ptt:
                             _ptt.add_clean('files', time.perf_counter() - _ptt_t0)
-                        return file_path
+                        return str(result_path)
                     else:
                         log.warning(f"HTTP ошибка {response.status} для {file_url}")
                         return None
@@ -3073,15 +3671,24 @@ class WebCrawler:
         self.url_normalizer = SmartURLNormalizer(self.url_categorizer)
         self.product_grid_parser = ProductGridParser(self.url_categorizer)
         self.temp_storage = TempStorageManager( base_dir=os.path.join(config.base_dir, "temp_html_storage"),
-            max_size_mb=config.temp_storage_max_size_mb)
+            max_size_mb=config.temp_storage_max_size_mb,
+            url_normalizer=self.url_normalizer.normalize_url)
         self.file_download_manager = FileDownloadManager(self, config)
-        self.sitemap_parser = SiteMapParser(config, self.url_categorizer, self.url_normalizer)
+        self.sitemap_parser = SiteMapParser(config, self.url_categorizer, self.url_normalizer,
+                                            allowed_url=self._is_allowed_url)
         self.permanent_errors_cache = self._load_permanent_errors_cache()
+        self._negative_cache_status = {}
         self._errors_cache_lock = asyncio.Lock()
         
         # Статистика
         self.stats = {
             'total_pages': 0,
+            'attempted_pages': 0,
+            'fetched_pages': 0,
+            'resumed_pages': 0,
+            'successful_urls': 0,
+            'failed_attempts': 0,
+            'processing_errors': 0,
             'product_pages': 0,
             'category_pages': 0,
             'price_list_pages': 0,  
@@ -3113,6 +3720,8 @@ class WebCrawler:
         # Потоковая обработка: опциональная asyncio.Queue; если задана, каждая сохранённая
         # страница дополнительно кладётся в неё сразу после записи в хранилище
         self.page_sink = None
+        self.crawl_run_id = None
+        self._resume_pages = {}
 
         self.browser_pool = BrowserPool(
             headless=True,
@@ -3127,14 +3736,15 @@ class WebCrawler:
         self.product_urls = set()
         # D59 RC1: ключи схемного дедупа (домен+путь без схемы) — гасят ТОЛЬКО http↔https
         # одной и той же страницы при постановке в очередь (контент идентичен, безопасно).
-        # Кросс-доменная/путь-склейка (C) вынесена на стадию УСПЕШНОГО извлечения в main.py
-        # (_product_dedup_key), чтобы провалившаяся версия (soft-404 на осн. домене холдинга)
-        # НЕ вытесняла рабочую версию со вторичного домена. См. _scheme_dedup_key.
+        # Разные хосты и пути сохраняются до извлечения; общий слаг не доказывает дубль.
+        # Успешное извлечение дополнительно проверяет полный адрес и стабильный product_id.
         self._crawled_scheme_keys = set()
         # D36: детект протухшего sitemap (soft-404 оболочки). Если N товарных страниц
-        # дали одинаковый видимый текст — sitemap отдаёт заглушки; вычищаем его хвост
+        # дали подтверждённую одинаковую soft-404 — вычищаем товарный хвост
         # из очереди, чтобы не сжечь бюджет max_product_pages_per_site впустую.
         self._product_text_hash_counts = {}
+        self._sitemap_soft404_seen = {}
+        self._sitemap_hard_fail_seen = set()
         self._stale_sitemap_guard_tripped = False
         self.stale_sitemap_dup_threshold = getattr(self.config, 'stale_sitemap_dup_threshold', 10)
         # P02 U1: учёт товарной квоты. Слот занимается при ПОСТАНОВКЕ URL в очередь и
@@ -3160,6 +3770,8 @@ class WebCrawler:
         # при no_content/404 на другом написании того же ключа (напр. бесслешевом
         # стартовом пути) повторить запрос ровно опубликованным адресом.
         self._sitemap_published_urls = {}
+        self._sitemap_pending = deque()
+        self._sitemap_slots = set()
         # P01 U3: подтверждённая find_working_url рабочая форма хоста и схемы компании.
         # К ней приводятся хост и схема каждой собранной ссылки ДО постановки в очередь
         # (D87 — www-форма сохраняется, D134 — http поднимается до https, D270 — www-дубль
@@ -3174,7 +3786,20 @@ class WebCrawler:
         self._mirror_autodetect_done = False
         # D40: ретраи страниц, не отдавших контент (таймауты медленных сайтов):
         # {normalized_url: (url, depth, category, attempts)}
+        self._retry_due = {}
+        self._retry_reasons = {}
+        self._host_retry_until = {}
+        self._successful_fetch_urls = set()
+        self._usable_page_urls = set()
+        self._terminal_crawl_reason = None
+        self._depth_limited_urls = set()
+        self._pagination_limited_urls = set()
+        self._remaining_queue = []
+        self._fetch_failures = {}
         self._page_retry_candidates = {}
+        self._page_retry_attempts = {}
+        self._queued_retries = set()
+        self._quota_rejected_depths = {}
         self.page_retry_max_attempts = getattr(self.config, 'page_retry_max_attempts', 1)
         self.permanent_errors_cache = self._load_permanent_errors_cache()
         # Блокировки для потокобезопасности
@@ -3197,27 +3822,40 @@ class WebCrawler:
         txt = re.sub(r'\s+', ' ', txt).strip()
         return hashlib.md5(txt.encode('utf-8', errors='ignore')).hexdigest()
 
-    async def _check_stale_sitemap_guard(self, html: str, url: str, queue: deque) -> None:
-        """D36: считает одинаковые сигнатуры текста товарных страниц; при достижении
-        порога вычищает из очереди необойдённые товарные URL карты сайта (depth=0)
-        и освобождает их слоты в product_urls (бюджет max_product_pages_per_site)."""
-        if self._stale_sitemap_guard_tripped:
+    async def _check_stale_sitemap_guard(self, html: str, url: str, queue: deque,
+                                         *, outcome=None) -> None:
+        """Считает разные адреса карты с подтверждённой одинаковой soft-404."""
+        norm = self.url_normalizer.normalize_url(url)
+        if (self._stale_sitemap_guard_tripped
+                or norm not in self._sitemap_published_urls
+                or (outcome is not None and outcome.reason != 'soft_not_found')
+                or not is_soft_not_found(html)):
+            return
+        soup = BeautifulSoup(html, 'html.parser')
+        if (has_product_island(html)
+                or self.url_categorizer.is_product_page_by_content(soup, url)):
             return
         sig = self._soft404_text_signature(html)
-        n = self._product_text_hash_counts.get(sig, 0) + 1
+        seen = self._sitemap_soft404_seen.setdefault(sig, set())
+        seen.add(norm)
+        n = len(seen)
         self._product_text_hash_counts[sig] = n
         if n < self.stale_sitemap_dup_threshold:
             return
         self._stale_sitemap_guard_tripped = True
         await self._purge_sitemap_tail(
-            queue, f"Протухший sitemap: {n} товарных страниц с одинаковым текстом "
+            queue, f"Протухший sitemap: {n} разных товарных адресов с одинаковой soft-404 "
                    f"(последняя: {url}).")
 
     async def _purge_sitemap_tail(self, queue: deque, reason: str) -> None:
-        """D36/D225: снимает из очереди необойдённые товарные URL карты сайта (глубина 0)
+        """D36/D225: снимает из очереди необойдённые товарные URL карты сайта
         и освобождает их слоты товарной квоты. Вместе с product_urls/visited_urls
         снимается и схемный ключ D59 RC1 — иначе те же адреса, предложенные ссылками из
         каталога, отбиваются как «схемный дубль», и освобождённый бюджет некому занять."""
+        pending = self._sitemap_pending
+        self._sitemap_pending = deque(row for row in pending if row[2] != 'product')
+        self.stats['sitemap_guard_reason'] = reason
+        self.stats['sitemap_guard_pending_purged'] = len(pending) - len(self._sitemap_pending)
         purged = 0
         purged_keys = 0
         async with self._queue_lock:
@@ -3225,11 +3863,12 @@ class WebCrawler:
             while queue:
                 item = queue.popleft()
                 q_url, q_depth, q_category = item[0], item[1], item[2]
-                if q_category == 'product' and q_depth == 0:
-                    norm = self.url_normalizer.normalize_url(q_url)
+                norm = self.url_normalizer.normalize_url(q_url)
+                if q_category == 'product' and norm in self._sitemap_published_urls:
                     skey = self._scheme_dedup_key(q_url)
                     async with self._urls_lock:
                         self.product_urls.discard(norm)
+                        self._sitemap_slots.discard(norm)
                         self.visited_urls.discard(norm)
                         if skey is not None and skey in self._crawled_scheme_keys:
                             self._crawled_scheme_keys.discard(skey)
@@ -3238,24 +3877,32 @@ class WebCrawler:
                 else:
                     kept.append(item)
             queue.extend(kept)
+        self.stats['sitemap_guard_purged'] = purged
         log.warning(f"{reason} Из очереди убрано {purged} товарных URL карты сайта "
                     f"(снято схемных ключей: {purged_keys}), бюджет освобождён для "
                     f"ссылок из каталога")
 
     async def _check_hard_fail_sitemap_guard(self, url: str, depth: int, category: str,
-                                             queue: deque) -> None:
-        """P02 U1 п.2: жёсткие отказы (404/410, таймаут) подряд среди товарных URL карты
-        сайта глубины 0. Сторож D36 против них слеп по построению: ему нужен пришедший
-        HTML, а на жёстком отказе parse_result=None и до него управление не доходит."""
-        if self._stale_sitemap_guard_tripped or category != 'product' or depth != 0:
+                                             queue: deque, *, outcome=None) -> None:
+        """Серия подтверждённых 404/410 разных товарных адресов карты сайта."""
+        norm = self.url_normalizer.normalize_url(url)
+        if (self._stale_sitemap_guard_tripped or category != 'product'
+                or norm not in self._sitemap_published_urls):
             return
+        if (outcome is None or outcome.reason not in ('not_found', 'gone')
+                or outcome.retryable):
+            self._sitemap_hard_fail_streak = 0
+            return
+        if norm in self._sitemap_hard_fail_seen:
+            return
+        self._sitemap_hard_fail_seen.add(norm)
         self._sitemap_hard_fail_streak += 1
         if self._sitemap_hard_fail_streak < self.stale_sitemap_hard_fail_threshold:
             return
         self._stale_sitemap_guard_tripped = True
         await self._purge_sitemap_tail(
-            queue, f"Карта сайта не отдаёт содержимое: {self._sitemap_hard_fail_streak} "
-                   f"товарных адресов подряд без контента (последний: {url}).")
+            queue, f"Карта сайта содержит отсутствующие страницы: {self._sitemap_hard_fail_streak} "
+                   f"разных товарных адресов подряд с 404/410 (последний: {url}).")
 
     async def _release_product_quota_slot(self, normalized_url: str, reason: str) -> bool:
         """P02 U1 п.1: возврат слота товарной квоты на пути неуспеха товарной страницы.
@@ -3267,6 +3914,7 @@ class WebCrawler:
             if self._product_quota_reused >= self.product_quota_reuse_limit:
                 return False
             self.product_urls.discard(normalized_url)
+            self._sitemap_slots.discard(normalized_url)
             self._quota_released.add(normalized_url)
             self._product_quota_reused += 1
             reused = self._product_quota_reused
@@ -3318,26 +3966,173 @@ class WebCrawler:
         return await self._release_product_quota_slot(
             normalized_url, 'страница-листинг, а не карточка')
 
-    def _register_page_retry(self, url: str, depth: int, category: str) -> None:
-        """D40: запоминает страницу, не отдавшую контент, для повторной попытки.
-        Ретраим только целевые категории — терять их значит терять товары/дилеров."""
-        if category not in ('product', 'contacts', 'distributor', 'main_page'):
-            return
+    def _register_page_retry(self, url: str, depth: int, category: str, outcome=None) -> None:
+        """Повтор только временного отказа; лимит попыток и серверная пауза сохраняются."""
         norm = self.url_normalizer.normalize_url(url)
-        cur = self._page_retry_candidates.get(norm)
-        attempts = cur[3] + 1 if cur else 1
-        if attempts > self.page_retry_max_attempts:
+        if outcome is not None and not outcome.retryable:
+            self._page_retry_candidates.pop(norm, None)
+            self._retry_due.pop(norm, None)
+            self._retry_reasons.pop(norm, None)
             return
-        self._page_retry_candidates[norm] = (url, depth, category, attempts)
+        attempts = self._page_retry_attempts.get(norm, 0)
+        if attempts < self.page_retry_max_attempts:
+            delay = max(min(2 ** (attempts + 1), 30), outcome.retry_after) if outcome else 0
+            self._page_retry_candidates[norm] = (url, depth, category, attempts + 1)
+            self._retry_due[norm] = time.monotonic() + delay
+            self._retry_reasons[norm] = 'delay'
 
-    async def reset_state(self, company_name: str):
-        """Сброс состояния и загрузка обработанных URL из временного хранилища для компании"""
+    async def _enqueue_page_retries(self, queue):
+        for norm, (url, depth, category, attempt) in list(self._page_retry_candidates.items()):
+            if self._retry_due.get(norm, 0) > time.monotonic():
+                continue
+            if self._queue_url_rejection(url, depth, category):
+                self._retry_reasons[norm] = 'scope'
+                self._sitemap_slots.discard(norm)
+                if category == 'product':
+                    await self._release_product_quota_slot(norm, 'повтор вне допуска')
+                continue
+            if await self._should_add_to_queue_parallel(url, depth, category, retry=True):
+                self._page_retry_candidates.pop(norm, None)
+                self._retry_due.pop(norm, None)
+                self._retry_reasons.pop(norm, None)
+                self._page_retry_attempts[norm] = attempt
+                self._queued_retries.add(norm)
+                queue.append((url, depth, category, 1))
+                log.info(f"Повтор {attempt}/{self.page_retry_max_attempts}: {url}")
+            else:
+                self._retry_reasons[norm] = 'quota'
+
+    def _retry_summary(self, queue=()):
+        now = time.monotonic()
+        budget = self.stats['total_pages'] >= self.max_pages_per_site
+        self.stats['pending_retries'] = [
+            {'url': row[0], 'attempt': row[3],
+             'reason': 'page_budget' if budget else self._retry_reasons.get(norm, 'delay'),
+             'retry_in': max(0, self._retry_due.get(norm, now) - now)}
+            for norm, row in self._page_retry_candidates.items()]
+        for url, depth, category, priority in queue:
+            norm = self.url_normalizer.normalize_url(url)
+            if norm in self._queued_retries:
+                due = self._host_retry_until.get(urlparse(url).netloc.lower(), now)
+                self.stats['pending_retries'].append({'url': url,
+                    'attempt': self._page_retry_attempts.get(norm, 0),
+                    'reason': 'page_budget' if budget else 'host_cooldown',
+                    'retry_in': max(0, due - now)})
+        self.stats['fetch_failures'] = list(self._fetch_failures.values())
+
+    def _record_page_success(self, url, *, resumed=False):
+        norm = self.url_normalizer.normalize_url(url)
+        self._successful_fetch_urls.add(norm)
+        self._page_retry_candidates.pop(norm, None)
+        self._retry_due.pop(norm, None)
+        self._retry_reasons.pop(norm, None)
+        self.stats['successful_urls'] = len(self._successful_fetch_urls)
+        key = 'resumed_pages' if resumed else 'fetched_pages'
+        self.stats[key] += 1
+        for failed in list(self._fetch_failures):
+            if self.url_normalizer.normalize_url(failed) == norm:
+                self._fetch_failures.pop(failed, None)
+        self.stats['failed_pages'] = len({self.url_normalizer.normalize_url(u) for u in self._fetch_failures})
+
+    def _record_page_failure(self, url, reason, *, processing=False):
+        self.stats['processing_errors' if processing else 'failed_attempts'] += 1
+        self._fetch_failures.setdefault(url, {'requested_url': url, 'reason': reason})
+        self.stats['failed_pages'] = len({self.url_normalizer.normalize_url(u) for u in self._fetch_failures})
+
+    def _finalize_crawl_status(self, queue=None, *, reason=None):
+        """Полнота именно обхода: исчерпание очереди не равно исчерпанию лимита."""
+        if queue is not None:
+            self._remaining_queue = list(queue)
+        queue = self._remaining_queue
+        self._retry_summary(queue)
+        successful = self._successful_fetch_urls
+        pending_products = {self.url_normalizer.normalize_url(u) for u in
+                            list(self._quota_rejected_urls) + list(self._quota_rejected_depths)} - self.processed_urls
+        pending_map = {row[1] for row in self._sitemap_pending} - self.processed_urls
+        depth = self._depth_limited_urls - self.processed_urls
+        pagination = self._pagination_limited_urls - self.processed_urls
+        self.stats['successful_urls'] = len(successful)
+        self.stats['failed_pages'] = len({self.url_normalizer.normalize_url(u) for u in self._fetch_failures})
+        self.stats['remaining_pages'] = len(queue)
+        self.stats['remaining_sitemap_urls'] = len(pending_map)
+        self.stats['remaining_product_urls'] = len(pending_products)
+        reasons = []
+        if reason:
+            self._terminal_crawl_reason = reason
+        if self._terminal_crawl_reason:
+            reasons.append(self._terminal_crawl_reason)
+        if self.stats['total_pages'] >= self.max_pages_per_site and (queue or pending_map or pending_products or self._page_retry_candidates):
+            reasons.append('page_limit')
+        if self.stats.get('host_pause_pending') or any(self._host_paused(item[0]) for item in queue):
+            reasons.append('host_cooldown')
+        if self.stats.get('pending_retries'):
+            reasons.append('pending_retries')
+        if pending_products:
+            reasons.append('product_limit')
+        if pending_map:
+            reasons.append('sitemap_limit')
+        if depth:
+            reasons.append('depth_limit')
+        if pagination:
+            reasons.append('pagination_limit')
+        if self._stale_sitemap_guard_tripped:
+            reasons.append('sitemap_guard')
+        if self._fetch_failures:
+            reasons.append('fetch_failures')
+        if getattr(self.sitemap_parser, 'phase_timed_out', False) or any(
+                state == 'error' for state in self.sitemap_parser._states.values()):
+            reasons.append('sitemap_incomplete')
+        self.stats['usable_pages'] = len(self._usable_page_urls)
+        if not self._usable_page_urls:
+            reasons.append('no_content')
+        if queue and not reasons:
+            reasons.append('remaining_queue')
+        self.stats['crawl_status'] = 'failed' if not self._usable_page_urls else 'partial' if reasons else 'complete'
+        self.stats['stop_reasons'] = list(dict.fromkeys(reasons))
+        self.stats['stop_reason'] = reasons[0] if reasons else 'exhausted'
+        return self.stats
+
+    async def reset_state(self, company_name: str, *, crawl_run_id: str = None, resume: bool = False):
+        """Новый мониторинг проверяет сайт; resume использует HTML только того же прохода."""
+        if resume and not crawl_run_id:
+            raise ValueError('Для возобновления необходим crawl_run_id')
+        self.crawl_run_id = crawl_run_id or uuid4().hex
+        self.temp_storage.crawl_run_id = self.crawl_run_id
+        if _get_profile_resolver:
+            _get_profile_resolver().reload_if_changed()
+        self.temp_storage.reset_url_index()
+        # Кэш в памяти относится только к одному обходу; следующий update обязан
+        # перепроверить сервер по постоянным валидаторам, а не пропустить URL.
+        self.file_download_manager.downloaded_files_cache.clear()
+        self.file_download_manager.processed_tabs.clear()
+        self.file_download_manager._download_locks.clear()
+        self._resume_pages = {}
+        await self.sitemap_parser.reset_run()
+        self.current_base_url = None
+        self._apply_site_profile('')
+        self._sitemap_pending.clear()
+        self._sitemap_slots.clear()
+        # Отрицательные результаты прошлых проходов не доказывают текущий отказ.
+        self.permanent_errors_cache.clear()
+        self._negative_cache_status.clear()
         async with self._urls_lock:
             self.visited_urls.clear()
             self.processed_urls.clear()
             self.product_urls.clear()
             self._crawled_scheme_keys.clear()
             self._product_text_hash_counts.clear()
+            self._sitemap_soft404_seen.clear()
+            self._sitemap_hard_fail_seen.clear()
+            self._retry_due.clear()
+            self._retry_reasons.clear()
+            self._host_retry_until.clear()
+            self._fetch_failures.clear()
+            self._successful_fetch_urls.clear()
+            self._usable_page_urls.clear()
+            self._terminal_crawl_reason = None
+            self._depth_limited_urls.clear()
+            self._pagination_limited_urls.clear()
+            self._remaining_queue.clear()
             self._stale_sitemap_guard_tripped = False
             self._sitemap_published_urls.clear()
             self._quota_released.clear()
@@ -3346,37 +4141,45 @@ class WebCrawler:
             self._queue_gate_rejections.clear()
             self._sitemap_hard_fail_streak = 0
             self._page_retry_candidates.clear()
+            self._page_retry_attempts.clear()
+            self._queued_retries.clear()
+            self._quota_rejected_depths.clear()
             # P05 U3: периметр обхода пер-компанийный
             self._allowed_hosts.clear()
             self._skipped_link_hosts.clear()
             self._mirror_autodetect_done = False
             self._flat_site_observed = False
 
-        # Получаем все файлы компании из временного хранилища
-        company_files = await self.temp_storage.get_company_files(company_name)
-        async with self._urls_lock:
-            for file_info in company_files:
-                metadata = file_info['metadata']
-                # Если страница обработана AI, добавляем ее URL в посещенные и обработанные
-                if metadata.get('checkpoints', {}).get('ai_processed', False):
-                    normalized_url = metadata.get('normalized_url')
-                    if normalized_url:
-                        self.visited_urls.add(normalized_url)
-                        self.processed_urls.add(normalized_url)
-                        # D59 RC1: восстанавливаем схемный ключ, чтобы на возобновлении
-                        # не перекачать http/https-двойник уже обработанной страницы.
-                        if self.url_categorizer.categorize_url(normalized_url)[0] == 'product':
-                            skey = self._scheme_dedup_key(normalized_url)
-                            if skey is not None:
-                                self._crawled_scheme_keys.add(skey)
-
-        log.info(f"Загружено {len(self.visited_urls)} обработанных URL для компании {company_name}")
+        if resume:
+            for item in await self.temp_storage.get_company_files(company_name):
+                meta = item['metadata']
+                if meta.get('crawl_run_id') != self.crawl_run_id:
+                    continue
+                for address in (meta.get('url'), meta.get('requested_url'), meta.get('normalized_url')):
+                    if address:
+                        self._resume_pages[self.url_normalizer.normalize_url(address)] = item
+        await self._reset_stats()
+        log.info(f"Режим обхода: {'возобновление' if resume else 'новая проверка'}, "
+                 f"проход {self.crawl_run_id}, сохранённых адресов: {len(self._resume_pages)}")
 
     async def _reset_stats(self):
         """Сброс статистики (без очистки visited_urls, processed_urls, product_urls)"""
         async with self._stats_lock:
+            self._successful_fetch_urls.clear()
+            self._usable_page_urls.clear()
+            self._fetch_failures.clear()
+            self._remaining_queue.clear()
+            self._depth_limited_urls.clear()
+            self._pagination_limited_urls.clear()
+            self._terminal_crawl_reason = None
             self.stats = {
                 'total_pages': 0,
+                'attempted_pages': 0,
+                'fetched_pages': 0,
+                'resumed_pages': 0,
+                'successful_urls': 0,
+                'failed_attempts': 0,
+                'processing_errors': 0,
                 'product_pages': 0,
                 'category_pages': 0,
                 'price_list_pages': 0,
@@ -3427,16 +4230,8 @@ class WebCrawler:
             # Принудительный сбор мусора
             gc.collect()
 
-            async with self._urls_lock:
-                self.visited_urls.clear()
-                self.processed_urls.clear()
-                self.product_urls.clear()
-                self._crawled_scheme_keys.clear()
-
-            # Дополнительная очистка если память все еще высокая
-            if read_memory_usage_mb() > self.config.memory_cleanup_threshold_mb:
-                self.permanent_errors_cache.clear()
-                gc.collect()
+            # Посещённые адреса, квоты, повторы и отрицательные результаты —
+            # состояние обхода. Их очистка повторно открыла бы уже закрытые URL.
 
             log.info(f"Очистка памяти завершена. Текущее потребление: {read_memory_usage_mb():.2f}MB")
 
@@ -3444,24 +4239,29 @@ class WebCrawler:
             log.warning(f"Ошибка проверки памяти: {e}")
 
     def _load_permanent_errors_cache(self) -> set:
-        """Загрузка кэша перманентных ошибок из файла"""
-        cache_file = os.path.join(self.config.base_dir, "permanent_errors_cache.json")
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    return set(json.load(f))
-            except Exception as e:
-                log.warning(f"Ошибка загрузки кэша ошибок: {e}")
+        """Кэш ограничен обходом; старый файл без статусов/сроков не используем."""
         return set()
 
     def _save_permanent_errors_cache(self):
-        """Сохранение кэша перманентных ошибок в файл"""
-        cache_file = os.path.join(self.config.base_dir, "permanent_errors_cache.json")
-        try:
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                json.dump(list(self.permanent_errors_cache), f, ensure_ascii=False)
-        except Exception as e:
-            log.warning(f"Ошибка сохранения кэша ошибок: {e}")
+        """Отказы текущего прохода не переносятся на следующий. Архив не трогаем."""
+        pass
+
+    @staticmethod
+    def _negative_cache_key(url, transport):
+        # Не нормализуем путь/схему: /catalog и /catalog/ могут отвечать по-разному.
+        return transport, url.split('#', 1)[0]
+
+    def _record_fetch_status(self, url, transport, status):
+        key = self._negative_cache_key(url, transport)
+        if status in PERMANENT_ERRORS:
+            self.permanent_errors_cache.add(key)
+            self._negative_cache_status[key] = status
+        elif status == 200:
+            # Успех другого транспорта опровергает предыдущий отрицательный ответ.
+            self.permanent_errors_cache.difference_update(
+                self._negative_cache_key(url, name) for name in ('aiohttp', 'curl', 'playwright'))
+            for name in ('aiohttp', 'curl', 'playwright'):
+                self._negative_cache_status.pop(self._negative_cache_key(url, name), None)
 
     def _sanitize_filename(self, filename: str) -> str:
         return sanitize_filename(filename)
@@ -3490,6 +4290,8 @@ class WebCrawler:
         # P05 U3 п.1: применяется ДО выбора рабочего URL и резолвится по исходному адресу
         # компании — его crawl.equivalent_domains / subdomain_collapse / strict_www должны
         # влиять на выбор базы обхода, а не только на то, что делать после.
+        await self._reset_stats()
+        self.current_base_url = site_url
         self._apply_site_profile(site_url)
 
         # Определяем рабочий URL с учетом эквивалентности доменов
@@ -3498,10 +4300,8 @@ class WebCrawler:
         # Сохраняем базовый URL для проверки поддоменов
         self.current_base_url = working_url
 
-        # База уехала на другой домен (алиас/зеркало) — профиль перечитывается по нему
-        if self.url_categorizer.extract_main_domain(urlparse(working_url).netloc) != \
-                self.url_categorizer.extract_main_domain(urlparse(site_url).netloc):
-            self._apply_site_profile(working_url)
+        # Профиль закреплён за исходной компанией. Разрешённое зеркало не может
+        # подменить его своим профилем и транзитивно открыть новые домены/CDN.
 
         # P01 U3: рабочая форма хоста и схемы — после профиля, чтобы учесть его strict_www.
         self._set_working_base(working_url)
@@ -3516,11 +4316,10 @@ class WebCrawler:
         if self.profile is not None and self.profile.crawl.antibot == 'blocked':
             log.warning(f"Профиль {self.profile.domain}: antibot=blocked — сайт не "
                         f"обрабатывается (ждёт решения в REVIEW)")
-            return {'error': 'antibot=blocked (профиль сайта)', 'stored_pages': [],
+            self._finalize_crawl_status(reason='blocked')
+            return {**self.stats, 'error': 'antibot=blocked (профиль сайта)', 'stored_pages': [],
                     'original_url': site_url, 'working_url': working_url}
 
-        # Сбрасываем статистику для нового сайта
-        await self._reset_stats()
         # Машинный статус выбора базы обхода (parked_domain / redirect_shim / hoster_stub /
         # http_only / no_host) — пишется после сброса, чтобы не быть затёртым (P05 U2).
         if self.site_status:
@@ -3533,6 +4332,7 @@ class WebCrawler:
             await self._start_crawling_with_sitemap_support(working_url, company_name, domain_dirs, stored_pages)                       
             self._save_permanent_errors_cache()
 
+            self._finalize_crawl_status()
             # Сохраняем статистику
             await self._save_crawling_stats(site_url, domain_dirs)            
             log.info(f"Краулинг завершен для {site_url}. Сохранено страниц: {len(stored_pages)}")
@@ -3546,8 +4346,8 @@ class WebCrawler:
             
         except Exception as e:
             log.error(f"Ошибка краулинга сайта {working_url}: {e}")
-            self.stats['failed_pages'] += 1
-            return {'error': str(e), 'stored_pages': stored_pages, 'original_url': site_url, 'working_url': working_url}
+            self._finalize_crawl_status(reason='internal_error')
+            return {**self.stats, 'error': str(e), 'stored_pages': stored_pages, 'original_url': site_url, 'working_url': working_url}
     
     def _apply_site_profile(self, working_url: str) -> None:
         """Резолвит профиль сайта и применяет пер-сайтовые лимиты/настройки.
@@ -3658,11 +4458,9 @@ class WebCrawler:
         """P01 U3 п.2: приводит хост и схему ссылки к рабочей форме компании. Путь,
         параметры и фрагмент не трогаются.
 
-        Приводится ТОЛЬКО ссылка на тот же хост в другой форме (апекс/www/мобильное
-        зеркало): www-дубль не создаётся (D270), www-форма не теряется (D87), http
-        поднимается до подтверждённой https (D134). Домены группы холдинга
-        (config.equivalent_domains) и прочие хосты остаются как есть — иначе сломается
-        переход между доменами группы. Fail-open: при любой ошибке возвращается исходный URL."""
+        Приводится ТОЛЬКО ссылка на тот же хост в другой форме (апекс/www): www-дубль не создаётся (D270), www-форма не теряется (D87), http
+        поднимается до подтверждённой https (D134). Явные зеркала профиля
+        и прочие хосты остаются как есть. Fail-open: при любой ошибке возвращается исходный URL."""
         if not self._working_host or not url:
             return url
         try:
@@ -3673,7 +4471,7 @@ class WebCrawler:
                 return url
             if netloc == self._working_host and parsed.scheme == self._working_scheme:
                 return url
-            if not hosts_equivalent(netloc, self._working_host):
+            if not url_in_scope(url, f'{self._working_scheme}://{self._working_host}'):
                 return url
             return urlunparse((self._working_scheme, self._working_host, parsed.path,
                                parsed.params, parsed.query, parsed.fragment))
@@ -3689,109 +4487,34 @@ class WebCrawler:
         except Exception:
             return ''
 
-    def _in_crawl_perimeter(self, url: str, base_url: str) -> bool:
-        """P05 U3: периметр обхода — домен компании (в т.ч. www/мобильное зеркало, группа
-        config.equivalent_domains и периметр профиля) ИЛИ хост, разрешённый для этой
-        компании (поддомен-носитель каталога, подтверждённое зеркало)."""
-        if self.url_categorizer.is_main_domain(url, base_url):
-            return True
-        return self._url_host(url) in self._allowed_hosts
+    def _is_allowed_url(self, url: str, *, resource='page', base_url=None) -> bool:
+        """Одна политика для очереди, всех транспортов, sitemap и загрузки файлов."""
+        base = getattr(self, 'current_base_url', None) or base_url
+        profile = self.profile
+        domains, suffixes, files = [], [], []
+        if profile is not None:
+            domains = [profile.domain] + list(profile.crawl.equivalent_domains)
+            suffixes = profile.crawl.subdomain_collapse
+            files = getattr(profile.crawl, 'file_hosts', ())
+        return url_in_scope(url, base, profile_domains=domains,
+                            profile_suffixes=suffixes, file_hosts=files, resource=resource)
 
-    # Служебные поддомены: носителем каталога не бывают, а потолок разрешённых поддоменов
-    # выбирают первыми (живая проба gexa.ru: partner./tender. занимали оба слота, а
-    # продуктовый isospan.gexa.ru оставался за периметром).
-    _NON_CATALOG_SUBDOMAINS = frozenset({
-        'partner', 'partners', 'tender', 'tenders', 'sb', 'lk', 'my', 'cabinet',
-        'hr', 'job', 'jobs', 'career', 'vacancy', 'mail', 'webmail', 'smtp', 'ftp',
-        'cdn', 'static', 'img', 'images', 'media', 'blog', 'news', 'forum',
-        'support', 'help', 'status', 'test', 'dev', 'stage', 'beta',
-    })
+    def _in_crawl_perimeter(self, url: str, base_url: str) -> bool:
+        return self._is_allowed_url(url, base_url=base_url)
 
     def _maybe_allow_subdomain(self, url: str, category: str, depth: int, base_url: str) -> bool:
-        """P05 U3 п.2: поддомен ТОГО ЖЕ корневого домена как носитель каталога
-        (flowsolutions.plasson.com, isospan.gexa.ru — D131).
-
-        Условие из досье: ссылка стоит в навигации главной (глубина 0) ЛИБО URL
-        категоризуется как каталожный/товарный. Потолок config.max_allowed_subdomains
-        (0 = прежнее поведение); разрешённый хост наследует бюджет страниц компании и сам
-        никого не разрешает (без транзитивности)."""
-        limit = getattr(self.config, 'max_allowed_subdomains', 2)
-        host = self._url_host(url)
-        if limit <= 0 or not host:
-            return False
-        if not same_registrable_domain(url, base_url):
-            return False
-        if depth != 0 and category not in ('product', 'category'):
-            return False
-        if (host.split('.')[0] in self._NON_CATALOG_SUBDOMAINS
-                and category not in ('product', 'category')):
-            log.debug(f"Поддомен {host} не разрешён: служебный, не носитель каталога")
-            return False
-        if len(self._allowed_hosts) >= limit:
-            log.debug(f"Поддомен {host} не разрешён: потолок {limit} уже выбран "
-                      f"({', '.join(sorted(self._allowed_hosts))})")
-            return False
-        self._allowed_hosts.add(host)
-        log.info(f"Разрешён поддомен {host} как носитель каталога "
-                 f"(роль ссылки: {category}, глубина страницы: {depth}); "
-                 f"бюджет страниц общий с компанией [{len(self._allowed_hosts)}/{limit}]")
-        return True
+        """Ссылки сайта больше не дают разрешение: дополнительные хосты задаёт профиль."""
+        return False
 
     async def _maybe_autodetect_mirror_host(self, parse_result: ParseResult, depth: int,
                                             skipped_hosts: dict, skipped_examples: dict,
                                             product_links: int) -> bool:
-        """P05 U3 пп.3,5: автодетект «внешний хост отдаёт тот же сайт» (навигация на
-        техдомене хостера — D124). За флагом config.foreign_host_autodetect, по умолчанию
-        ВЫКЛЮЧЕН: ошибочно разрешённый внешний хост означает обход чужого сайта (D114/D167).
+        """Совпадение title/canonical не заменяет явное разрешение профиля."""
+        return False
 
-        Срабатывает один раз за компанию, только на главной, только если товарных ссылок на
-        ней не осталось, и только для хоста, подтверждённого совпадением title/canonical
-        главной. Возвращает True, если хост разрешён (ссылки надо перебрать заново)."""
-        if (not getattr(self.config, 'foreign_host_autodetect', False)
-                or self._mirror_autodetect_done or depth != 0 or product_links
-                or self._allowed_hosts or not skipped_hosts):
-            return False
-        self._mirror_autodetect_done = True
-        min_links = getattr(self.config, 'foreign_host_min_links', 5)
-        host, count = max(skipped_hosts.items(), key=lambda item: item[1])
-        if count < min_links:
-            return False
-        de = getattr(self.url_categorizer, 'domain_equivalency', None)
-        if de is None:
-            return False
-        own_title = self._page_title(parse_result.soup)
-        example = skipped_examples.get(host) or f'https://{host}/'
-        candidate_root = f"{urlparse(example).scheme or 'https'}://{host}/"
-        try:
-            body = await de.fetch_page_body(candidate_root)
-        except Exception as e:
-            log.warning(f"Автодетект зеркала: {candidate_root} не опрошен ({e})")
-            return False
-        if not body:
-            return False
-        soup = BeautifulSoup(body, 'html.parser')
-        canonical = self.url_normalizer.extract_canonical_url(soup, candidate_root)
-        same_canonical = bool(canonical) and self.url_categorizer.is_main_domain(
-            canonical, self.current_base_url)
-        same_title = bool(own_title) and self._page_title(soup) == own_title
-        if not (same_title or same_canonical):
-            log.info(f"Автодетект зеркала: {host} ({count} ссылок) не подтверждён "
-                     f"(title/canonical главной не совпали) — хост остаётся чужим")
-            return False
-        self._allowed_hosts.add(host)
-        log.warning(f"Разрешён внешний хост {host}: {count} ссылок главной, подтверждение — "
-                    f"{'title' if same_title else 'canonical'} главной; бюджет страниц общий "
-                    f"с компанией, дальше периметр не расширяется")
-        return True
-
-    @staticmethod
-    def _page_title(soup: BeautifulSoup) -> str:
-        """Заголовок страницы в сравнимом виде (пробелы схлопнуты, нижний регистр)."""
-        try:
-            title = soup.title.get_text(strip=True) if soup and soup.title else ''
-        except Exception:
-            return ''
-        return re.sub(r'\s+', ' ', title).strip().lower()
+    def _is_allowed_final_url(self, requested_url: str, final_url: Optional[str]) -> bool:
+        return (self._is_allowed_url(requested_url, base_url=requested_url)
+                and self._is_allowed_url(final_url or requested_url, base_url=requested_url))
 
     def _log_effective_url(self, requested: str, final_url: Optional[str]) -> None:
         """P01 U3 п.5: в логе виден реально запрошенный адрес и конечный после редиректов
@@ -3808,27 +4531,11 @@ class WebCrawler:
         
         for url in start_urls:
             category, priority = self.url_categorizer.categorize_url(url)
-            queue.append((url, 0, category, priority))
-            self.visited_urls.add(self.url_normalizer.normalize_url(url))
+            if await self._should_add_to_queue_parallel(url, 0, category):
+                queue.append((url, 0, category, priority))
         
-        # Запускаем обработку очереди
-        while queue and self.stats['total_pages'] < self.max_pages_per_site:
-            url, depth, category, priority = queue.popleft()
-            
-            if await self._should_skip_url(url, depth, company_name):
-                continue
-                
-            try:
-                # Обрабатываем страницу и сохраняем в хранилище
-                stored_page = await self._process_page_with_storage(url, depth, category, company_name, domain_dirs, queue)
-                if stored_page:
-                    stored_pages.append(stored_page)
-                    
-            except Exception as e:
-                log.error(f"Ошибка обработки страницы {url}: {e}")
-                self.stats['failed_pages'] += 1
-                continue
-    
+        await self._drain_crawl_queue(queue, site_url, company_name, domain_dirs, stored_pages)
+
     async def _start_crawling_with_sitemap_support(self, site_url: str, company_name: str, 
                                          domain_dirs: Dict[str, str], stored_pages: List[Dict]):
         """Запуск процесса краулинга с поддержкой карты сайта"""
@@ -3840,12 +4547,16 @@ class WebCrawler:
             # считаем признак «плоского» сайта до постановки адресов в очередь.
             # Элемент карты — 4-кортеж полосы A (адрес, ключ, роль, приоритет).
             self._flat_site_observed = True
-            if self.url_categorizer.observe_urls(u for u, _n, _c, _p in sitemap_urls):
+            observed_rows = sitemap_urls + list(self._sitemap_pending)
+            if self.url_categorizer.observe_urls(u for u, _n, _c, _p in observed_rows):
                 # Признак включился уже ПОСЛЕ категоризации в парсере карты — роли
                 # адресов пересчитываем, иначе на плоском сайте они остаются 'other'
                 # и гейт сохранения выбрасывает страницы (D145, D228, D237).
                 sitemap_urls = [(u, n) + self._recategorize_sitemap_row(u)
                                 for u, n, _c, _p in sitemap_urls]
+                self._sitemap_pending = deque(
+                    (u, n) + self._recategorize_sitemap_row(u)
+                    for u, n, _c, _p in self._sitemap_pending)
             await self._add_sitemap_urls_to_queue(queue, sitemap_urls, site_url)
             log.info(f"Добавлено {len(sitemap_urls)} URL из карты сайта")
         
@@ -3853,80 +4564,14 @@ class WebCrawler:
         start_urls = self._get_start_urls(site_url)
         added_standard_urls = 0
         for url in start_urls:
-            normalized_url = self.url_normalizer.normalize_url(url)
-            
-            async with self._urls_lock:
-                if normalized_url not in self.visited_urls:
-                    category, priority = self.url_categorizer.categorize_url(url)
-                    adjusted_priority = max(priority - 2, 1)
-                    queue.append((url, 0, category, adjusted_priority))
-                    self.visited_urls.add(normalized_url)
-                    added_standard_urls += 1
-        
+            category, priority = self.url_categorizer.categorize_url(url)
+            if await self._should_add_to_queue_parallel(url, 0, category):
+                queue.append((url, 0, category, max(priority - 2, 1)))
+                added_standard_urls += 1
+
         log.info(f"Добавлено {added_standard_urls} стандартных URL, общий размер очереди: {len(queue)}")
         
-        # 3. Параллельная обработка очереди
-        processed_count = 0
-        active_tasks = set()
-        
-        # Ревью слияния F7: бюджет страниц проверяется ДО предохранителя фильтров, иначе
-        # при исчерпанном лимите он зря возвращает отложенные URL в очередь.
-        while await self._get_total_pages() < self.max_pages_per_site \
-                and ((queue or active_tasks) or self._apply_exclude_failopen(queue)):
-            # Сортируем очередь по приоритету
-            async with self._queue_lock:
-                queue_list = list(queue)
-                queue_list.sort(key=lambda x: x[3], reverse=True)
-                queue.clear()
-                queue.extend(queue_list)
-            
-            # Создаем задачи для параллельной обработки
-            async with self._queue_lock:
-                batch_size = min(self._effective_max_concurrent_pages - len(active_tasks), len(queue))
-                if batch_size > 0:
-                    for _ in range(batch_size):
-                        if queue:
-                            url, depth, category, priority = queue.popleft()
-                            task = asyncio.create_task(
-                                self._process_page_parallel(url, depth, category, company_name, domain_dirs, queue, stored_pages)
-                            )
-                            active_tasks.add(task)
-                            task.add_done_callback(active_tasks.discard)
-            
-            # Ожидаем завершения некоторых задач
-            if active_tasks:
-                await asyncio.sleep(0.1)  # Короткая пауза для управления нагрузкой
-            
-            # Проверка памяти каждые 10 страниц
-            if processed_count % 10 == 0:
-                await self._check_memory_usage()
-        
-        # Ожидаем завершения всех оставшихся задач
-        if active_tasks:
-            await asyncio.gather(*active_tasks, return_exceptions=True)
-
-        # D40: повторный проход по целевым страницам, не отдавшим контент (таймауты
-        # медленных сайтов). Без ретрая каждый прогон терял случайное подмножество товаров.
-        retry_round = 0
-        while (self._page_retry_candidates and retry_round < self.page_retry_max_attempts
-               and await self._get_total_pages() < self.max_pages_per_site):
-            retry_round += 1
-            batch = list(self._page_retry_candidates.values())
-            self._page_retry_candidates.clear()
-            log.info(f"Повторная попытка для {len(batch)} страниц без контента (раунд {retry_round})")
-            for url, depth, category, _ in batch:
-                if await self._get_total_pages() >= self.max_pages_per_site:
-                    break
-                try:
-                    with (self.processing_tracker.retry_span('crawler') if self.processing_tracker else nullcontext()):
-                        stored_page = await self._process_page_with_storage(
-                            url, depth, category, company_name, domain_dirs, queue)
-                    if stored_page:
-                        stored_pages.append(stored_page)
-                        if self.page_sink is not None:
-                            await self.page_sink.put(stored_page)
-                except Exception as e:
-                    log.error(f"Ошибка повторной обработки страницы {url}: {e}")
+        await self._drain_crawl_queue(queue, site_url, company_name, domain_dirs, stored_pages)
 
         # P02 U1 пп.4-5: сводка немых отказов гейтов очереди и страховка на случай,
         # когда квота потрачена, а товарных страниц не сохранено ни одной.
@@ -3945,39 +4590,101 @@ class WebCrawler:
         if self._allowed_hosts:
             log.info(f"Хосты сверх домена компании в периметре: "
                      f"{', '.join(sorted(self._allowed_hosts))}")
-        await self._second_pass_for_quota_rejected(company_name, domain_dirs, stored_pages, queue)
+
+    async def _drain_crawl_queue(self, queue, site_url, company_name, domain_dirs, stored_pages):
+        """Обычные URL, резерв и повторы обслуживаются до общего исчерпания работы."""
+        active = set()
+        quota_reconsidered = False
+        waited = 0.0
+        retry_turn = True
+        try:
+            while active or await self._get_total_pages() < self.max_pages_per_site:
+                if await self._get_total_pages() < self.max_pages_per_site:
+                    # Созревший повтор получает доступ до пополнения резерва карты.
+                    await self._enqueue_page_retries(queue)
+                    await self._refill_sitemap_queue(queue, site_url)
+                if not active and await self._get_total_pages() >= self.max_pages_per_site:
+                    break
+                if not queue and not active:
+                    self._apply_exclude_failopen(queue)
+                    if not queue and not quota_reconsidered:
+                        quota_reconsidered = True
+                        await self._second_pass_for_quota_rejected(
+                            company_name, domain_dirs, stored_pages, queue)
+                    if not queue:
+                        future = [due for norm, due in self._retry_due.items()
+                                  if due > time.monotonic() and self._retry_reasons.get(norm) != 'scope']
+                        if future and waited < 60:
+                            delay = min(min(future) - time.monotonic(), 60 - waited)
+                            await asyncio.sleep(max(0, delay))
+                            waited += max(0, delay)
+                            continue
+                        for norm in self._page_retry_candidates:
+                            if self._retry_due.get(norm, 0) > time.monotonic():
+                                self._retry_reasons[norm] = 'delay_budget'
+                        break
+                # Активные задачи также резервируют общий бюджет: даже первый
+                # параллельный батч не должен превышать остаток лимита страниц.
+                remaining = self.max_pages_per_site - await self._get_total_pages() - len(active)
+                slots = min(self._effective_max_concurrent_pages - len(active), remaining)
+                async with self._queue_lock:
+                    ordered = sorted(queue, key=lambda item: item[3], reverse=True)
+                    queue.clear()
+                    retries = deque()
+                    fresh = deque()
+                    for item in ordered:
+                        target = retries if self.url_normalizer.normalize_url(item[0]) in self._queued_retries else fresh
+                        target.append(item)
+                    # Чередуем фактически запускаемые задачи; пауза хоста не
+                    # расходует очередь другой группы и не меняет её приоритеты.
+                    while slots > 0 and (retries or fresh):
+                        pending = retries if retries and (retry_turn or not fresh) else fresh
+                        item = pending.popleft()
+                        url, depth, category, _ = item
+                        if self._host_retry_until.get(urlparse(url).netloc.lower(), 0) > time.monotonic():
+                            queue.append(item)
+                            continue
+                        slots -= 1
+                        retry_turn = pending is fresh
+                        active.add(asyncio.create_task(self._process_page_parallel(
+                            url, depth, category, company_name, domain_dirs, queue, stored_pages)))
+                    queue.extend(retries)
+                    queue.extend(fresh)
+                if active:
+                    done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                    await asyncio.gather(*done, return_exceptions=True)
+                elif queue:
+                    due = min(self._host_retry_until.get(urlparse(item[0]).netloc.lower(), 0) for item in queue)
+                    delay = max(0, due - time.monotonic())
+                    if waited >= 60:
+                        self.stats['host_pause_pending'] = [item[0] for item in queue]
+                        break
+                    pause = min(delay, 60 - waited)
+                    await asyncio.sleep(pause)
+                    waited += pause
+        except asyncio.CancelledError:
+            self._terminal_crawl_reason = 'cancelled'
+            raise
+        finally:
+            # Отмена обхода не оставляет фоновые задачи от предыдущей компании.
+            for task in active:
+                task.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+            self._finalize_crawl_status(queue, reason='cancelled' if active else None)
 
     async def _second_pass_for_quota_rejected(self, company_name: str, domain_dirs: Dict[str, str],
                                               stored_pages: List[Dict], queue: deque) -> None:
-        """P02 U1 п.5: страховка. Если по итогам обхода сохранённых товарных страниц 0,
-        а товарные адреса отбивались гейтом квоты, значит квота была занята адресами, не
-        давшими ни одной страницы. Освобождаем её и проходим по отбитым адресам."""
-        async with self._stats_lock:
-            product_pages = self.stats['product_pages']
-        if product_pages or not self._quota_rejected_urls:
+        """Возвращает отложенные адреса в общий цикл только при свободной квоте."""
+        if self.stats['product_pages'] or not self._quota_rejected_urls:
             return
+        candidates = list(dict.fromkeys(self._quota_rejected_urls))
+        self._quota_rejected_urls.clear()
+        for url in candidates:
+            depth = self._quota_rejected_depths.get(url, 1)
+            if await self._should_add_to_queue_parallel(url, depth, 'product'):
+                queue.append((url, depth, 'product', 1))
 
-        async with self._urls_lock:
-            candidates = list(dict.fromkeys(self._quota_rejected_urls))[:self.max_product_pages_per_site]
-            self._quota_rejected_urls.clear()
-            self.product_urls.clear()
-            for candidate in candidates:
-                self.visited_urls.discard(self.url_normalizer.normalize_url(candidate))
-
-        log.warning(f"Товарных страниц не сохранено ни одной, а по квоте было отбито "
-                    f"{len(candidates)} товарных адресов — второй проход по ним")
-        for candidate in candidates:
-            if await self._get_total_pages() >= self.max_pages_per_site:
-                break
-            try:
-                stored_page = await self._process_page_with_storage(
-                    candidate, 1, 'product', company_name, domain_dirs, queue)
-                if stored_page:
-                    stored_pages.append(stored_page)
-                    if self.page_sink is not None:
-                        await self.page_sink.put(stored_page)
-            except Exception as e:
-                log.error(f"Ошибка второго прохода по {candidate}: {e}")
     def _apply_exclude_failopen(self, queue: deque) -> bool:
         """P04 U1 (п. 5): очередь обхода опустела — проверяем, не вырезал ли сайт целиком
         языковой фильтр или глобальный exclude-список. Если да, фильтр отключается для
@@ -3996,7 +4703,7 @@ class WebCrawler:
             if normalized_url in self.visited_urls:
                 continue
             category, priority = categorizer.categorize_url(url, link_text)
-            if category.startswith('excluded'):
+            if self._queue_url_rejection(url, 1, category):
                 continue
             # F8 ревью слияния: возвращённый товарный URL тоже занимает слот квоты —
             # иначе учёт полосы A по этим адресам не ведётся вовсе. Без await: хук
@@ -4007,6 +4714,11 @@ class WebCrawler:
                     self._count_queue_gate_rejection(reason)
                     self._quota_rejected_urls.append(url)
                     continue
+                skey = self._scheme_dedup_key(url)
+                if skey in self._crawled_scheme_keys:
+                    continue
+                if skey is not None:
+                    self._crawled_scheme_keys.add(skey)
                 self.product_urls.add(normalized_url)
             queue.append((url, 1, category, priority))
             self.visited_urls.add(normalized_url)
@@ -4017,11 +4729,17 @@ class WebCrawler:
     async def _process_page_parallel(self, url: str, depth: int, category: str, company_name: str,
                                    domain_dirs: Dict[str, str], queue: deque, stored_pages: List[Dict]):
         """Параллельная обработка отдельной страницы"""
-        if await self._should_skip_url(url, depth, company_name):
+        if await self._should_skip_url(url, depth, company_name, category):
+            self._sitemap_slots.discard(self.url_normalizer.normalize_url(url))
+            self._queued_retries.discard(self.url_normalizer.normalize_url(url))
             return
         
+        norm = self.url_normalizer.normalize_url(url)
+        retry = norm in self._queued_retries
+        self._queued_retries.discard(norm)
         try:
-            with (self.processing_tracker.clean_span('crawler') if self.processing_tracker else nullcontext()):
+            span = (self.processing_tracker.retry_span if retry else self.processing_tracker.clean_span) if self.processing_tracker else None
+            with (span('crawler') if span else nullcontext()):
                 stored_page = await self._process_page_with_storage(url, depth, category, company_name, domain_dirs, queue)
             if stored_page:
                 stored_pages.append(stored_page)
@@ -4030,8 +4748,7 @@ class WebCrawler:
 
         except Exception as e:
             log.error(f"Ошибка обработки страницы {url}: {e}")
-            async with self._stats_lock:
-                self.stats['failed_pages'] += 1
+            self._record_page_failure(url, 'processing_error', processing=True)
 
     async def _get_total_pages(self) -> int:
         """Потокобезопасное получение общего количества страниц"""
@@ -4068,15 +4785,50 @@ class WebCrawler:
         """D144/D240: сводит списки отдельных карт в один, забирая из каждой по кругу,
         пока не набран кэп. Так одна большая карта не вытесняет остальные целиком."""
         merged = []
+        seen = set()
         index = 0
         while len(merged) < cap and any(index < len(rows) for rows in per_map):
             for rows in per_map:
                 if index < len(rows):
-                    merged.append(rows[index])
+                    row = rows[index]
+                    if row[1] in seen:
+                        continue
+                    seen.add(row[1])
+                    merged.append(row)
                     if len(merged) >= cap:
                         break
             index += 1
         return merged
+
+    def _sitemap_budget(self):
+        """Профиль переопределяет квоту обхода; размер порции её не уменьшает."""
+        if self.profile is not None and self.profile.crawl.limits.sitemap_urls:
+            return self.profile.crawl.limits.sitemap_urls
+        return self.config.sitemap_max_urls
+
+    def _eligible_sitemap_row(self, row, base_url):
+        """Статические фильтры применяются до квоты и повторяются перед очередью."""
+        url, normalized_url, category, priority = row
+        if urlparse(url).scheme not in ('http', 'https') or category.startswith('excluded'):
+            return None
+        url = self._canonicalize_to_working_base(url)
+        if self._queue_url_rejection(url, 0, category, base_url):
+            return None
+        locale = self._sitemap_locale_prefix(base_url)
+        if locale and not self._url_has_locale(url, locale):
+            return None
+        if (self.url_categorizer.should_exclude_by_language(url)
+                or self.url_normalizer.is_over_pagination_limit(url)):
+            return None
+        return url, self.url_normalizer.normalize_url(url), category, priority
+
+    async def _refill_sitemap_queue(self, queue, base_url):
+        """Пополняет очередь из резерва, пока квота и сторож это допускают."""
+        if (not self._sitemap_pending
+                or len(self._sitemap_slots) >= self._sitemap_budget()):
+            return 0
+        return await self._add_sitemap_urls_to_queue(
+            queue, [], base_url, batch_size=self.config.sitemap_processing_batch_size)
 
     def _recategorize_sitemap_row(self, url: str) -> Tuple[str, int]:
         """P04 U4: роль и приоритет адреса карты сайта после того, как включился признак
@@ -4090,27 +4842,8 @@ class WebCrawler:
             return []
         
         try:
-            # Обнаружение карт сайта
-            sitemap_urls = await self.sitemap_parser.discover_sitemap_urls(site_url)
-            log.info(f"Найдено карт сайта: {len(sitemap_urls)}")
-            
-            if not sitemap_urls:
-                return []
-            
-            # Параллельный парсинг всех найденных карт сайта
-            tasks = []
-            for sitemap_url in sitemap_urls:
-                task = self.sitemap_parser.parse_sitemap(sitemap_url, max_depth=self.config.sitemap_max_depth)
-                tasks.append(task)
-            
-            # Ограничиваем время выполнения. D154: после снятия среза [:5] объём разбора
-            # у сайтов с большими индексами вырос, поэтому потолок вынесен в Config
-            # и поднят консервативно.
-            results = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=self.config.sitemap_phase_timeout_seconds
-            )
-
+            results = await self.sitemap_parser.collect_sitemap_urls(
+                site_url, max_depth=self.config.sitemap_max_depth)
             # Фильтруем только товарные URL и категории, ПОКАРТОЧНО
             # (элемент: опубликованный адрес, нормализованный ключ, категория, приоритет)
             locale_prefix = self._sitemap_locale_prefix(site_url)
@@ -4120,7 +4853,11 @@ class WebCrawler:
                 if not isinstance(result, list):
                     continue
                 kept = []
-                for url, normalized_url, category, priority in result:
+                for row in result:
+                    row = self._eligible_sitemap_row(row, site_url)
+                    if row is None:
+                        continue
+                    url, normalized_url, category, priority = row
                     # D240: локаль из Site_list — берём только адреса своей локали,
                     # иначе мультилокальная карта отдаёт кэп чужим языкам
                     if locale_prefix and not self._url_has_locale(url, locale_prefix):
@@ -4137,10 +4874,8 @@ class WebCrawler:
             # D144/D240: кэп квотируется ПО КАРТАМ, а не по объединённому списку —
             # иначе одна карта (например, карта вложений) забирала весь лимит, а
             # товарная не получала ни слота.
-            _sitemap_cap = self.config.sitemap_max_urls
-            if self.profile is not None and self.profile.crawl.limits.sitemap_urls:
-                _sitemap_cap = self.profile.crawl.limits.sitemap_urls
-            filtered_urls = self._merge_sitemap_maps(per_map, _sitemap_cap)
+            _sitemap_cap = self._sitemap_budget()
+            filtered_urls = self._merge_sitemap_maps(per_map, sum(map(len, per_map)))
 
             # P04 U2 п.7: если товарных адресов в карте не нашлось вовсе, служебные
             # (роль other) не выбрасываем — ставим их в конец с низким приоритетом,
@@ -4150,12 +4885,23 @@ class WebCrawler:
             other_urls = [row for row in other_urls if not row[2].startswith('excluded')]
             if other_urls and not any(row[2] == 'product' for row in filtered_urls):
                 other_urls.sort(key=self.sitemap_parser._sitemap_rank_key)
-                addition = other_urls[:max(_sitemap_cap - len(filtered_urls), 0)]
+                addition = other_urls
                 if addition:
                     log.info(f"В карте сайта нет товарных адресов — добавляем {len(addition)} "
                              f"служебных с низким приоритетом")
                     filtered_urls.extend(addition)
 
+            # Полный допустимый резерв сохраняется до конца обхода. Дубли схемы
+            # товара не расходуют квоту, как и нормализованные дубли между картами.
+            unique = []
+            seen = set()
+            for row in filtered_urls:
+                key = self._scheme_dedup_key(row[0]) if row[2] == 'product' else row[1]
+                if key not in seen:
+                    unique.append(row)
+                    seen.add(key)
+            filtered_urls = unique[:_sitemap_cap]
+            self._sitemap_pending = deque(unique[_sitemap_cap:])
             log.info(f"Отфильтровано {len(filtered_urls)} URL из карты сайта")
             if self.metrics_collector is not None:
                 self.metrics_collector.record_sitemap(len(filtered_urls))
@@ -4168,7 +4914,7 @@ class WebCrawler:
         
         return []
     
-    async def _add_sitemap_urls_to_queue(self, queue: deque, sitemap_urls: List[Tuple[str, str, str, int]], base_url: str):
+    async def _add_sitemap_urls_to_queue(self, queue: deque, sitemap_urls: List[Tuple[str, str, str, int]], base_url: str, *, batch_size=None):
         """Добавление URL из карты сайта в очередь краулинга.
 
         D120/D219/D198: элемент — (опубликованный адрес, нормализованный ключ, категория,
@@ -4184,13 +4930,25 @@ class WebCrawler:
         diverged_examples = []
 
         # Сортируем URL по рангу (приоритет, не-info раздел, артикульный слаг, глубина)
-        sitemap_urls.sort(key=self.sitemap_parser._sitemap_rank_key)
+        sitemap_urls = sorted(sitemap_urls, key=self.sitemap_parser._sitemap_rank_key)
+        candidates = deque(sitemap_urls)
+        candidates.extend(self._sitemap_pending)
+        self._sitemap_pending.clear()
+        deferred = deque()
+        batch_limit = max(1, batch_size if batch_size is not None
+                          else self.config.sitemap_initial_batch_size)
         # D208: блок собирается целиком и кладётся в голову одной операцией. Прежний
         # appendleft в цикле разворачивал порядок: первым из очереди доставался элемент
         # с САМЫМ НИЗКИМ рангом, а товарные адреса уезжали в хвост за все служебные.
         block = []
 
-        for url, normalized_url, category, priority in sitemap_urls:
+        while candidates:
+            row = candidates.popleft()
+            eligible = self._eligible_sitemap_row(row, base_url)
+            if eligible is None:
+                skipped_count += 1
+                continue
+            url, normalized_url, category, priority = eligible
             # P01 U3: хост и схема адреса карты приводятся к рабочей форме компании; путь
             # остаётся опубликованным (D120). Ключ дедупа пересчитывается по новому адресу,
             # иначе схема ключа разойдётся с тем, что реально запрашивается.
@@ -4241,8 +4999,18 @@ class WebCrawler:
                 # неотличим от дедупа; теперь считается отдельно и служит входом
                 # страховки «второй проход», если товарных страниц не сохранилось вовсе.
                 skipped_quota += 1
-                self._quota_rejected_urls.append(url)
+                if url not in self._quota_rejected_urls:
+                    self._quota_rejected_urls.append(url)
+                self._quota_rejected_depths.setdefault(url, 0)
+                self._sitemap_published_urls[normalized_url] = url
+                deferred.append(eligible)
                 continue
+
+            if len(self._sitemap_slots) >= self._sitemap_budget():
+                deferred.append(eligible)
+                deferred.extend(candidates)
+                candidates.clear()
+                break
 
             # D59 RC1: схемный дубль http↔https из sitemap (общий набор ключей с гейтом ссылок).
             if category == 'product':
@@ -4255,7 +5023,6 @@ class WebCrawler:
                         continue
                     self._crawled_scheme_keys.add(skey)
 
-            url_depth = self.url_categorizer.calculate_url_depth(url)
             # Увеличиваем приоритет URL из карты сайта. D208: потолок 10 снят — иначе
             # товар, категория и контакты получали один и тот же приоритет, и
             # пересортировка очереди в главном цикле переставала их различать.
@@ -4270,15 +5037,20 @@ class WebCrawler:
             # написании того же ключа повторить запрос ровно тем адресом, что в карте
             # (и чтобы считать долю адресов карты, не отдавших содержимое).
             self._sitemap_published_urls[normalized_url] = url
+            self._sitemap_slots.add(normalized_url)
             if url != normalized_url:
                 diverged_count += 1
                 if len(diverged_examples) < 3:
                     diverged_examples.append(f"{url} != {normalized_url}")
             added_count += 1
 
-            # Ограничиваем количество для первого прохода
-            if added_count >= self.config.sitemap_initial_batch_size:
+            # Размер порции не обрезает резерв и не заменяет общую квоту.
+            if added_count >= batch_limit:
+                deferred.extend(candidates)
+                candidates.clear()
                 break
+
+        self._sitemap_pending = deferred
 
         # D208: extendleft разворачивает вставляемую последовательность, поэтому
         # подаём её перевёрнутой — порядок ранжирования доживает до popleft.
@@ -4324,11 +5096,28 @@ class WebCrawler:
 
         normalized_url = self.url_normalizer.normalize_url(url)
 
+        if self._queue_url_rejection(url, depth, category):
+            return None
         async with self._urls_lock:
-            self.processed_urls.add(normalized_url)
+            from_sitemap = normalized_url in self._sitemap_published_urls
+            if from_sitemap and normalized_url not in self._sitemap_slots:
+                if len(self._sitemap_slots) >= self._sitemap_budget():
+                    return None
+            if category == 'product' and normalized_url not in self.product_urls:
+                if self._product_quota_reject_reason(url):
+                    return None
+                self.product_urls.add(normalized_url)
+                self._quota_released.discard(normalized_url)
+            if from_sitemap:
+                self._sitemap_slots.add(normalized_url)
 
         async with self._stats_lock:
+            if self.stats['total_pages'] >= self.max_pages_per_site:
+                return None
             self.stats['total_pages'] += 1
+            self.stats['attempted_pages'] += 1
+        async with self._urls_lock:
+            self.processed_urls.add(normalized_url)
 
         # Мониторинг памяти
         self._pages_processed_since_last_check += 1
@@ -4338,17 +5127,33 @@ class WebCrawler:
             self._pages_processed_since_last_check = 0
             self._last_memory_check = time.time()
 
-        # Проверка, не была ли страница уже обработана ранее (не блокирует извлечение ссылок)
-        is_processed = await self.temp_storage.is_page_processed(normalized_url, company_name, category)
-        if is_processed:
-            log.info(f"Страница уже обработана ранее, пропускаем сохранение, но ссылки всё равно извлечём: {url}")
-
+        sitemap_accepted = False
+        fetched = False
         try:
             # 1. Получение контента страницы (может вернуть один ParseResult или список)
-            parse_result = await self._fetch_page_content(url, category)
+            cached = self._resume_pages.get(normalized_url)
+            cached_content = (await self.temp_storage.load_cleaned_html(cached['html_path'])
+                              if cached else None)
+            outcome = None
+            if cached_content:
+                saved_url = cached_content['metadata'].get('url') or url
+                parse_result = await self._parse_content(cached_content['html_content'], saved_url)
+                if parse_result:
+                    parse_result.requested_url = url
+                    parse_result.fetch_method = cached_content['metadata'].get('fetch_method', '')
+            else:
+                outcome = await self.fetch_page(url, category)
+                parse_result = outcome.content
 
+            if parse_result:
+                self._record_page_success(url, resumed=bool(cached_content))
+                fetched = True
             # Обработка случая, когда страница вернула список вкладок
             if isinstance(parse_result, list):
+                self._fetch_failures.pop(url, None)
+                if category == 'product' and normalized_url in self._sitemap_published_urls:
+                    self._sitemap_hard_fail_streak = 0
+                sitemap_accepted = any(parse_result)
                 for idx, single_result in enumerate(parse_result):
                     tab_url = f"{url}#tab_{idx}"
                     tab_normalized = self.url_normalizer.normalize_url(tab_url)
@@ -4369,37 +5174,48 @@ class WebCrawler:
             if not parse_result:
                 # D120 п.7а: адрес, отличающийся от опубликованного в карте сайта, мог
                 # получить 404 именно из-за написания (снятый слеш, снятый /ru). Перед
-                # отбраковкой повторяем запрос ровно опубликованным адресом; запись в
-                # кэше перманентных ошибок относилась к другому адресу — снимаем её.
+                # отбраковкой повторяем запрос ровно опубликованным адресом. Кэш
+                # ошибок различает эти написания и не мешает отдельной попытке.
                 published_url = self._sitemap_published_urls.get(normalized_url)
                 if published_url and published_url != url:
                     log.warning(f"Нет содержимого по адресу {url}; повтор опубликованным "
                                 f"адресом карты сайта: {published_url}")
-                    async with self._errors_cache_lock:
-                        self.permanent_errors_cache.discard(normalized_url)
-                    retried = await self._fetch_page_content(published_url, category)
+                    outcome = await self.fetch_page(published_url, category)
+                    retried = outcome.content
                     if isinstance(retried, list):
                         retried = retried[0] if retried else None
                     parse_result = retried
+                    if parse_result:
+                        self._record_page_success(url)
+                        fetched = True
 
             if not parse_result:
-                log.warning(f"Не удалось получить содержимое страницы: {url}")
+                outcome = outcome or FetchOutcome(url, reason='empty')
+                self._fetch_failures[url] = {k: getattr(outcome, k) for k in
+                    ('requested_url', 'final_url', 'transport', 'status', 'reason', 'retryable', 'retry_after')}
+                self._record_page_failure(url, outcome.reason)
+                log.warning(f"Не удалось получить содержимое страницы: {url}: {outcome.reason}")
                 if normalized_url in self._sitemap_published_urls and self.metrics_collector is not None:
                     self.metrics_collector.record_sitemap_no_content(url)
-                # P02 U1: страница не получена — слот товарной квоты держать незачем
                 if category == 'product':
-                    await self._release_product_quota_slot(normalized_url, 'нет содержимого')
-                    await self._check_hard_fail_sitemap_guard(url, depth, category, queue)
+                    await self._check_hard_fail_sitemap_guard(url, depth, category, queue, outcome=outcome)
+                    if outcome.reason == 'soft_not_found':
+                        await self._check_stale_sitemap_guard(outcome.evidence, url, queue, outcome=outcome)
                 # D40: таймаутнутые целевые страницы не теряем — кладём в очередь ретраев,
-                # она обходится повторно после основного прохода
-                self._register_page_retry(url, depth, category)
+                # её обслуживает тот же цикл, включая найденных при повторе потомков
+                self._register_page_retry(url, depth, category, outcome)
+                # Временный отказ сохраняет уже выделенную квоту до повтора.
+                # Иначе свежие URL займут её за время backoff и вытеснят повтор.
+                if category == 'product' and normalized_url not in self._page_retry_candidates:
+                    await self._release_product_quota_slot(normalized_url, 'нет содержимого')
                 return None
 
             # P02 U1: содержимое пришло — серия жёстких отказов карты сайта прервана
-            if category == 'product' and depth == 0:
+            self._fetch_failures.pop(url, None)
+            if category == 'product' and normalized_url in self._sitemap_published_urls:
                 self._sitemap_hard_fail_streak = 0
 
-            # 2. ИЗВЛЕЧЕНИЕ ССЫЛОК (ВСЕГДА, независимо от категории и is_processed)
+            # 2. ИЗВЛЕЧЕНИЕ ССЫЛОК (включая неизменённые и восстановленные страницы)
             await self._process_links_from_parse_result(url, parse_result, depth, queue)
 
             # 2а. ОБЩИЕ ДОКУМЕНТЫ КОМПАНИИ: если страница принадлежит одному из
@@ -4407,19 +5223,21 @@ class WebCrawler:
             # скачиваем файлы с неё в соответствующую папку компании
             doc_section = self.url_categorizer.profile_document_section(url)
             if doc_section:
-                await self._download_company_documents(url, parse_result.html, doc_section, domain_dirs)
+                await self._download_company_documents(parse_result.url or url, parse_result.html, doc_section, domain_dirs)
 
             # 3. СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ ДОКУМЕНТАЦИИ (скачивание файлов)
             if category == 'documentation':
                 log.info(f"Обработка страницы документации (скачивание файлов): {url}")
                 try:
                     extractor = self._make_dynamic_extractor()
-                    result = await extractor.extract(url)
+                    async with async_deadline(self.config.page_fetch_timeout):
+                        result = await extractor.extract(url)
                     if result:
                         await self._download_files_from_documentation_page(url, result, domain_dirs, company_name)
                     else:
                         log.warning(f"Не удалось получить контент для документации {url}")
                 except Exception as e:
+                    self._record_page_failure(url, 'documentation_error', processing=True)
                     log.error(f"Ошибка при скачивании файлов документации {url}: {e}")
                 return None
 
@@ -4428,11 +5246,14 @@ class WebCrawler:
             # сохраняются в Other_pages и доступны второму проходу извлечения в main.py
             target_categories = {'product', 'contacts', 'distributor', 'main_page', 'category', 'price_list'}
             if category not in target_categories:
+                sitemap_accepted = True
+                self._usable_page_urls.add(normalized_url)
                 log.debug(f"Страница категории '{category}' не подлежит сохранению, ссылки извлечены: {url}")
                 return None
 
             # 5. Проверка размера оригинального HTML
             if len(parse_result.html) < 300:
+                self._record_page_failure(url, 'content_too_small', processing=True)
                 log.info(f"Пропускаем сохранение страницы {url}: размер оригинального HTML менее 300 символов")
                 # P02 U1: страница не сохранена — слот товарной квоты возвращается
                 if category == 'product':
@@ -4449,8 +5270,11 @@ class WebCrawler:
 
             # 6. Подготовка метаданных
             metadata = {
-                'url': url,
-                'normalized_url': self.url_normalizer.normalize_url(parse_result.url) if hasattr(parse_result, 'url') else normalized_url,
+                'url': parse_result.url or url,
+                'requested_url': parse_result.requested_url or url,
+                'canonical_url': parse_result.canonical_url,
+                'fetch_method': parse_result.fetch_method,
+                'normalized_url': self.url_normalizer.normalize_url(parse_result.url or url),
                 'category': category,
                 'content_type': parse_result.content_type,
                 'depth': depth,
@@ -4464,7 +5288,7 @@ class WebCrawler:
 
             # 7. Сохранение оригинального HTML во временное хранилище
             file_path, is_new, storage_metadata = await self.temp_storage.save_cleaned_html(
-                url, metadata['normalized_url'], parse_result.html, company_name, metadata, category
+                metadata['url'], metadata['normalized_url'], parse_result.html, company_name, metadata, category
             )
 
             # 8. Дополнительное сохранение для контактов как дистрибьюторов
@@ -4473,7 +5297,7 @@ class WebCrawler:
                 distributor_metadata['category'] = 'distributor'
                 distributor_metadata['is_contact_duplicate'] = True
                 await self.temp_storage.save_cleaned_html(
-                    url, metadata['normalized_url'], parse_result.html, company_name, distributor_metadata, 'distributor'
+                    metadata['url'], metadata['normalized_url'], parse_result.html, company_name, distributor_metadata, 'distributor'
                 )
 
             # 9. Формирование результата. Словарь строим независимо от наличия списка
@@ -4485,7 +5309,8 @@ class WebCrawler:
             if file_path and is_new:
                 stored_page = {
                     'file_path': file_path,
-                    'url': url,
+                    'url': metadata['url'],
+                    'requested_url': metadata['requested_url'],
                     'category': category,
                     'normalized_url': metadata['normalized_url'],
                     'timestamp': metadata['timestamp'],
@@ -4494,14 +5319,23 @@ class WebCrawler:
                 if stored_pages is not None:
                     stored_pages.append(stored_page)
 
+            sitemap_accepted = bool(file_path)
+            if not file_path:
+                self._record_page_failure(url, 'storage_error', processing=True)
+            else:
+                self._usable_page_urls.add(normalized_url)
             await self._update_stats(category, url)
             return stored_page
 
         except Exception as e:
             log.error(f"Ошибка обработки страницы {url}: {e}", exc_info=True)
-            async with self._stats_lock:
-                self.stats['failed_pages'] += 1
+            self._record_page_failure(url, 'processing_error', processing=fetched)
             return None
+        finally:
+            if not sitemap_accepted and normalized_url not in self._page_retry_candidates:
+                self._sitemap_slots.discard(normalized_url)
+                if category == 'product':
+                    await self._release_product_quota_slot(normalized_url, 'страница не сохранена')
 
 
     async def _process_links_from_parse_result(self, url: str, parse_result: ParseResult,
@@ -4511,7 +5345,8 @@ class WebCrawler:
         Вызывается всегда, даже если страница не сохраняется.
         """
         try:
-            new_links = await self._extract_links(url, parse_result, depth, base_url=self.current_base_url)
+            new_links = await self._extract_links(parse_result.url or url, parse_result, depth,
+                                                  base_url=self.current_base_url)
             added = 0
             for link_url, link_category, priority in new_links:
                 if await self._should_add_to_queue_parallel(link_url, depth + 1, link_category):
@@ -4525,20 +5360,12 @@ class WebCrawler:
         except Exception as e:
             log.error(f"Ошибка извлечения ссылок из {url}: {e}")
 
-    # D59: генерические слаги — не идентификатор товара; по ним склеивать нельзя
-    # (иначе разные товары/категории с общим последним сегментом схлопнутся).
-    _GENERIC_PRODUCT_SLUGS = frozenset({
-        'product', 'products', 'produkciya', 'produktsiya', 'produkty',
-        'tovar', 'tovary', 'catalog', 'katalog', 'index', 'page', 'item', 'items',
-        'main', 'home', 'default', 'card', 'detail',
-    })
-
     def _scheme_dedup_key(self, url: str):
         """D59 RC1: ключ для отсева ТОЛЬКО схемных дублей http↔https одной страницы —
         нормализованный URL без схемы (домен и путь сохраняются, включая фактический домен,
         без сведе́ния к группе). Две версии http/https одного домена+пути дают один ключ;
-        кросс-домен и разные пути НЕ склеиваются здесь (их развести́т extract-стадия по слагу,
-        т.к. на разных доменах холдинга контент может отличаться — вплоть до soft-404)."""
+        кросс-домен и разные пути НЕ склеиваются ни здесь, ни по последнему сегменту,
+        т.к. на разных доменах холдинга контент может отличаться — вплоть до soft-404."""
         try:
             n = self.url_normalizer.normalize_url(url)
             key = re.sub(r'^https?://', '', n or '')
@@ -4547,31 +5374,42 @@ class WebCrawler:
             return None
 
     def _product_dedup_key(self, url: str):
-        """D59 (RC1+C): ключ склейки версий ОДНОГО товара, доступного под разными URL.
-        Отбрасывает схему (http↔https — RC1) и различие путей/доменов холдинга (C):
-        ключ = <представитель группы эквивалентных доменов>|<последний слаг пути>.
-        Возвращает None, если слаг не различим (тогда действует обычный дедуп по visited_urls).
-        НЕ мутирует реальный URL (скачивание идёт по оригиналу) — только ключ для set-а."""
+        """Полный адрес товара без схемы: host/port/path/query, без склейки по слагу.
+
+        Адрес уже прошёл редиректы перед извлечением. Группа доступных доменов
+        определяет периметр обхода, но не доказывает тождество товаров на них.
+        """
         try:
             parsed = urlparse(url)
-            de = getattr(self.url_categorizer, 'domain_equivalency', None)
-            if de is not None and getattr(self.config, 'domain_equivalency_enabled', False):
-                # стабильный представитель группы: все домены холдинга -> один ключ
-                repr_domain = min(de._domain_group(de.get_canonical_domain(url)))
-            else:
-                repr_domain = parsed.netloc.lower().split(':')[0]
-                if getattr(self.config, 'domain_strict_www', False) and repr_domain.startswith('www.'):
-                    repr_domain = repr_domain[4:]
-            slug = re.sub(r'/+$', '', parsed.path or '').rsplit('/', 1)[-1].lower()
-            if len(slug) < 3 or slug in self._GENERIC_PRODUCT_SLUGS:
+            if parsed.scheme not in ('http', 'https') or not parsed.netloc:
                 return None
-            return f"{repr_domain}|{slug}"
+            return self._scheme_dedup_key(url)
         except Exception as e:
             log.debug(f"_product_dedup_key: не удалось построить ключ для {url}: {e}")
             return None
 
+    def _queue_url_rejection(self, url, depth, category, base_url=None):
+        """Одинаковый допуск для ссылок, стартов, sitemap, резерва и повторов."""
+        if not self._is_allowed_url(url, base_url=base_url or url):
+            return 'домен вне профиля'
+        if depth > self.max_depth:
+            self._depth_limited_urls.add(self.url_normalizer.normalize_url(url))
+            return 'глубина переходов'
+        if category.startswith('excluded'):
+            return 'исключённая категория'
+        if self.url_categorizer.should_exclude_by_language(url):
+            return 'язык'
+        if self.url_normalizer.is_over_pagination_limit(url):
+            self._pagination_limited_urls.add(self.url_normalizer.normalize_url(url))
+            return 'предел пагинации'
+        if category == 'product' and self.url_categorizer.is_print_version(url, category):
+            return 'печатная версия'
+        if self.url_categorizer._is_image_url(url) or self.url_categorizer.is_downloadable_file(url):
+            return 'файл вместо страницы'
+        return None
+
     async def _should_add_to_queue_parallel(self, url: str, depth: int,
-                                            category: str = None) -> bool:
+                                            category: str = None, *, retry=False) -> bool:
         """Потокобезопасная проверка, нужно ли добавлять URL в очередь.
 
         F3 ревью слияния: роль передаётся УЖЕ ПОСЧИТАННОЙ сборщиком ссылок — она
@@ -4580,56 +5418,35 @@ class WebCrawler:
         слот квоты не резервировал и схемный дедуп D59 не проходил."""
         if category is None:
             category, _ = self.url_categorizer.categorize_url(url)
-
-        if category == 'excluded':
-            log.debug(f"Не добавляем исключённый URL в очередь: {url}")
+        reason = self._queue_url_rejection(url, depth, category)
+        if reason:
+            self._count_queue_gate_rejection(reason)
             return False
-
-        if category == 'product' and self.url_categorizer.is_print_version(url, category):
-            log.debug(f"Не добавляем печатную версию в очередь: {url}")
-            return False
-        
-        if depth > self.max_depth:
-            return False
-            
         normalized_url = self.url_normalizer.normalize_url(url)
-        
         async with self._urls_lock:
-            if normalized_url in self.visited_urls:
+            if not retry and (normalized_url in self.visited_urls or normalized_url in self.processed_urls):
                 return False
-            
-            # Проверяем языковые префиксы
-            if self.url_categorizer.should_exclude_by_language(url):
-                return False
-
-            url_depth = self.url_categorizer.calculate_url_depth(url)
-            
-            # Для не-товарных страниц ограничиваем глубину. Контакты/дистрибьюторы часто
-            # лежат глубже (напр. /where-to-buy/регион/город), поэтому им даём больший лимит,
-            # согласованный с _should_skip_url (там не-товарные отсекаются при depth > 4).
-            non_product_depth_limit = 4 if category in ('contacts', 'distributor') else 2
-            if category != 'product' and url_depth > non_product_depth_limit:
-                self._count_queue_gate_rejection('глубина не-товарной страницы')
-                return False
+            if normalized_url in self._sitemap_published_urls:
+                if normalized_url not in self._sitemap_slots and len(self._sitemap_slots) >= self._sitemap_budget():
+                    return False
 
             # Для товарных страниц ограничиваем количеством.
             # D193/D143/D212: отказ был немым; теперь он считается и попадает в сводку
             # за компанию, а сам адрес — во вход страховки «второй проход».
-            if category == 'product':
+            if category == 'product' and normalized_url not in self.product_urls:
                 reason = self._product_quota_reject_reason(url)
                 if reason:
                     self._count_queue_gate_rejection(reason)
                     self._quota_rejected_urls.append(url)
+                    self._quota_rejected_depths.setdefault(url, depth)
                     return False
 
-            # D59 (RC1+C): один товар под несколькими URL (http↔https / алиас пути /
-            # разные домены холдинга) даёт дубль карточки, т.к. product_id из имени LLM
-            # нестабилен. Склеиваем по (группа доменов, последний слаг) ДО постановки в
-            # очередь — вторая версия не скачивается и не извлекается.
+            # Схемный дубль не создаёт новую работу; явный повтор того же URL
+            # допускается с сохранением индивидуального бюджета попыток.
             if category == 'product':
                 skey = self._scheme_dedup_key(url)
                 if skey is not None:
-                    if skey in self._crawled_scheme_keys:
+                    if not retry and skey in self._crawled_scheme_keys:
                         log.info(f"D59 RC1: пропускаем схемный дубль (ключ {skey}): {url}")
                         return False
                     self._crawled_scheme_keys.add(skey)
@@ -4639,17 +5456,28 @@ class WebCrawler:
             # (max_concurrent_pages) иначе лимит перебирается на размер батча.
             if category == 'product':
                 self.product_urls.add(normalized_url)
+                self._quota_released.discard(normalized_url)
 
+            if normalized_url in self._sitemap_published_urls:
+                self._sitemap_slots.add(normalized_url)
+            self.visited_urls.add(normalized_url)
             return True
 
     async def _download_site_files(self, site_url: str, domain_dirs: Dict[str, str]) -> List[str]:
         """Скачивание файлов с сайта"""
         downloaded_files = []
         
+        if not self._is_allowed_url(site_url, base_url=site_url):
+            return downloaded_files
+        page = None
+        cleanup_guard = None
         context = await self.browser_pool.get_browser()
         try:
             page = await context.new_page()
+            cleanup_guard = await self._guard_browser_page(page, site_url)
             await page.goto(site_url)
+            if not self._is_allowed_url(page.url, base_url=site_url):
+                return downloaded_files
             
             # Скачиваем файлы с различных вкладок
             downloaded_files.extend(
@@ -4668,10 +5496,7 @@ class WebCrawler:
         except Exception as e:
             log.error(f"Ошибка скачивания файлов с {site_url}: {e}")
         finally:
-            if page:
-                await self.browser_pool.close_page(page)
-            if context:
-                await self.browser_pool.return_browser(context)
+            await _release_browser_resources(self.browser_pool, context, page, cleanup_guard)
         return downloaded_files
     
     def _normalize_file_url(self, url: str, base_url: str) -> str:
@@ -4722,10 +5547,11 @@ class WebCrawler:
                 log.debug(f"D72: не удалось прочитать сохранённый HTML {storage_path}: {e}")
         # 2) Фолбэк: сетевая загрузка (прежнее поведение)
         try:
-            parse_result = await self._fetch_page_content(url, 'product')
+            outcome = await self.fetch_page(url, 'product')
+            parse_result = outcome.content
             if not parse_result:
                 return []
-            return self._extract_file_links_from_soup(parse_result.soup, url)
+            return self._extract_file_links_from_soup(parse_result.soup, parse_result.url or url)
         except Exception as e:
             log.error(f"Ошибка извлечения файловых ссылок со страницы {url}: {e}")
             return []
@@ -4734,6 +5560,7 @@ class WebCrawler:
         """Извлечение файловых ссылок из готового soup (общая логика: сохранённый HTML и сетевая загрузка)."""
         try:
             file_links = []
+            link_base = document_base_url(soup, url)
 
             # Ищем все ссылки с текстом, указывающим на скачивание
             download_keywords = ['скачать', 'download', 'загрузить', 'Скачать', 'Download',
@@ -4751,14 +5578,10 @@ class WebCrawler:
                 is_download_link = any(keyword in link_text for keyword in download_keywords)
                 
                 # Нормализуем URL
-                normalized_url = self._normalize_file_url(href, url)
+                normalized_url = self._normalize_file_url(href, link_base)
                 
-                # Проверяем основной домен (фильтруем поддомены)
-                if self.config.ignore_subdomains:
-                    if self.url_categorizer.is_subdomain(normalized_url, url):
-                        if self.config.log_skipped_subdomains:
-                            log.info(f"Пропускаем файл с поддомена: {normalized_url}")
-                        continue
+                if not self._is_allowed_url(normalized_url, resource='file', base_url=url):
+                    continue
                     
                 # Если это явно ссылка для скачивания ИЛИ это поддерживаемый файл
                 if is_download_link or self._is_supported_file_link(normalized_url):
@@ -4772,12 +5595,10 @@ class WebCrawler:
                 parent_link = element.find_parent('a', href=True)
                 if parent_link and parent_link['href']:
                     href = sanitize_href(parent_link['href'])  # D257/D233
-                    normalized_url = self._normalize_file_url(href, url)
+                    normalized_url = self._normalize_file_url(href, link_base)
                     
-                    # Проверяем основной домен
-                    if self.config.ignore_subdomains:
-                        if not self.url_categorizer.is_main_domain(normalized_url, url):
-                            continue
+                    if not self._is_allowed_url(normalized_url, resource='file', base_url=url):
+                        continue
                         
                     if self._is_supported_file_link(normalized_url):
                         file_links.append(normalized_url)
@@ -4788,10 +5609,9 @@ class WebCrawler:
                 if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
                     continue
                 
-                normalized_url = self._normalize_file_url(href, url)
-                if self.config.ignore_subdomains:
-                    if not self.url_categorizer.is_main_domain(normalized_url, url):
-                        continue
+                normalized_url = self._normalize_file_url(href, link_base)
+                if not self._is_allowed_url(normalized_url, resource='file', base_url=url):
+                    continue
                 if self._is_supported_file_link(normalized_url) and normalized_url not in file_links:
                     file_links.append(normalized_url)
 
@@ -4908,89 +5728,38 @@ class WebCrawler:
 
         return [url for url in expanded_urls if self._is_valid_url(url)]
 
-    async def _should_skip_url(self, url: str, depth: int, company_name: str) -> bool:
+    async def _should_skip_url(self, url: str, depth: int, company_name: str, category: str = None) -> bool:
         """Проверка, нужно ли пропустить URL"""
         
         normalized_url = self.url_normalizer.normalize_url(url)
-        
-        if self.url_categorizer.should_exclude_by_language(url):
-            log.debug(f"Пропускаем URL с не-русским языковым префиксом: {url}")
-            return True
-        
-        category, _ = self.url_categorizer.categorize_url(url)
-        if category == 'product' and self.url_categorizer.is_print_version(url, category):
-            log.debug(f"Пропускаем печатную версию товара: {url}")
-            return True
-        
-        # Проверяем, является ли URL изображением или файлом
-        if (self.url_categorizer._is_image_url(url) or 
-            self.url_categorizer.is_downloadable_file(url)):
-            log.debug(f"Пропускаем URL файла: {url}")
-            return True
-        
-        # Проверяем основной домен (фильтруем поддомены)
-        if self.config.ignore_subdomains:
-            if not self._in_crawl_perimeter(url, self.current_base_url):
-                if self.config.log_skipped_subdomains:
-                    log.info(f"Пропускаем неэквивалентный домен: {url} (основной: {self.current_base_url})")
-                # P01 U3 п.4: адрес уже занял слот товарной квоты при постановке в очередь —
-                # на отбраковке чужого хоста слот возвращается (хвост P02 U1).
-                await self._release_product_quota_slot(normalized_url, 'чужой домен')
-                return True
-
-        # Проверяем посещенные URL
-        async with self._urls_lock:
-            if normalized_url in self.processed_urls:
-                log.debug(f"URL уже обработан: {url} -> {normalized_url}")
-                return True       
-        # Проверка временного хранилища на наличие сохраненного HTML
-        try:
+        if category is None:
             category, _ = self.url_categorizer.categorize_url(url)
-            storage_category = 'product' if category == 'product' else 'other'
-            
-            # Проверяем существующие файлы в хранилище для этого URL
-            existing_files = await self.temp_storage._find_existing_files(normalized_url, company_name, storage_category)
-            
-            if existing_files:
-                for file_path in existing_files:
-                    meta_path = file_path.with_suffix('.json')
-                    if meta_path.exists():
-                        async with aiofiles.open(meta_path, 'r', encoding='utf-8') as f:
-                            metadata = json.loads(await f.read())
-                        
-                        if metadata.get('normalized_url') == normalized_url:
-                            log.debug(f"URL уже сохранен в хранилище: {url}")
-                            
-                            async with self._urls_lock:
-                                self.visited_urls.add(normalized_url)
-                            
-                            if metadata.get('checkpoints', {}).get('ai_processed', False):
-                                async with self._urls_lock:
-                                    self.processed_urls.add(normalized_url)
-                            
-                            return True
-                            
-        except Exception as e:
-            log.warning(f"Ошибка проверки URL в хранилище {url}: {e}")
-
-        # Проверяем глубину для разных типов страниц
-        url_depth = self.url_categorizer.calculate_url_depth(url)
-        category, _ = self.url_categorizer.categorize_url(url)
-        
-        # Для не-товарных страниц ограничиваем глубину 4
-        if category != 'product' and url_depth > 4:
-            log.debug(f"Превышена глубина для не-товарной страницы: {url} (глубина: {url_depth})")
+        reason = self._queue_url_rejection(url, depth, category)
+        if reason:
+            await self._release_product_quota_slot(normalized_url, reason)
             return True
-            
-        # Продуктовый лимит здесь НЕ проверяем: product_urls наполняется при ПОСТАНОВКЕ URL в
-        # очередь (_should_add_to_queue_parallel / _add_sitemap_urls_to_queue), поэтому к моменту
-        # обработки счётчик уже = кэпу и эта проверка отбраковывала бы ВСЕ товарные страницы;
-        # кэп уже обеспечен на этапе постановки (в очередь попадает ≤ кэпа товарных URL).
-
-        return False
+        async with self._urls_lock:
+            return (normalized_url in self.processed_urls
+                    and normalized_url not in self._queued_retries)
 
     async def _accept_cookie_consent(self, page) -> bool:
         """Ищет и кликает по кнопке принятия cookies (если присутствует)."""
+        # Тизол: кнопка баннера включается только после двух согласий.
+        # Не трогаем флажки форм заказа и других сайтов.
+        if (urlparse(page.url).hostname or '').lower() in ('tizol.com', 'www.tizol.com'):
+            try:
+                banner = await page.query_selector('.personal-warning--show')
+                if banner and await banner.is_visible():
+                    for checkbox in await banner.query_selector_all('input[type="checkbox"]'):
+                        await checkbox.check(timeout=2000)
+                    button = await banner.query_selector('.personal-warning__btn')
+                    if button:
+                        await button.click(timeout=2000)
+                        await page.wait_for_timeout(300)
+                        return True
+            except Exception as exc:
+                log.debug(f"Не удалось закрыть баннер Тизола: {exc}")
+                return False
         # Распространённые селекторы для кнопок согласия
         consent_selectors = [
             # Кнопки с текстом
@@ -5053,234 +5822,216 @@ class WebCrawler:
         
         return False  # Баннер не найден или не требует действий   
        
-    async def _fetch_page_content(self, url: str, category: str = None) -> Optional[ParseResult]:
-        """Получение контента страницы с улучшенной обработкой"""
-        if category == 'product' and self.url_categorizer.is_print_version(url, category):
-            log.debug(f"Не загружаем печатную версию: {url}")
-            return None
+    def _usable_product_content(self, parsed: ParseResult, *, rendered: bool) -> bool:
+        """Каталог отдаёт ссылки; короткая HTTP-карточка требует проверки браузером."""
+        html = parsed.html
+        if (page_error_reason(html) or is_unrendered_store_listing(html)
+                or needs_javascript(html)):
+            return False
+        if product_state_key(parsed.url) and parsed.soup.select_one('main[data-tilda-product], main[data-inline-product]'):
+            return True
+        if has_product_island(html):
+            return True
+        if (any(cat == 'product' for _, cat, _ in parsed.additional_links)
+                and (rendered or self.url_categorizer.is_listing_url(parsed.url))):
+            return True
+        if rendered and self.url_categorizer.is_product_page_by_content(parsed.soup, parsed.url):
+            return True
+        minimum = self._product_shell_min_text()
+        return not minimum or not looks_like_product_shell(html, min_text=minimum)
+
+    def _host_paused(self, url):
+        return self._host_retry_until.get(urlparse(url).netloc.lower(), 0) > time.monotonic()
+
+    async def fetch_page(self, url: str, category=None) -> FetchOutcome:
+        """Одна попытка со всеми транспортами; свидетельства изолированы по asyncio-task."""
+        if not self._is_allowed_url(url, base_url=url):
+            return FetchOutcome(url, reason='out_of_scope', retryable=False)
+        if self._host_paused(url):
+            return FetchOutcome(url, reason='host_cooldown', retry_after=
+                self._host_retry_until[urlparse(url).netloc.lower()] - time.monotonic())
+        trace = []
+        def record(outcome):
+            trace.append(outcome)
+            if outcome.status in (429, 503):
+                host = urlparse(outcome.final_url or outcome.requested_url).netloc.lower()
+                pause = max(2, outcome.retry_after)
+                self._host_retry_until[host] = max(self._host_retry_until.get(host, 0), time.monotonic() + pause)
+                # Исходный URL тоже не должен немедленно повторять цепочку редиректов.
+                origin = urlparse(url).netloc.lower()
+                self._host_retry_until[origin] = max(self._host_retry_until.get(origin, 0), time.monotonic() + pause)
+        token = fetch_observer.set(record)
+        deadline = async_deadline(max(0.001, float(self.config.page_fetch_timeout)))
         try:
-            # Проверяем, не в кэше ли перманентных ошибок
-            normalized_url = self.url_normalizer.normalize_url(url)
-            async with self._errors_cache_lock:
-                if normalized_url in self.permanent_errors_cache:
-                    log.debug(f"URL в кэше перманентных ошибок, пропускаем: {url}")
-                    return None
+            async with deadline:
+                content = await self._fetch_page_content(url, category)
+            if content:
+                page = content[0] if isinstance(content, list) else content
+                success = next((item for item in reversed(trace) if item.reason == 'ok'), None)
+                return FetchOutcome(url, getattr(page, 'url', url),
+                                    getattr(page, 'fetch_method', '') or (success.transport if success else ''),
+                                    200, 'ok', False, content=content)
+            failures = [item for item in trace if item.reason != 'ok']
+            # Любой временный отказ делает вывод об исчезновении страницы недоказанным.
+            transient = [item for item in failures if item.retryable]
+            other = [item for item in failures if item.reason not in ('not_found', 'gone', 'soft_not_found')]
+            outcome = (transient or other or failures or [FetchOutcome(url)])[-1]
+            # Явный последний отказ периметра завершает попытку, даже если исходный
+            # HTTP потребовал браузер из-за пустой панели характеристик.
+            if failures and failures[-1].reason == 'out_of_scope':
+                outcome = failures[-1]
+            outcome.requested_url = url
+            return outcome
+        except (asyncio.TimeoutError, PlaywrightTimeoutError):
+            return FetchOutcome(url, transport='deadline' if deadline.expired else '', reason='timeout')
+        except Exception as exc:
+            log.exception(f"Внутренняя ошибка получения страницы {url}")
+            return FetchOutcome(url, reason='internal_error', retryable=False)
+        finally:
+            fetch_observer.reset(token)
 
-            # Пер-хостовый троттлинг из профиля (crawl.load.page_delay_ms); 0 = no-op.
-            if self.profile is not None and self.host_throttle is not None:
-                await self.host_throttle.acquire(urlparse(url).netloc.lower(),
-                                                 self.profile.crawl.load.page_delay_ms)
-            # Профиль: render=browser -> сразу Playwright (SPA); antibot=impersonate/warmup ->
-            # HTTP-first (curl_cffi) пробуется первым и для contacts/distributor.
-            force_browser = self.profile is not None and self.profile.crawl.render == 'browser'
-            profile_antibot = self.profile.crawl.antibot if self.profile is not None else 'none'
-
-            if category in ('contacts', 'distributor') and self.config.dynamic_content_enabled:
-                if profile_antibot in ('impersonate', 'warmup') and not force_browser:
-                    http_html = await self._http_first_get(url)
-                    if http_html:
-                        log.info(f"Профиль (antibot={profile_antibot}): {category}-страница "
-                                 f"получена HTTP-first без браузера: {url}")
-                        self._census_fetch(url, category, 'http_first')
-                        return await self._parse_content(http_html, url)
-                log.info(f"Обработка динамического контента для {category}: {url}")
-                extractor = self._make_dynamic_extractor()
-                result = await extractor.extract(url)
-
-                if isinstance(result, list):
-                    # Список HTML (вкладки) -> создаём ParseResult для каждого
-                    parsed_list = []
-                    for html in result:
-                        parsed = await self._parse_content(html, url)
-                        if parsed:
-                            parsed_list.append(parsed)
-                    if parsed_list:
-                        self._census_fetch(url, category, 'dynamic')
-                        return parsed_list
-                elif isinstance(result, str):
-                    # Один HTML (аккордеоны) -> один ParseResult
-                    parsed = await self._parse_content(result, url)
-                    if parsed:
-                        self._census_fetch(url, category, 'dynamic')
-                        return parsed
-
-                # D79: браузер не отдал контент (частая причина — Page.goto Timeout на медленных
-                # динамических контакт/дилерских страницах, напр. dipos.ru/contact/<город>, /dealers,
-                # /gde-kupit). Не теряем страницу — откатываемся на HTTP-first/aiohttp, как у товаров.
-                # Иначе дилерские страницы не сохраняются и дубль-сохранение contacts->distributor
-                # (шаг 8 в _process_page) не срабатывает -> дилеры не извлекаются.
-                log.warning(f"Динамический контент не получен для {category}, HTTP-fallback: {url}")
-                http_html = await self._http_first_get(url)
-                if not http_html:
-                    http_html = await self._fetch_with_aiohttp(url)
-                if http_html:
-                    log.info(f"HTTP-fallback отдал {category}-страницу без браузера ({len(http_html)} симв): {url}")
-                    self._census_fetch(url, category, 'http_first')
-                    return await self._parse_content(http_html, url)
-                if self.metrics_collector is not None:
-                    self.metrics_collector.record_fetch_fail(url, category)
-                return None
-                
-            # Для продуктовых/каталожных страниц сначала пробуем aiohttp: статические каталоги
-            # (напр. aerobel.ru) отдают полный HTML со ссылками на карточки обычным GET, тогда как
-            # Playwright по таким страницам иногда возвращает пустой каркас. Если товарных ссылок
-            # в aiohttp-ответе нет (сетка рендерится JS), откатываемся на Playwright.
-            if category == 'product':
-                # D01: домены с AJAX-вкладками характеристик — рендер браузером с кликами
-                # по вкладкам и склейкой в один HTML (HTTP-first бесполезен: первичный DOM
-                # не содержит контента вкладок)
-                ajax_domains = getattr(self.config, 'ajax_product_tabs_domains', []) or []
-                page_host = urlparse(url).netloc.lower()
-                profile_ajax = self.profile is not None and self.profile.crawl.ajax_tabs
-                if profile_ajax or any(page_host == d or page_host.endswith('.' + d) for d in ajax_domains):
-                    extractor = self._make_dynamic_extractor()
-                    merged_html = await extractor.extract_product_tabs_merged(url)
-                    if merged_html:
-                        log.info(f"Товарная страница с AJAX-вкладками склеена ({len(merged_html)} симв): {url}")
-                        self._census_fetch(url, category, 'ajax_tabs')
-                        return await self._parse_content(merged_html, url)
-                    # если браузер не отдал страницу — падаем на обычную лестницу ниже
-
-                # HTTP-first: curl_cffi impersonate + cookie-warmup при antibot-челлендже.
-                # Если статический HTML достаточен и JS не нужен (или есть товарный остров) —
-                # берём без браузера; иначе (None) идём по старой лестнице aiohttp→Playwright.
-                # Профиль render=browser: HTTP-слой пропускается — сразу Playwright.
-                aiohttp_parsed = None
-                aiohttp_content = None
-                if not force_browser:
-                    http_html = await self._http_first_get(url, expect_product=True)
-                    if http_html:
-                        log.info(f"HTTP-first отдал товарную страницу без браузера ({len(http_html)} симв): {url}")
-                        self._census_fetch(url, category, 'http_first')
-                        return await self._parse_content(http_html, url)
-
-                    aiohttp_content = await self._fetch_with_aiohttp(url)
-                if aiohttp_content:
-                    aiohttp_parsed = await self._parse_content(aiohttp_content, url)
-                    if any(cat == 'product' for _, cat, _ in aiohttp_parsed.additional_links):
-                        self._census_fetch(url, category, 'aiohttp')
-                        return aiohttp_parsed
-                    # Гейт data-island: если полный контент товарной страницы уже пришёл
-                    # обычным GET (достаточно SSR-текста либо в HTML есть товарный остров
-                    # JSON-LD/__NEXT__/__NUXT__ — needs_javascript учитывает оба сигнала),
-                    # запускать Playwright не нужно. needs_javascript строит собственный
-                    # временный soup и не мутирует aiohttp_parsed.
-                    # Гейт оболочки повторяется и здесь: иначе эскалация из _http_first_get
-                    # обесценивается — aiohttp принесёт тот же пустой HTML, и мы вернём его,
-                    # так и не дойдя до Playwright.
-                    _min_text = self._product_shell_min_text()
-                    _shell = bool(_min_text) and looks_like_product_shell(aiohttp_content, min_text=_min_text)
-                    if (not _shell and not needs_javascript(aiohttp_content)
-                            and not is_unrendered_store_listing(aiohttp_content)):
-                        log.debug(f"data-island: контент товара уже в HTML, пропускаем Playwright: {url}")
-                        self._census_fetch(url, category, 'aiohttp')
-                        return aiohttp_parsed
-
-                # Товарных ссылок в обычном GET нет — пробуем Playwright (динамический рендеринг)
-                result = await self._fetch_with_playwright(url)
-
-                # result всегда должен быть кортежем из 3 элементов
-                if result is None:
-                    log.error(f"_fetch_with_playwright вернул None для {url}")
-                    return aiohttp_parsed
-
-                content, is_permanent_error, final_url = result
-                if is_permanent_error:
-                    return aiohttp_parsed
-                # Если Playwright вернул меньше, чем обычный GET (типичный «каркас» вместо контента) —
-                # используем более полный aiohttp-ответ.
-                if aiohttp_content and len(aiohttp_content) > len(content or ''):
-                    log.info(
-                        f"Playwright вернул меньше ({len(content or '')} симв), чем aiohttp "
-                        f"({len(aiohttp_content)} симв) — берём aiohttp: {url}"
-                    )
-                    return aiohttp_parsed
-                if content:
-                    effective_url = final_url if final_url and final_url != url else url
-                    self._log_effective_url(url, final_url)
-                    # Проверяем, что конечный домен эквивалентен базовому
-                    if final_url and final_url != url:
-                        if not self.url_categorizer.is_main_domain(final_url, self.current_base_url):
-                            log.warning(f"Редирект на неэквивалентный домен: {url} -> {final_url}, пропускаем")
-                            return None
-                    # Парсим с учётом конечного URL
-                    parse_result = await self._parse_content(content, effective_url)
-                    # Добавляем информацию о редиректе в метаданные (будет использовано при сохранении)
-                    if parse_result and final_url and final_url != url:
-                        # Сохраним исходный URL в дополнительном поле parse_result (можно через атрибут)
-                        parse_result.redirected_from = url
-                    self._census_fetch(url, category, 'playwright')
-                    return parse_result
-                if aiohttp_parsed is not None:
-                    self._census_fetch(url, category, 'aiohttp')
-                elif self.metrics_collector is not None:
-                    self.metrics_collector.record_fetch_fail(url, category)
-                return aiohttp_parsed
-            else:
-                # HTTP-impersonate первым (сильнее голого aiohttp). Не гейтим по needs_javascript:
-                # для не-товарных страниц важны ссылки для BFS, они есть и в «тонком» HTML.
-                # Профиль render=browser: HTTP-слой пропускается — сразу Playwright.
-                if not force_browser and getattr(self.config, 'http_first_enabled', True) and _CURL_CFFI_AVAILABLE:
-                    res = await self._fetch_with_http_impersonate(url)
-                    if res and not res.from_cache_error and res.status == 200 and res.html:
-                        ok_domain = True
-                        if res.final_url and res.final_url != url:
-                            self._log_effective_url(url, res.final_url)
-                            ok_domain = self.url_categorizer.is_main_domain(res.final_url, self.current_base_url)
-                        if ok_domain:
-                            self._census_fetch(url, category, 'http_first')
-                            return await self._parse_content(res.html, url)
-
-                content = None if force_browser else await self._fetch_with_aiohttp(url)
-                if content:
-                    self._census_fetch(url, category, 'aiohttp')
-                    return await self._parse_content(content, url)
-                result = await self._fetch_with_playwright(url)
-                if result is not None:
-                    content, _, final_url = result
-                    if content:
-                        self._log_effective_url(url, final_url)
-                        # Сверка хоста после навигации, как в товарной ветке: JS-редиректор
-                        # уводил браузер на чужой сайт, и тот сохранялся под адресом
-                        # компании — вплоть до карточки чужой организации (D238).
-                        if final_url and final_url != url and not self.url_categorizer.is_main_domain(
-                                final_url, self.current_base_url):
-                            log.warning(f"Редирект на неэквивалентный домен: {url} -> {final_url}, пропускаем")
-                            return None
-                        self._census_fetch(url, category, 'playwright')
-                        return await self._parse_content(content, final_url or url)
-                if self.metrics_collector is not None:
-                    self.metrics_collector.record_fetch_fail(url, category)
-                return None
-
-        except Exception as e:
-            log.error(f"Ошибка получения контента {url}: {e}")
+    async def _fetch_page_content(self, url: str, category: str = None) -> Optional[Union[ParseResult, List[ParseResult]]]:
+        """Лестница загрузки: одна проверка пригодности после каждой ступени."""
+        if not self._is_allowed_url(url, base_url=url):
             return None
+        if category == 'product' and self.url_categorizer.is_print_version(url, category):
+            return None
+        if self.profile is not None and self.host_throttle is not None:
+            await self.host_throttle.acquire(urlparse(url).netloc.lower(),
+                                             self.profile.crawl.load.page_delay_ms)
 
-    async def _fetch_with_playwright(self, url: str) -> tuple[Optional[str], bool, Optional[str]]:
+        force_browser = self.profile is not None and self.profile.crawl.render == 'browser'
+        profile_antibot = self.profile.crawl.antibot if self.profile is not None else 'none'
+        host = urlparse(url).netloc.lower()
+        ajax_required = category == 'product' and (
+            (self.profile is not None and self.profile.crawl.ajax_tabs)
+            or any(host == domain or host.endswith('.' + domain)
+                   for domain in (getattr(self.config, 'ajax_product_tabs_domains', []) or [])))
+        dynamic_contacts = category in ('contacts', 'distributor') and self.config.dynamic_content_enabled
+        if ajax_required:
+            # Без интерактивного результата профиль не разрешает принять исходный DOM.
+            stages = deque(['ajax_tabs'])
+        elif force_browser or (dynamic_contacts and self.profile is not None
+                               and self.profile.crawl.contact_ready_selector):
+            stages = deque(['dynamic' if dynamic_contacts else 'playwright'])
+        elif dynamic_contacts:
+            stages = deque(['http_first', 'dynamic', 'aiohttp'] if profile_antibot in ('impersonate', 'warmup')
+                           else ['dynamic', 'http_first', 'aiohttp'])
+        else:
+            stages = deque(['http_first', 'aiohttp', 'playwright'])
+
+        while stages:
+            if self._host_paused(url):
+                break  # 429/503 закрывает все следующие ступени этой попытки.
+            method = stages.popleft()
+            try:
+                if method == 'http_first':
+                    content = await self._http_first_get(url, expect_product=category == 'product',
+                                                         check_content=False)
+                elif method == 'aiohttp':
+                    content = await self._fetch_with_aiohttp(url)
+                elif method == 'ajax_tabs':
+                    extractor = self._make_dynamic_extractor()
+                    extractor.product_tabs_only = not ajax_required
+                    content = await extractor.extract_product_tabs_merged(url)
+                elif method == 'dynamic':
+                    extractor = self._make_dynamic_extractor()
+                    content = await extractor.extract(url)
+                    if getattr(extractor, 'incomplete_render', False):
+                        return None  # Статический GET не заменяет незагруженную панель контактов.
+                else:
+                    result = await self._fetch_with_playwright(url)
+                    content = None
+                    if result is not None:
+                        html, permanent, final_url = result
+                        if html and not permanent:
+                            content = html if isinstance(html, PageContent) else PageContent(
+                                html, url, final_url or url, method=method)
+                if self._host_paused(url):
+                    break
+                if not content:
+                    continue
+
+                parsed_pages = []
+                for html in content if isinstance(content, list) else [content]:
+                    parsed = await self._parse_content(html, url)
+                    if parsed is None:
+                        continue
+                    # Длинный текст и JSON-LD не доказывают загрузку отдельной панели.
+                    pending_tabs = (category in ('product', 'category')
+                                    and has_unloaded_product_tabs(parsed.html))
+                    if pending_tabs:
+                        observe_fetch(url, method, reason='incomplete_render')
+                        log.info(f"Лестница: {method} -> незагруженные товарные вкладки: {url}")
+                        if method != 'ajax_tabs':
+                            # Повторный обычный GET не раскроет уже обнаруженную вкладку.
+                            stages = deque(['ajax_tabs'])
+                        continue
+                    if category == 'product':
+                        usable = self._usable_product_content(
+                            parsed, rendered=method not in ('http_first', 'aiohttp'))
+                    else:
+                        usable = not needs_javascript(parsed.html) and not is_unrendered_store_listing(parsed.html)
+                    if not usable:
+                        observe_fetch(url, method, reason='incomplete_render')
+                        log.info(f"Лестница: {method} -> неполное содержимое: {url}")
+                        continue
+                    parsed.fetch_method = method
+                    if parsed.url != url:
+                        parsed.redirected_from = url
+                        self._log_effective_url(url, parsed.url)
+                    parsed_pages.append(parsed)
+                if parsed_pages:
+                    self._census_fetch(url, category, method)
+                    log.debug(f"Лестница: принят результат {method}: {url}")
+                    return parsed_pages if isinstance(content, list) else parsed_pages[0]
+            except Exception as exc:
+                # Отмена общего дедлайна и внешняя отмена (CancelledError) проходят наружу.
+                observe_fetch(url, method, error=exc)
+                log.warning(f"Лестница: отказ {method}, следующая ступень для {url}: {exc}")
+        if self.metrics_collector is not None:
+            self.metrics_collector.record_fetch_fail(url, category)
+        return None
+
+    async def _fetch_with_playwright(self, url: str) -> tuple[Optional[PageContent], bool, Optional[str]]:
         """
         Специализированная загрузка продуктовых страниц с полной обработкой динамического контента
 
         Returns:
             Tuple[Optional[str], bool, Optional[str]]: (содержимое страницы, была ли перманентная ошибка, финальный URL после редиректа)
         """
+        if not self._is_allowed_url(url, base_url=url):
+            return None, False, None
+        if self._host_paused(url):
+            return None, False, None
         normalized_url = self.url_normalizer.normalize_url(url)
 
         async with self._errors_cache_lock:
-            if normalized_url in self.permanent_errors_cache:
+            if self._negative_cache_key(url, 'playwright') in self.permanent_errors_cache:
+                observe_fetch(url, 'playwright', status=self._negative_cache_status.get(self._negative_cache_key(url, 'playwright')))
                 log.debug(f"Пропускаем URL из кэша ошибок: {url}")
                 return None, True, None
 
         context = await self.browser_pool.get_browser()
         page = None
+        cleanup_guard = None
+        state = {}
         try:
             page = await context.new_page()
+            state = _track_document_response(page)
+            cleanup_guard = await self._guard_browser_page(page, url, navigation_state=state)
             # ИЗМЕНЕНО: убрали set_default_timeout(6000), таймауты теперь явные
 
             log.info(f"Загружаем продуктовую страницу с улучшенной обработкой: {normalized_url}")
 
             # ИЗМЕНЕНО: увеличен таймаут до 20 сек, wait_until='domcontentloaded'
             response = await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+            state['response'] = response
+            if response is not None and response.status != 200:
+                observe_fetch(url, 'playwright', status=response.status, final_url=page.url, headers=getattr(response, 'headers', {}))
+            if not self._is_allowed_url(page.url, base_url=url):
+                observe_fetch(url, 'playwright', final_url=page.url, reason='out_of_scope')
+                return None, False, None
             if page.is_closed():
                 log.debug(f"Страница закрыта после goto для {url}")
                 return None, False, None
@@ -5291,35 +6042,49 @@ class WebCrawler:
             except Exception:
                 pass  # нормально, не блокируем
 
-            await self._accept_cookie_consent(page)
-            await self._scroll_page(page)
-
             if response is not None and response.status in PERMANENT_ERRORS:
                 log.warning(f"Playwright: Перманентная ошибка {response.status} для {url}")
                 async with self._errors_cache_lock:
-                    self.permanent_errors_cache.add(normalized_url)
+                    self._record_fetch_status(url, 'playwright', response.status)
                 return None, True, None
 
-            final_url = page.url
-
+            if response is not None and response.status != 200:
+                return None, False, None
+            initial = _browser_content(await page.content(), url, page, state, 'playwright')
+            if page_error_reason(initial):
+                return None, False, None
+            await self._accept_cookie_consent(page)
+            await self._scroll_page(page)
             await self._wait_for_product_content(page)
             await self._wait_for_dynamic_links(page)
+            if not self._is_allowed_url(page.url, base_url=url):
+                observe_fetch(url, 'playwright', final_url=page.url, reason='out_of_scope')
+                return None, False, None
             content = await self._extract_dynamic_product_content(page)
 
+            final_url = page.url
+            if not self._is_allowed_url(final_url, base_url=url):
+                observe_fetch(url, 'playwright', final_url=final_url, reason='out_of_scope')
+                return None, False, None
+            content = _browser_content(content, url, page, state, 'playwright')
+            reason = page_error_reason(content)
+            if reason:
+                self._record_fetch_status(url, 'playwright', content.status if content.status != 200 else 0)
+                return None, content.status in PERMANENT_ERRORS, final_url
+            self._record_fetch_status(url, 'playwright', 200)
             log.info(f"Успешно обработана продуктовая страница через Playwright: {url}")
             return content, False, final_url
 
-        except PlaywrightTimeoutError:
+        except PlaywrightTimeoutError as e:
+            _observe_browser_failure(url, 'playwright', e, state, self._is_allowed_url)
             log.warning(f"Таймаут при обработке продуктовой страницы {url}")
             return None, False, None
         except Exception as e:
-            log.debug(f"Playwright не смог обработать продуктовую страницу {url}: {e}")
+            _observe_browser_failure(url, 'playwright', e, state, self._is_allowed_url)
+            log.debug(f"Playwright не смог обработать продуктовой страницы {url}: {e}")
             return None, False, None
         finally:
-            if page:
-                await self.browser_pool.close_page(page)
-            if context:
-                await self.browser_pool.return_browser(context)
+            await _release_browser_resources(self.browser_pool, context, page, cleanup_guard)
 
     async def _scroll_page(self, page, scroll_step=500, scroll_delay=0.1):
         try:
@@ -5383,21 +6148,11 @@ class WebCrawler:
                 '.select-mask'
             ]
         
-            # Ожидаем появления хотя бы одного ключевого элемента # ИЗМЕНЕНО: таймаут увеличен до 10 секунд
-            for selector in products_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=10000)
-                    log.debug(f"Найден ключевой элемент товара: {selector}")
-                    break
-                except PlaywrightTimeoutError:
-                    continue
-
-                except Exception as e:
-                    # Если страница закрыта, выходим
-                    if "closed" in str(e).lower():
-                        log.debug(f"Страница закрыта при ожидании селектора {selector}: {e}")
-                        return
-                    raise
+            # Любой подходящий элемент в одном общем окне ожидания.
+            try:
+                await page.wait_for_selector(', '.join(products_selectors), timeout=10000)
+            except PlaywrightTimeoutError:
+                pass
 
             # Дополнительное ожидание для AJAX-контента
             await page.wait_for_timeout(2000)
@@ -5445,17 +6200,11 @@ class WebCrawler:
                 '//*[contains(text(), "MB)")]',
             ]
             
-            for indicator in file_indicators:
-                try:
-                    await page.wait_for_selector(f"xpath={indicator}", timeout=3000)
-                    log.debug(f"Найден файловый индикатор: {indicator}")
-                except PlaywrightTimeoutError:
-                    continue
-                except Exception as e:
-                    if "closed" in str(e).lower():
-                        log.debug(f"Страница закрыта при ожидании индикатора {indicator}: {e}")
-                        return
-                        
+            try:
+                await page.wait_for_selector('xpath=' + ' | '.join(file_indicators), timeout=3000)
+            except PlaywrightTimeoutError:
+                pass
+
             # Дополнительное ожидание для AJAX-контента
             await page.wait_for_timeout(2000)
             if page.is_closed():
@@ -5512,6 +6261,103 @@ class WebCrawler:
     # ------------------------------------------------------------------ #
     #  HTTP-first слой: curl_cffi с браузерным TLS/HTTP2-отпечатком        #
     # ------------------------------------------------------------------ #
+    async def _curl_get_in_perimeter(self, session, url, headers, *, base_url):
+        """Проверяет каждый переход до запроса и адрес ответа до чтения тела."""
+        current = url
+        for _ in range(11):
+            if not self._is_allowed_url(current, base_url=base_url):
+                observe_fetch(url, 'curl', final_url=current, reason='out_of_scope')
+                return None
+            if self._host_paused(current):
+                observe_fetch(url, 'curl', final_url=current, reason='host_cooldown')
+                return None
+            response = await session.get(current, headers=headers, allow_redirects=False)
+            final = str(response.url)
+            if not self._is_allowed_url(final, base_url=base_url):
+                observe_fetch(url, 'curl', final_url=final, reason='out_of_scope')
+                return None
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get('Location') or response.headers.get('location')
+                if not location:
+                    observe_fetch(url, 'curl', status=response.status_code, final_url=final)
+                    return None
+                current = urljoin(final, location)
+                continue
+            return response
+        observe_fetch(url, 'curl', final_url=current, reason='http_error')
+        return None
+
+    async def _guard_browser_page(self, page, base_url, *, navigation_state=None):
+        """CDP проверяет каждый HTTP-переход; маршрут охраняет новые вкладки."""
+        context = page.context
+        sessions = {}
+        session_lock = asyncio.Lock()
+
+        async def attach(target):
+            async with session_lock:
+                if target in sessions:
+                    return
+                session = await context.new_cdp_session(target)
+                main_frame_id = None
+                if target is page and navigation_state is not None:
+                    tree = await session.send('Page.getFrameTree', {})
+                    main_frame_id = tree['frameTree']['frame']['id']
+
+                async def paused(event):
+                    request_id = event['requestId']
+                    main_document = main_frame_id is not None and event.get('frameId') == main_frame_id
+                    if self._is_allowed_url(event['request']['url'], base_url=base_url):
+                        if main_document:
+                            navigation_state.pop('blocked_url', None)
+                        await session.send('Fetch.continueRequest', {'requestId': request_id})
+                    else:
+                        if main_document:
+                            # requestfailed может сохранить исходный URL редиректа.
+                            # Пишем адрес до блокировки, в состояние этой страницы.
+                            navigation_state['blocked_url'] = event['request']['url']
+                        await session.send('Fetch.failRequest', {
+                            'requestId': request_id, 'errorReason': 'BlockedByClient'})
+
+                session.on('Fetch.requestPaused', paused)
+                await session.send('Fetch.enable', {'patterns': [
+                    {'resourceType': 'Document', 'requestStage': 'Request'}]})
+                sessions[target] = session
+
+        await attach(page)
+
+        async def guard(route):
+            request = route.request
+            if request.resource_type == 'document':
+                if not self._is_allowed_url(request.url, base_url=base_url):
+                    if navigation_state is not None and request.frame == page.main_frame:
+                        navigation_state['blocked_url'] = request.url
+                    await route.abort()
+                    return
+                # Маршрут срабатывает до первого запроса popup; CDP затем видит
+                # и редиректы, для которых Playwright повторно route не вызывает.
+                try:
+                    await attach(request.frame.page)
+                except Exception:
+                    await route.abort()
+                    return
+            await route.continue_()
+
+        await context.route('**/*', guard)
+
+        async def cleanup():
+            try:
+                await asyncio.wait_for(context.unroute('**/*', guard),
+                                       timeout=BrowserPool.CLOSE_TIMEOUT)
+            except Exception as e:
+                log.debug(f"Маршрут закрытого контекста не снят: {e}")
+            for session in list(sessions.values()):
+                try:
+                    await asyncio.wait_for(session.detach(), timeout=BrowserPool.CLOSE_TIMEOUT)
+                except Exception:
+                    pass  # Закрытая вкладка уже освободила свою CDP-сессию.
+
+        return cleanup
+
     async def _fetch_with_http_impersonate(
         self, url: str, *, session=None, proxy: Optional[str] = None
     ) -> Optional[HttpFetchResult]:
@@ -5523,12 +6369,14 @@ class WebCrawler:
         session — если передан, переиспользуем сессию (для cookie-warmup).
         Возвращает HttpFetchResult или None при сетевой ошибке.
         """
-        if not _CURL_CFFI_AVAILABLE:
+        if self._host_paused(url):
+            return None
+        if not self._is_allowed_url(url, base_url=url) or not _CURL_CFFI_AVAILABLE:
             return None
 
-        normalized_url = self.url_normalizer.normalize_url(url)
         async with self._errors_cache_lock:
-            if normalized_url in self.permanent_errors_cache:
+            if self._negative_cache_key(url, 'curl') in self.permanent_errors_cache:
+                observe_fetch(url, 'curl', status=self._negative_cache_status.get(self._negative_cache_key(url, 'curl')))
                 return HttpFetchResult(None, 0, {}, url, {}, from_cache_error=True)
 
         impersonate = getattr(self.config, 'impersonate_profile', 'chrome')
@@ -5545,21 +6393,25 @@ class WebCrawler:
                         kwargs["proxies"] = {"http": proxy, "https": proxy}
                     sess = _CurlAsyncSession(**kwargs)
                 try:
-                    resp = await sess.get(url, headers=IMPERSONATE_HEADERS, allow_redirects=True)
+                    resp = await self._curl_get_in_perimeter(sess, url, IMPERSONATE_HEADERS, base_url=url)
+                    if resp is None:
+                        return None
                     html = resp.text
+                    observe_fetch(url, 'curl', status=resp.status_code, final_url=str(resp.url), headers=resp.headers, html=html)
                     headers = {k.lower(): v for k, v in resp.headers.items()}
                     try:
                         cookies = {c.name: c.value for c in sess.cookies.jar}
                     except Exception:
                         cookies = {}
-                    if resp.status_code in PERMANENT_ERRORS:
-                        async with self._errors_cache_lock:
-                            self.permanent_errors_cache.add(normalized_url)
+                    if resp.status_code != 200 or not page_error_reason(html):
+                        self._record_fetch_status(url, 'curl', resp.status_code)
                     return HttpFetchResult(html, resp.status_code, headers, str(resp.url), cookies)
                 finally:
                     if own_session:
-                        await sess.close()
+                        async with async_deadline(5):
+                            await sess.close()
             except Exception as e:
+                observe_fetch(url, 'curl', error=e)
                 log.debug(f"curl_cffi не смог получить {url}: {e}")
                 return None
 
@@ -5593,7 +6445,12 @@ class WebCrawler:
     def _make_dynamic_extractor(self):
         """DynamicContentExtractor с пер-сайтовым селектором панели вкладки из профиля."""
         extra = self.profile.crawl.tab_panel_selector if self.profile is not None else None
-        return DynamicContentExtractor(self.browser_pool, self.config, extra_tab_panel_selector=extra)
+        return DynamicContentExtractor(self.browser_pool, self.config, extra_tab_panel_selector=extra,
+                                       guard_browser_page=self._guard_browser_page,
+                                       allowed_url=self._is_allowed_url,
+                                       accept_cookie_consent=self._accept_cookie_consent,
+                                       tab_selector=self.profile.crawl.tab_selector if self.profile else None,
+                                       ready_selector=self.profile.crawl.contact_ready_selector if self.profile else None)
 
     def _effective_http_timeout(self) -> int:
         """Таймаут HTTP-фетча: профиль сайта (crawl.load.fetch_timeout_s) -> config."""
@@ -5627,7 +6484,7 @@ class WebCrawler:
         cf_clearance/_abck/bm_sz), затем повторяем целевой URL той же сессией с Referer.
         Снимает часть Cloudflare/DDoS-Guard без запуска браузера. Прокси не требуется.
         """
-        if not _CURL_CFFI_AVAILABLE:
+        if not self._is_allowed_url(url, base_url=url) or not _CURL_CFFI_AVAILABLE:
             return None
         impersonate = getattr(self.config, 'impersonate_profile', 'chrome')
         verify = getattr(self.config, 'http_verify_tls', True)
@@ -5638,11 +6495,21 @@ class WebCrawler:
             sess = _CurlAsyncSession(impersonate=impersonate, verify=verify, timeout=timeout)
             try:
                 # 1) прогрев главной — собираем cookies в сессию
-                await sess.get(home, headers=IMPERSONATE_HEADERS, allow_redirects=True)
+                warmup = await self._curl_get_in_perimeter(sess, home, IMPERSONATE_HEADERS, base_url=url)
+                if warmup is None:
+                    return None
+                if warmup.status_code in (429, 503):
+                    observe_fetch(url, 'curl', status=warmup.status_code, final_url=str(warmup.url), headers=warmup.headers)
+                    return None
                 await asyncio.sleep(delay)
                 # 2) повтор цели в той же сессии
                 hdrs = {**IMPERSONATE_HEADERS, "Referer": home, "Sec-Fetch-Site": "same-origin"}
-                resp = await sess.get(url, headers=hdrs, allow_redirects=True)
+                resp = await self._curl_get_in_perimeter(sess, url, hdrs, base_url=url)
+                if resp is None:
+                    return None
+                observe_fetch(url, 'curl', status=resp.status_code, final_url=str(resp.url), headers=resp.headers, html=resp.text)
+                if resp.status_code != 200 or not page_error_reason(resp.text):
+                    self._record_fetch_status(url, 'curl', resp.status_code)
                 headers = {k.lower(): v for k, v in resp.headers.items()}
                 try:
                     cookies = {c.name: c.value for c in sess.cookies.jar}
@@ -5650,26 +6517,33 @@ class WebCrawler:
                     cookies = {}
                 return HttpFetchResult(resp.text, resp.status_code, headers, str(resp.url), cookies)
             except Exception as e:
+                observe_fetch(url, 'curl', error=e)
                 log.debug(f"warmup не удался для {url}: {e}")
                 return None
             finally:
-                await sess.close()
+                async with async_deadline(5):
+                    await sess.close()
 
     def _product_shell_min_text(self) -> int:
         """Порог гейта «оболочки» товарной страницы (0 = гейт выключен)."""
         return getattr(self.config, 'product_min_text', 1000)
 
-    async def _http_first_get(self, url: str, *, expect_product: bool = False) -> Optional[str]:
+    async def _http_first_get(self, url: str, *, expect_product: bool = False, check_content: bool = True) -> Optional[PageContent]:
         """
         Лестница эскалации на уровне HTTP (без Playwright):
           1) HTTP-impersonate -> 2) при challenge: cookie-warmup -> повтор.
-        Возвращает HTML (валидный 200 с контентом) либо None — тогда вызывающий
+        Возвращает PageContent (валидный 200 с адресом ответа) либо None — тогда вызывающий
         эскалирует к Playwright.
         """
+        if not self._is_allowed_url(url, base_url=url):
+            return None
         if not (getattr(self.config, 'http_first_enabled', True) and _CURL_CFFI_AVAILABLE):
             return None
         res = await self._fetch_with_http_impersonate(url)
         if res is None or res.from_cache_error:
+            return None
+        observe_fetch(url, 'curl', status=res.status, final_url=res.final_url, headers=res.headers, html=res.html)
+        if res.status in (429, 503):
             return None
         # Антибот-челлендж -> прогрев и повтор. Профиль antibot=warmup: прогреваем
         # агрессивнее — при любом не-200 (не только по маркерам челленджа).
@@ -5687,6 +6561,14 @@ class WebCrawler:
                 res = warm
         if res.status != 200 or not res.html:
             return None
+        if not self._is_allowed_final_url(url, res.final_url):
+            return None
+        content = PageContent(res.html, url, res.final_url, res.status, res.headers, 'http_first')
+        if page_error_reason(content):
+            return None
+        # Общая лестница проверяет содержимое после разбора, включая AJAX-вкладки.
+        if not check_content:
+            return content
         # Tilda store-ЛИСТИНГ с JS-плитками: статический HTML не содержит ссылок на
         # товары (рендерятся браузером). HTTP-first бесполезен — форсим Playwright,
         # иначе целый раздел каталога теряется (D96). Проверка до needs_javascript и
@@ -5696,8 +6578,8 @@ class WebCrawler:
         # Товарная страница-«оболочка»: разметка есть, видимого текста почти нет — контент
         # дорисовывает JS. needs_javascript такое пропускает (ему нужен ещё признак SPA),
         # поэтому HTTP-first отдавал страницу без товара и LLM отвергал её как Trash_418#.
-        # Отдаём None -> лестница идёт на aiohttp/Playwright; если и там пусто, вызывающий
-        # код всё равно сохранит то, что получил (поведение fail-open не меняется).
+        # Отдаём None -> лестница идёт на aiohttp/Playwright. Неотрендеренная
+        # оболочка не сохраняется как успешная товарная страница.
         min_text = self._product_shell_min_text()
         if expect_product and min_text and looks_like_product_shell(res.html, min_text=min_text):
             log.debug(f"HTTP-first: товарная страница похожа на оболочку, эскалируем в браузер: {url}")
@@ -5707,59 +6589,113 @@ class WebCrawler:
         if len(res.html) >= min_content and not needs_javascript(
             res.html, text_threshold=getattr(self.config, 'js_render_text_threshold', 300)
         ):
-            # Проверка редиректа на неэквивалентный домен
-            if res.final_url and res.final_url != url:
-                if not self.url_categorizer.is_main_domain(res.final_url, self.current_base_url):
-                    return None
-            return res.html
+            return content
         # Контент есть, но похоже нужен JS — если есть товарный остров, всё равно отдаём
         if res.html and has_product_island(res.html):
-            return res.html
+            return content
         return None
 
-    async def _fetch_with_aiohttp(self, url: str) -> Optional[str]:
-        """Получение контента через aiohttp с использованием семафора"""
-        normalized_url = self.url_normalizer.normalize_url(url)
-
-        # Проверяем кэш ошибок
+    async def _fetch_with_aiohttp(self, url: str) -> Optional[PageContent]:
+        """Получение контента с проверкой каждого HTTP-перехода."""
+        if self._host_paused(url):
+            return None
+        if not self._is_allowed_url(url, base_url=url):
+            return None
         async with self._urls_lock:
-            if normalized_url in self.permanent_errors_cache:
-                log.debug(f"Пропускаем URL из кэша ошибок: {url}")
+            if self._negative_cache_key(url, 'aiohttp') in self.permanent_errors_cache:
+                observe_fetch(url, 'aiohttp', status=self._negative_cache_status.get(self._negative_cache_key(url, 'aiohttp')))
                 return None
-        
         async with self.aiohttp_semaphore:
             try:
-                # КОННЕКТОР С ОТКЛЮЧЕННОЙ ПРОВЕРКОЙ SSL (удалить connector=connector из aiohttp.ClientSession(connector=connector) as session)
                 connector = aiohttp.TCPConnector(ssl=False)
                 async with aiohttp.ClientSession(connector=connector) as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=self._effective_http_timeout())) as response:
-                        if response.status == 200:
-                            content = await response.text()
-                            log.debug(f"Успешно получен контент через aiohttp: {url}")
-                            return content
-                        
-                        elif response.status in PERMANENT_ERRORS:
-                            log.warning(f"Перманентная ошибка {response.status} для {url}")
-                            self.permanent_errors_cache.add(normalized_url)
-                            return None
-                        
-                        else:
-                            log.debug(f"aiohttp: статус {response.status} для {url}")
-                            return None
-                        
+                    return await self._aiohttp_get_in_perimeter(session, url, base_url=url)
             except Exception as e:
+                observe_fetch(url, 'aiohttp', error=e)
                 log.debug(f"aiohttp не смог получить {url}: {e}")
                 return None
 
-    async def _parse_content(self, html: str, url: str) -> ParseResult:
+    async def _aiohttp_get_in_perimeter(self, session, url, *, base_url, json_response=False):
+        """Автопереходы отключены: тело читается только после проверки адреса."""
+        current = url
+        for _ in range(11):
+            if not self._is_allowed_url(current, base_url=base_url):
+                if not json_response:
+                    observe_fetch(url, 'aiohttp', final_url=current, reason='out_of_scope')
+                return None
+            if not json_response and self._host_paused(current):
+                observe_fetch(url, 'aiohttp', final_url=current, reason='host_cooldown')
+                return None
+            async with session.get(
+                current, allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=20 if json_response else self._effective_http_timeout()),
+                headers={'X-Requested-With': 'XMLHttpRequest'} if json_response else None,
+            ) as response:
+                final = str(response.url)
+                if not self._is_allowed_url(final, base_url=base_url):
+                    if not json_response:
+                        observe_fetch(url, 'aiohttp', final_url=final, reason='out_of_scope')
+                    return None
+                if response.status in (301, 302, 303, 307, 308):
+                    location = response.headers.get('Location') or response.headers.get('location')
+                    if not location:
+                        if not json_response:
+                            observe_fetch(url, 'aiohttp', status=response.status, final_url=final)
+                        return None
+                    current = urljoin(final, location)
+                    continue
+                if not json_response and response.status != 200:
+                    observe_fetch(url, 'aiohttp', status=response.status, final_url=final, headers=response.headers)
+                if response.status != 200:
+                    if response.status in PERMANENT_ERRORS and not json_response:
+                        self._record_fetch_status(url, 'aiohttp', response.status)
+                    return None
+                if json_response:
+                    data = await response.json(content_type=None)
+                    return data if isinstance(data, dict) else None
+                content = PageContent(await response.text(), url, final, response.status,
+                                      dict(response.headers), 'aiohttp')
+                observe_fetch(url, 'aiohttp', status=response.status, final_url=final, headers=response.headers, html=content)
+                if page_error_reason(content):
+                    return None
+                self._record_fetch_status(url, 'aiohttp', 200)
+                return content
+        if not json_response:
+            observe_fetch(url, 'aiohttp', final_url=current, reason='http_error')
+        return None
+
+    async def _parse_content(self, html: str, url: str) -> Optional[ParseResult]:
         """Парсинг контента страницы с учетом canonical URL"""
+        reason = page_error_reason(html)
+        if reason:
+            observe_fetch(url, getattr(html, 'method', 'page'), status=getattr(html, 'status', 200),
+                          final_url=getattr(html, 'final_url', url), html=html)
+            log.warning(f"Страница отклонена до разбора: {url}: {reason}")
+            return None
         try:
+            requested_url = getattr(html, 'requested_url', url)
+            url = getattr(html, 'final_url', url)
+            if not self._is_allowed_final_url(requested_url, url):
+                raise ValueError(f"Редирект вне периметра: {requested_url} -> {url}")
+            if getattr(html, 'status', 200) == 200:
+                self._record_fetch_status(requested_url, getattr(html, 'method', 'page'), 200)
+                self._record_fetch_status(url, getattr(html, 'method', 'page'), 200)
             # D82: для Bitrix-шаблона betar.ru дотягиваем блок «Исполнение и цена» (AJAX
             # product_offers.php) и вклеиваем таблицу исполнений в HTML — до конвертации в
             # markdown и до сохранения cleaned-HTML (сохраняется именно parse_result.html).
             # No-op для всех прочих доменов/страниц (гейт внутри метода).
             html = await self._enrich_bitrix_offers(html, url)
 
+            if product_state_key(requested_url):
+                requested = urlparse(requested_url)
+                final = urlparse(url)
+                if not final.fragment and final.path.rstrip('/') == requested.path.rstrip('/'):
+                    url = urlunparse(final._replace(fragment=requested.fragment))
+                selected = isolate_product_state(html, url)
+                if product_state_key(url) != product_state_key(requested_url) or selected is None:
+                    observe_fetch(requested_url, getattr(html, 'method', 'page'), reason='incomplete_render')
+                    return None
+                html = selected
             soup = BeautifulSoup(html, 'html.parser')
             
             canonical_url = self.url_normalizer.extract_canonical_url(soup, url)            
@@ -5781,7 +6717,10 @@ class WebCrawler:
                 html=html,
                 additional_links=additional_links,
                 content_type=content_type,
-                elements_found=elements_found
+                elements_found=elements_found,
+                url=url,
+                requested_url=requested_url,
+                canonical_url=canonical_url
             )
             
         except Exception as e:
@@ -5828,24 +6767,16 @@ class WebCrawler:
             return html
 
     async def _fetch_offers_json(self, page_url: str, section_id: str) -> Optional[dict]:
-        """GET /local/ajax/product_offers.php?section_id=N&lang=ru → dict {section, offers, filter}.
-        Отдельный лёгкий запрос (не через _fetch_with_aiohttp): нужен сырой JSON того же домена
-        с сохранением query-параметров; ssl=False — у betar.ru просроченный самоподписанный cert."""
+        """Дотягивает JSON исполнений, соблюдая периметр страницы на каждом переходе."""
         p = urlparse(page_url)
         endpoint = f"{p.scheme}://{p.netloc}/local/ajax/product_offers.php?section_id={section_id}&lang=ru"
+        if not self._is_allowed_url(endpoint, base_url=page_url):
+            return None
         try:
             connector = aiohttp.TCPConnector(ssl=False)
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(
-                    endpoint,
-                    timeout=aiohttp.ClientTimeout(total=20),
-                    headers={'X-Requested-With': 'XMLHttpRequest'},
-                ) as response:
-                    if response.status != 200:
-                        log.debug(f"product_offers.php статус {response.status} (section_id={section_id})")
-                        return None
-                    data = await response.json(content_type=None)
-                    return data if isinstance(data, dict) else None
+                return await self._aiohttp_get_in_perimeter(
+                    session, endpoint, base_url=page_url, json_response=True)
         except Exception as e:
             log.debug(f"product_offers.php не получен (section_id={section_id}): {e}")
             return None
@@ -5963,6 +6894,7 @@ class WebCrawler:
         links = []
         
         try:
+            link_base = document_base_url(soup, current_url)
             current_parsed = urlparse(current_url)
             current_scheme = current_parsed.scheme
 
@@ -5985,7 +6917,7 @@ class WebCrawler:
             if not self._flat_site_observed:
                 self._flat_site_observed = True
                 self.url_categorizer.observe_urls(
-                    urljoin(current_url, sanitize_href(raw)) for _el, raw, _is_a in link_sources)
+                    urljoin(link_base, sanitize_href(raw)) for _el, raw, _is_a in link_sources)
 
             # Извлекаем все ссылки со страницы
             for link, raw_href, is_anchor in link_sources:
@@ -6000,10 +6932,11 @@ class WebCrawler:
                     self.metrics_collector.record_mangled_href(kind)
                 if self.metrics_collector is not None and is_anchor:
                     self.metrics_collector.record_href_seen()
-                if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
+                if (not href or href.startswith(('javascript:', 'mailto:', 'tel:'))
+                        or (href.startswith('#') and not product_state_key(urljoin(link_base, href)))):
                     continue
 
-                full_url = urljoin(current_url, href)
+                full_url = urljoin(link_base, href)
 
                 # Нормализуем URL с сохранением протокола текущей страницы
                 normalized_url = self.url_normalizer.normalize_url(full_url)
@@ -6040,6 +6973,9 @@ class WebCrawler:
                 # Добавляем в список
                 links.append((full_url, category, priority))
             
+            links.extend((address, 'product', self.url_categorizer.priority_levels['product'])
+                         for address in tilda_product_links(soup, current_url) + inline_product_links(soup, current_url))
+
             # Извлекаем товарные ссылки из сеток
             product_links = self.product_grid_parser.extract_product_links(soup, current_url, current_url)
             links.extend(product_links)
@@ -6068,12 +7004,10 @@ class WebCrawler:
 
         all_links = parse_result.additional_links
         filtered_links = []
-        parsed_base = urlparse(base_url)
         # Используем базовый домен для проверки
         base_domain_for_check = base_url
         # P05 U3 п.6: отброшенные гейтом периметра хосты — разрезом, а не общим счётчиком
         skipped_hosts = {}
-        skipped_examples = {}   # хост -> пример адреса (нужен схеме пробы автодетекта)
 
         for link_url, category, priority in all_links:
             if category == 'product' and self.url_categorizer.is_print_version(link_url, category):
@@ -6086,32 +7020,22 @@ class WebCrawler:
                 log.debug(f"Ссылка приведена к рабочей базе: {link_url} -> {canonical_link}")
                 link_url = canonical_link
             try:
-                # Проверяем основной домен (фильтруем поддомены и неэквивалентные)
-                if self.config.ignore_subdomains:
-                    if not (self._in_crawl_perimeter(link_url, base_domain_for_check)
-                            or self._maybe_allow_subdomain(link_url, category, depth,
-                                                           base_domain_for_check)):
-                        if self.config.log_skipped_subdomains:
-                            log.info(f"Пропускаем неэквивалентный домен: {link_url} (основной: {base_domain_for_check})")
-                        host = self._url_host(link_url)
-                        skipped_hosts[host] = skipped_hosts.get(host, 0) + 1
-                        skipped_examples.setdefault(host, link_url)
-                        self._skipped_link_hosts[host] = self._skipped_link_hosts.get(host, 0) + 1
-                        async with self._stats_lock:
-                            self.stats['skipped_subdomains'] += 1
-                        continue
-                else:
-                    # Старая логика – точное совпадение доменов
-                    parsed_link = urlparse(link_url)
-                    if parsed_link.netloc != parsed_base.netloc:
-                        continue
+                # Одна политика независимо от старого переключателя ignore_subdomains.
+                if not self._in_crawl_perimeter(link_url, base_domain_for_check):
+                    if self.config.log_skipped_subdomains:
+                        log.info(f"Пропускаем домен вне профиля: {link_url} (основной: {base_domain_for_check})")
+                    host = self._url_host(link_url)
+                    skipped_hosts[host] = skipped_hosts.get(host, 0) + 1
+                    self._skipped_link_hosts[host] = self._skipped_link_hosts.get(host, 0) + 1
+                    async with self._stats_lock:
+                        self.stats['skipped_subdomains'] += 1
+                    continue
 
                 normalized_url = self.url_normalizer.normalize_url(link_url)
                 if normalized_url in self.visited_urls:
                     continue
 
-                link_depth = self.url_categorizer.calculate_url_depth(link_url)
-                if category != 'product' and link_depth > 4:
+                if self._queue_url_rejection(link_url, depth + 1, category, base_url):
                     continue
 
                 filtered_links.append((link_url, category, priority))
@@ -6119,14 +7043,6 @@ class WebCrawler:
             except Exception as e:
                 log.debug(f"Ошибка фильтрации ссылки {link_url}: {e}")
                 continue
-
-        # P05 U3 пп.3,5: автодетект зеркала на внешнем хосте (за флагом, по умолчанию
-        # выключен). Если хост разрешён, ссылки на него уже отброшены этим проходом —
-        # перебираем список заново (флаг _mirror_autodetect_done исключает повтор).
-        if await self._maybe_autodetect_mirror_host(
-                parse_result, depth, skipped_hosts, skipped_examples,
-                sum(1 for _u, cat, _p in filtered_links if cat == 'product')):
-            return await self._extract_links(url, parse_result, depth, base_url)
 
         if self.metrics_collector is not None:
             # P05 U2: счётчики периметра (реализованы полосой C, вызов — здесь)
@@ -6146,19 +7062,13 @@ class WebCrawler:
 
     def _should_add_to_queue(self, url: str, depth: int) -> bool:
         """Проверка, нужно ли добавлять URL в очередь"""
-        if depth > self.max_depth:
-            return False
-            
-        normalized_url = self.url_normalizer.normalize_url(url)
-        if normalized_url in self.visited_urls:
-            return False
-            
         category, _ = self.url_categorizer.categorize_url(url)
-        url_depth = self.url_categorizer.calculate_url_depth(url)
-        
-        # Для не-товарных страниц ограничиваем глубину
-        if category != 'product' and url_depth > 2:
-            self._count_queue_gate_rejection('глубина не-товарной страницы')
+        reason = self._queue_url_rejection(url, depth, category)
+        if reason:
+            self._count_queue_gate_rejection(reason)
+            return False
+        normalized_url = self.url_normalizer.normalize_url(url)
+        if normalized_url in self.visited_urls or normalized_url in self.processed_urls:
             return False
 
         # Для товарных страниц ограничиваем количеством (P04 U4 п.2: плюс резерв под карточки)
@@ -6167,6 +7077,7 @@ class WebCrawler:
             if reason:
                 self._count_queue_gate_rejection(reason)
                 self._quota_rejected_urls.append(url)
+                self._quota_rejected_depths.setdefault(url, depth)
                 return False
 
         return True
@@ -6259,9 +7170,16 @@ class WebCrawler:
             log.info(f"Пропускаем сохранение страницы {url}: размер контента менее 800 символов")
             return None
 
+        requested_url = parse_result.requested_url or url
+        url = parse_result.url or url
+        normalized_url = self.url_normalizer.normalize_url(url)
+
         # Подготовка метаданных
         metadata = {
             'url': url,
+            'requested_url': requested_url,
+            'canonical_url': parse_result.canonical_url,
+            'fetch_method': parse_result.fetch_method,
             'normalized_url': normalized_url,
             'category': category,
             'content_type': parse_result.content_type,
@@ -6279,6 +7197,11 @@ class WebCrawler:
         file_path, is_new, storage_metadata = await self.temp_storage.save_cleaned_html(
             url, normalized_url, html, company_name, metadata, category
         )
+
+        if file_path:
+            self._usable_page_urls.add(self.url_normalizer.normalize_url(requested_url))
+        else:
+            self._record_page_failure(requested_url, 'storage_error', processing=True)
 
         if category == 'contacts':
             # Дополнительно сохраняем как дистрибьютора, если нужно

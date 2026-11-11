@@ -66,7 +66,7 @@ class Config:
     
     # Graph DB API настройки
     graph_db_api_url: str = "https://stroy-resurs-db.bravo-soft.ru/api/companies"
-    graph_db_enable: bool = False
+    graph_db_enable: bool = True
     graph_db_max_retries: int = 3
     graph_db_request_timeout: int = 600
     graph_db_chunk_size_products: int = 5 
@@ -105,8 +105,8 @@ class Config:
     exclude_product_cards_rtf = True
         
     # Настройки краулера
-    max_pages_per_site: int = 250  # общий лимит страниц/сайт для диагностического прогона (Анализ системы/Краулер.md §7)
-    max_product_pages_per_site: int = 50  # верхняя граница продуктовых страниц/сайт; лимит учитывается при постановке URL в очередь (Краулер.md §4,§7)
+    max_pages_per_site: int = 1000  # общий лимит страниц/сайт для диагностического прогона (Анализ системы/Краулер.md §7)
+    max_product_pages_per_site: int = 900  # верхняя граница продуктовых страниц/сайт; лимит учитывается при постановке URL в очередь (Краулер.md §4,§7)
     max_depth: int = 6  
     request_delay: float = 0.3  
     max_pagination_depth: int = 40  
@@ -154,6 +154,7 @@ class Config:
     impersonate_profile: str = "chrome"      # TLS/HTTP2-отпечаток curl_cffi
     http_verify_tls: bool = True             # проверка TLS-сертификата в HTTP-first
     http_timeout: int = 30                   # таймаут HTTP-first запроса, сек
+    page_fetch_timeout: float = 60.0        # общий бюджет загрузки/рендера страницы, сек
     warmup_delay_seconds: float = 1.0        # пауза между прогревом главной и повтором цели
     http_min_content: int = 800              # минимум символов HTML, чтобы счесть HTTP-ответ достаточным
     js_render_text_threshold: int = 300      # порог текста для needs_javascript
@@ -172,18 +173,24 @@ class Config:
     # Настройки карты сайта
     sitemap_discovery_enabled = True
     sitemap_timeout_seconds = 10
-    sitemap_max_urls = 500
+    sitemap_max_urls = 1000
     sitemap_max_depth = 6
     sitemap_retry_attempts = 1
     sitemap_retry_delay = 2
-    sitemap_initial_batch_size: int = 500
-    sitemap_processing_batch_size: int = 500
-    # D144/D208: сколько <url> карты сайта категоризуется перед ранжированием и кэпом
-    # sitemap_max_urls. Кэп теперь применяется ПОСЛЕ категоризации, а не в порядке
-    # документа, поэтому разбирать приходится больше адресов; потолок нужен, чтобы карта
-    # на десятки тысяч записей не съела 30-секундный таймаут фазы карты. Консервативно
-    # выше любой карты корпуса прогона 2082 (максимум — 10 498 <loc> у kpp33.ru).
+    # Размеры порций очереди; остаток сохраняется для пополнения до общей квоты.
+    sitemap_initial_batch_size: int = 1000
+    sitemap_processing_batch_size: int = 1000
+    # Технический потолок чтения записей одной карты (XML/HTML/text).
+    # Товарная квота применяется после объединения и категоризации всех карт;
+    # этот предел защищает время и память при обработке огромного документа.
+    # Консервативно выше любой карты корпуса прогона 2082 (максимум — 10 498 <loc> у kpp33.ru).
     sitemap_max_scan_urls: int = 20000
+    # Технические бюджеты: 128 запросов достаточно для стандартных путей и десятков
+    # подкарт; 4 соединения ограничивают нагрузку. 8/32 МиБ ограничивают gzip и XML.
+    sitemap_max_requests: int = 128
+    sitemap_http_concurrency: int = 4
+    sitemap_max_compressed_bytes: int = 8 * 1024 * 1024
+    sitemap_max_decompressed_bytes: int = 32 * 1024 * 1024
     # P02 U1: потолок переиспользования слота товарной квоты за компанию. Слот теперь
     # возвращается на путях неуспеха товарной страницы (нет содержимого, HTML < 300
     # символов, 404/410); без потолка сайт со сплошными отказами крутил бы квоту, пока
@@ -194,7 +201,8 @@ class Config:
     # Выше порога soft-404 (stale_sitemap_dup_threshold = 10): жёсткий отказ бывает и от
     # таймаутов медленного сайта, и ложное срабатывание здесь дороже пропущенного.
     stale_sitemap_hard_fail_threshold: int = 15
-    # D154: сколько подкарт индекса разбирать. 0 = все (прежний жёсткий срез [:5]
+    # D154: сколько подкарт индекса разбирать. 0 = все в техническом бюджете
+    # sitemap_max_requests (прежний жёсткий срез [:5]
     # отрезал товарные инфоблоки Bitrix, которые нумеруются последними). При ненулевом
     # значении первыми берутся карты с product/catalog/shop/iblock в имени.
     sitemap_max_submaps: int = 0
@@ -206,7 +214,7 @@ class Config:
     # Настройки для обработки динамических страниц
     dynamic_content_enabled: bool = True
     dynamic_tab_selectors: list = field(default_factory=lambda: [
-        "button", "[role='tab']", ".tab", ".tabs__item", ".tabs-item",
+        "[role='tab']", ".tab", ".tabs__item", ".tabs-item",
         ".contacts__tabs-item", ".city-tab"
     ])
     dynamic_accordion_selectors: list = field(default_factory=lambda: [
@@ -215,30 +223,10 @@ class Config:
     ])
     dynamic_click_delay_ms: int = 400
     dynamic_save_tabs_separately: bool = True
-    # D01: домены, у которых ТОВАРНЫЕ страницы держат характеристики в AJAX-вкладках
-    # (контент вкладки подгружается по клику и отсутствует в первичном DOM).
-    # Для них товарная страница рендерится браузером с кликами по вкладкам, контент
-    # вкладок СКЛЕИВАЕТСЯ в один HTML (не отдельными #tab-страницами — иначе дедуп
-    # по имени товара теряет характеристики, регресс РУФ-135 попытки №1).
-    ajax_product_tabs_domains: list = field(default_factory=lambda: [
-        'tizol.com',     # МБОР: вкладка «Характеристики» (D01)
-        # cooltech.ru НЕ добавлять: его вкладки лежат скрытыми в DOM (не AJAX),
-        # а «Размеры» = чертёж с легендой A–G, которую адаптер D22 убирает намеренно
-    ])
-    # D82: домены на Bitrix-шаблоне, где блок «Исполнение и цена» (типоразмеры/фасеты/цена
-    # конкретного изделия) рендерится AngularJS отдельным AJAX-запросом product_offers.php и
-    # в статическом HTML пуст (тег <product-container product-container="N">). Для таких доменов
-    # краулер дотягивает /local/ajax/product_offers.php?section_id=N&lang=ru и вклеивает таблицу
-    # исполнений в HTML до конвертации в markdown — иначе страница теряет типоразмеры и отсеивается
-    # гейтом ≥3 числовых характеристик (betar.ru: 9 товаров -> Trash_418#, variants пусты).
-    bitrix_offers_domains: list = field(default_factory=lambda: [
-        'betar.ru',
-    ])
     # Селекторы панели с контентом активной вкладки (для склейки)
     dynamic_tab_panel_selectors: list = field(default_factory=lambda: [
         "[role='tabpanel']", ".tab-content", ".tabs-content", ".tab-pane",
         ".tabs__content", ".tab__content", ".tab-body",
-        ".product-page__section-content",  # tizol.com (Vue): панель активной вкладки товара
     ])
 
     # Настройки фильтрации печатных версий
@@ -308,58 +296,18 @@ class Config:
     max_concurrent_file_downloads: int = 5
 
     # Настройки домена
-    ignore_subdomains: bool = True  # Игнорировать поддомены (включая www)
+    ignore_subdomains: bool = True  # Совместимость классификатора; разрешения обхода задаёт профиль
     domain_strict_www: bool = True  # Считать www.example.com и example.com одним доменом
     log_skipped_subdomains: bool = False  # Логировать пропущенные поддомены
     treat_http_https_as_same: bool = True  # Считать http и https одним сайтом
     domain_equivalency_enabled: bool = True  # Включить распознавание эквивалентных доменов
     prefer_https: bool = True  # Предпочитать https при выборе схемы
 
-    equivalent_domains: dict = field(default_factory=lambda: {
-        "vmp-holding.ru": ["vmp-anticor.ru", "vmp-plamcor.ru", "vmp-goodline.ru"]
-    })
-
-    # P05 U3: периметр обхода шире одного хоста компании (D124, D131, D224, D201).
-    # Поддомен ТОГО ЖЕ корневого домена (flowsolutions.plasson.com, isospan.gexa.ru)
-    # разрешается, если ссылка стоит в навигации главной либо URL каталожный/товарный.
-    # Разрешённый хост наследует бюджет страниц компании; 0 = прежнее поведение.
+    # Старые настройки сохранены для совместимости конфигурации. Автоматическое
+    # разрешение поддоменов и зеркал отключено: дополнительные хосты задаёт профиль.
     max_allowed_subdomains: int = 2
-    # Автодетект «этот внешний хост отдаёт тот же сайт» (зеркало на техдомене хостера,
-    # D124). Риск ошибочно разрешённого чужого сайта (D114/D167) высок, поэтому по
-    # умолчанию ВЫКЛЮЧЕН: основной путь — декларативный crawl.equivalent_domains профиля.
     foreign_host_autodetect: bool = False
-    foreign_host_min_links: int = 5   # ссылок главной на один внешний хост для автодетекта
-
-    # D69: пер-доменное исключение разделов URL (скоуплено ПО ДОМЕНУ, не глобально).
-    # Ключ — домен (netloc без www), значение — подстроки пути, которые для ЭТОГО домена не
-    # краулятся. У pspcom.ru раздел /catalog/build/ — девелоперское направление (жилые
-    # микрорайоны/посёлки: «Микрорайон Гагарина» с таблицей «технико-экономических показателей»
-    # ошибочно шёл товаром), а не стройматериалы. Глобально сегмент 'build' исключать НЕЛЬЗЯ
-    # (на других сайтах это может быть продуктовый раздел). Пустой для прочих доменов → нулевой регресс.
-    exclude_url_patterns_by_domain: dict = field(default_factory=lambda: {
-        "pspcom.ru": ["/catalog/build/"],
-        # D89: раздел /practice/ на pktmt.ru — «Применение» (информационные статьи «что
-        # такое ППУ», «утепление балкона/кровли/откосов» …), а НЕ товары. Статьи с ТХ
-        # ошибочно проходили как товарные карточки. Товары лежат в /produktsiya/.
-        "pktmt.ru": ["/practice/"],
-        # D98: aerobel.ru — краулер обходил весь сайт вширь и жёг бюджет max_pages на
-        # некоммерческих разделах (архив новостей, портфолио проектов/объектов, услуги,
-        # ЛК/корзина, производство) через медленный Playwright → прогон ~3ч, извлечение
-        # начиналось только после докраула до лимита. Товары — в /catalog/, дилеры — в
-        # /cooperation/ (where___List, ~700 записей), контакты — /contacts//company//about/;
-        # эти разделы НЕ исключаем. /news/ безопасно исключить: список дилеров на
-        # /cooperation/, а /news/uvazhaemye_partnery — лишь новость-анонс, не список.
-        "aerobel.ru": ["/news/", "/our_projects/", "/our_objects/", "/services/",
-                       "/policy/", "/personal/", "/manufacturing/"],
-    })
-
-    # Домены, отдающие контент ТОЛЬКО на www. У pktmt.ru non-www 301-редиректит в
-    # /index.php → 404 (и подстраницы, и главная-подпуть). Канонизатор по умолчанию
-    # срезает www (domain_strict_www) → effective_url для резолва ссылок становится
-    # non-www → все найденные товарные ссылки уходят на non-www и отдают 404 (0 товаров).
-    # Для доменов из списка канонизируем К www (а не срезаем его). Ключ — «голый» домен
-    # без www. Скоуплено ПО ДОМЕНУ; пусто для прочих → нулевой регресс.
-    strict_www_domains: list = field(default_factory=lambda: ["pktmt.ru"])
+    foreign_host_min_links: int = 5
 
     # Выбор рабочего URL компании (P05 U1): кандидат подтверждается содержимым, а не одним
     # кодом ответа. Отклик живых сайтов не измерялся — значения выбраны консервативно.
@@ -392,10 +340,7 @@ class Config:
     ])
 
     # Профилирование сайтов (декларативные YAML-профили + перепись/метрики).
-    # Пер-доменные словари выше (ajax_product_tabs_domains, bitrix_offers_domains,
-    # exclude_url_patterns_by_domain, strict_www_domains, equivalent_domains) —
-    # DEPRECATED-fallback: их содержимое перенесено в profiles/<домен>.yaml,
-    # словари остаются на переходный период (выпиливание — фаза 2).
+    # Настройки конкретных сайтов хранятся только в profiles/<домен>.yaml.
     profiles_dir: str = '/home/user/stroy-resurs/mvp/profiles'
     profiles_drafts_dir: str = '/home/user/stroy-resurs/mvp/profiles_drafts'
     profile_metrics_dir: str = '/home/user/stroy-resurs/mvp/Base/profile_metrics'

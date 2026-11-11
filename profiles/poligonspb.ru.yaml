@@ -1,0 +1,7 @@
+domain: poligonspb.ru
+source: manual
+notes:
+- 'D52: шесть сортировочных вариантов одного листинга blokrkf; правило не применяется к карточкам.'
+crawl:
+  ignored_query_params: [orderby, sortby, sort_by, order_by, display, set_filter]
+  query_noise_paths: [/catalog/stabilizatory-napryazheniya/blokrkf]

@@ -1,0 +1,83 @@
+domain: pspcom.ru
+profile_version: 2
+profiled_at: '2026-08-19'
+confidence: 0.606
+source: mixed
+notes:
+- '2026-11-09: добавлены настройки сайта из config.py и рабочего профиля; показатели переписи и confidence
+  сохранены.'
+crawl:
+  render: html
+  exclude_paths:
+  - /catalog/build/
+sections:
+  contacts_urls:
+  - /contact/
+  - /contacts/
+  distributor_urls:
+  - /press/
+  - /dealers/
+  - /distributors/
+  product_url_patterns:
+  - /catalog/[^/]+/[^/]+/?$
+  - /catalog/[^/]+/?$
+  - /grafics/[^/]+/?$
+extract:
+  tier: llm
+baseline:
+  structure_hash: 6442574f081031cf002edfefcff17d00f11ce06d
+  selector_hit_rate: 1.0
+  pages_crawled: 33
+  product_pages: 22
+  product_cards: 4
+  jsonld_share: 0.0
+  cms_detected: generic-content
+  fetch_fail_rate: 0.0382
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.1143
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 0
+  extraction_path_share:
+    contacts_universal: 0.3714
+    universal: 0.5143
+    generic: 0.1143
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts: &id001
+    main_page: 1
+    product: 22
+    distributor: 8
+    contacts: 2
+census_evidence:
+  fetch_methods:
+    http_first: 141
+    dynamic: 10
+  pages_by_category: *id001
+  alerts: []
+  top_urls:
+    product:
+    - http://www.pspcom.ru/catalog
+    - http://pspcom.ru/catalog/pogonaj/pilomaterials/
+    - http://pspcom.ru/catalog/pogonaj/
+    - http://pspcom.ru/catalog/mashine/
+    - http://pspcom.ru/catalog/glued-beams-houses/
+    - http://pspcom.ru/catalog/doors/
+    - http://pspcom.ru/catalog/plates/drevesno-struzhechnye-plity/
+    - http://pspcom.ru/catalog/plates/vlagostojkie-konstrukcionnye-plity/
+    - http://pspcom.ru/catalog/plates/drevesno-voloknistye-plity/
+    - http://pspcom.ru/catalog/pogonaj/glued-structural-materials/
+    category: []
+    contacts:
+    - http://www.pspcom.ru/contact
+    - http://www.pspcom.ru/contacts
+    distributor:
+    - http://www.pspcom.ru/dealers
+    - http://www.pspcom.ru/distributors
+    - http://www.pspcom.ru/gde-kupit
+    - http://www.pspcom.ru/partners
+    - http://www.pspcom.ru/about/predstavitelstva
+    - http://www.pspcom.ru/where-to-buy
+    - http://pspcom.ru/press/ofitsialnym-predstavitelem-tm-alleanza-doors-v-permi-stala-kompaniya-alta-ural
+    - http://pspcom.ru/press/torgovo-proizvodstvennaya-gruppa-khoroshie-dveri-novyy-diler-alleanza-doors-v-ryazani
+    price_list: []

@@ -11,6 +11,7 @@ import re
 import hashlib
 from collections import Counter
 from datetime import date
+from copy import deepcopy
 from urllib.parse import urlparse
 
 from .profile_metrics import RunMetricsCollector
@@ -171,6 +172,13 @@ class CensusCollector:
                 },
             },
         }
+        # Явные настройки сайта не выводятся из телеметрии и должны переживать перепись.
+        if self.profile is not None:
+            for key in ('ajax_tabs', 'bitrix_offers', 'exclude_paths', 'strict_www',
+                        'equivalent_domains', 'tab_selector', 'tab_panel_selector'):
+                value = getattr(self.profile.crawl, key)
+                if value:
+                    draft['crawl'][key] = deepcopy(value)
         draft['baseline']['section_counts'] = metrics.get('pages_by_category')
         render = self._infer_render(metrics)
         if render:

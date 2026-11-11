@@ -1,0 +1,11 @@
+domain: tatpolimer.ru
+profile_version: 1
+profiled_at: '2026-11-03'
+source: manual
+confidence: 1.0
+notes:
+- 'Дилеры загружаются асинхронно в .buy__contact; пустой контейнер не готов.'
+crawl:
+  contact_ready_selector: 'body:not(:has(.buy__contact)), .buy__contact .buy__contact-item'
+sections:
+  distributor_urls: ['https://tatpolimer.ru/gde-kupit']

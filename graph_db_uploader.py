@@ -10,8 +10,10 @@ import aiohttp
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 import uuid
+import hashlib
 
 from config import Config
+from report_queue import company_state_path
 from graph_db_archiver import GraphDBDataArchiver
 
 # Настройка логирования
@@ -262,15 +264,12 @@ class GraphDBDataFormatter:
             "Описание": "",
             "Реквизиты": {},
             "files": [],
-            "report_date": "",
+            "data_update_in_progress": True,
             "status": "активен"
         }
         
-        # Только для обновлений добавляем update_date
-        if is_update:
-            formatted_company["update_date"] = current_time
-        else:
-            # Для первичной загрузки добавляем оба поля
+        # Дата обновления публикуется после всех чанков.
+        if not is_update:
             formatted_company["upload_date"] = current_time
             formatted_company["update_date"] = ""
 
@@ -368,6 +367,25 @@ class GraphDBDataFormatter:
         })
        
     @staticmethod
+    def _variants_with_ids(variants, product_id):
+        """Граф принимает массив объектов только со строковыми id; вход не меняем."""
+        if not isinstance(variants, list):
+            return variants
+        result = []
+        for variant in variants:
+            if not isinstance(variant, dict):
+                result.append(variant)
+                continue
+            item = dict(variant)
+            if not isinstance(item.get('id'), str) or not item['id']:
+                payload = json.dumps(_normalize_customer_symbols(variant), ensure_ascii=False,
+                                     sort_keys=True, separators=(',', ':'))
+                digest = hashlib.sha256((str(product_id) + '\n' + payload).encode()).hexdigest()[:24]
+                item['id'] = 'var_' + digest
+            result.append(item)
+        return result
+
+    @staticmethod
     def format_product_data(company_id: str, company_name: str, products: List[Dict[str, Any]], 
                           is_update: bool = False) -> Dict[str, Any]:
         """Форматирование данных продукта для API"""
@@ -407,8 +425,8 @@ class GraphDBDataFormatter:
             "security_measures": product_data.get('security_measures', ''),
             "dimensions": product_data.get('dimensions', ''),
             "weight": product_data.get('weight', ''),
-            "variants": product_data.get('variants', []),  # список объектов
-            "report_date": ""
+            "variants": GraphDBDataFormatter._variants_with_ids(
+                product_data.get('variants', []), product.get('product_id', '')),
         }
             
             # Только для обновлений добавляем update_date
@@ -467,8 +485,7 @@ class GraphDBDataFormatter:
                 "Адрес": distributor.get('address', '')[:200],
                 "Телефон": distributor.get('phone', ''),
                 "URL страницы": distributor.get('page_url', ''),
-                "report_date": ""
-            }
+                }
             
             # Только для обновлений добавляем update_date
             if is_update:
@@ -882,6 +899,22 @@ class GraphDBUploader:
                     had_fatal = True
                 await asyncio.sleep(self.config.graph_db_delay_between_chunks)
 
+        # Публикуем завершённую версию только после доставки всех частей.
+        # Pending остаётся при ошибке; повтор не отправляет успешные чанки заново.
+        if overall_success:
+            completed_at = self.get_current_verification_date()
+            completed = {"id": company_id, "data_update_in_progress": False,
+                         "data_version": uuid.uuid4().hex}
+            if is_update:
+                completed["update_date"] = completed_at
+            payload = {"companies": [completed], "verification_date": completed_at,
+                       "is_update": is_update}
+            try:
+                overall_success = await self.send_data(payload, "company_complete", company_id, company_name)
+            except GraphDBFatalError:
+                overall_success = False
+                had_fatal = True
+
         # ---- Статистика файлов ----
         total_files = len(company_files)
         for product in products:
@@ -890,14 +923,17 @@ class GraphDBUploader:
 
         # ---- Удаление состояния или сохранение (без увеличения общего retry_count) ----
         if overall_success:
+            # После обычного сбоя графа файлы уже подготовлены; возобновление
+            # завершает эту же версию. Незавершённый crawl не разблокируем.
+            state_root = os.path.dirname(getattr(self.config, 'documents_dir', self.config.graph_db_pending_dir))
+            state_path = company_state_path(os.path.join(state_root, 'Bot'), company_id)
+            if state_path.exists() and state_path.read_text() == 'awaiting_graph':
+                state_path.write_text('ready')
             await self.pending_manager.delete_state(company_id)
             log.info(f"Все данные для {company_id} успешно отправлены, состояние удалено")
         else:
-            # Общий retry_count больше не используем для блокировки, но увеличиваем для статистики (необязательно)
-            # Чтобы не зацикливать компанию, пропускаем увеличение – иначе компания может быть заблокирована.
-            # Просто обновляем last_updated
-            state['last_updated'] = datetime.now().isoformat()
-            await self.pending_manager.save_state(state)
+            # Статусы, retry_count и last_updated уже сохранены в update_chunk_status.
+            # Повторная запись исходного state откатила бы прогресс отправки.
             log.warning(f"Отправка для {company_id} завершена с ошибками, состояние сохранено для дальнейших попыток")
 
         # Если была фатальная сетевая ошибка – сигнализируем о необходимости остановки пайплайна

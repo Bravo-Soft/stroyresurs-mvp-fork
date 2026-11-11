@@ -43,6 +43,7 @@ class RunMetricsCollector:
         self.sitemap_url_count = None
         self.page_urls = []                     # [(url, category)] сохранённых страниц
         self.extraction_paths = Counter()       # adapter/adapter_special/contacts_universal/universal/generic
+        self.markdown_fallbacks = []            # URL, исходный/резервный путь и причина перехода
         self.markdown_lens = []
         self.min_len = 200                      # порог «пустого» markdown (профиль может сменить)
         self.jsonld_pages = 0
@@ -137,7 +138,9 @@ class RunMetricsCollector:
 
     @_safe
     def sink(self, event, **data):
-        if event == 'extraction':
+        if event == 'markdown_fallback':
+            self.markdown_fallbacks.append(dict(data))
+        elif event == 'extraction':
             self.extraction_paths[data.get('path') or 'generic'] += 1
             if data.get('md_len') is not None:
                 self.markdown_lens.append(int(data['md_len']))
@@ -208,6 +211,7 @@ class RunMetricsCollector:
             # Extraction
             'extraction_path_share': {k: self._rate(v, extraction_total)
                                       for k, v in self.extraction_paths.items()},
+            'markdown_fallbacks': list(self.markdown_fallbacks),
             'empty_markdown_rate': self._rate(empty_md, len(self.markdown_lens)),
             'gate3_pass_rate': self._rate(products_processed, gate3_total),
             'jsonld_share': self._rate(self.jsonld_pages, self.universal_detail_pages),

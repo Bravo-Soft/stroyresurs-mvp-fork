@@ -1,11 +1,13 @@
 # create_topics.py
 from kafka import KafkaAdminClient
 from kafka.admin import NewTopic
+from config import Config
 
 def create_kafka_topics():
     """Создание необходимых топиков Kafka"""
+    config = Config.load_from_env()
     admin_client = KafkaAdminClient(
-        bootstrap_servers="192.168.0.123:9092"
+        bootstrap_servers=config.kafka_bootstrap_servers
     )
     
     topics = [

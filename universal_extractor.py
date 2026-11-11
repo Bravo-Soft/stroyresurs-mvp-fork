@@ -5,8 +5,8 @@
 Назначение: для page_type='' (товарная страница) заменить наивный выбор
 контейнера article→main→.content в text_extractor на доменно-независимый
 конвейер, устойчивый к разным CMS (Bitrix, WooCommerce/WP, OpenCart, Tilda,
-Drupal, Joomla, generic) и к структурированной разметке (JSON-LD, Microdata,
-OpenGraph).
+Drupal, Joomla, generic). JSON-LD, Microdata и OpenGraph разбираются для
+диагностики; отсутствующие в пользовательском DOM сведения не добавляются.
 
 Зависимости: только bs4/lxml/re/json — без новых пакетов. Конвертер markdown,
 канон степеней, чистка шума и постпроцессинг — переиспользуются из
@@ -348,36 +348,6 @@ _MIN_TEXT = 120
 # t657 — типовой блок Tilda «Политика Cookie».
 _EXTRA_NOISE_SELECTORS = ['[class~="t657"]']
 
-_DISPLAY_NONE_RE = re.compile(r'display\s*:\s*none', re.I)
-# Классы, у которых display:none — это действительно скрытый шум, а не вкладка.
-_HIDDEN_NOISE_CLASS_RE = re.compile(
-    r'^(modal|popup|overlay|cart|basket|menu|nav|search|callback|cookie|form)([-_].*)?$', re.I)
-
-
-def _unhide_content_blocks(soup):
-    """Снимает inline display:none с содержательных блоков (вкладки «Характеристики»
-    и т.п. у Bitrix/WP скрыты до клика). Базовая clean_noise удаляет display:none
-    целиком — вместе со спеками. Расскрываем только блоки с таблицей либо с
-    плотным текстом (не меню из ссылок) и без шумовых классов."""
-    for el in soup.find_all(style=_DISPLAY_NONE_RE):
-        try:
-            classes = el.get('class') or []
-            if any(_HIDDEN_NOISE_CLASS_RE.match(c) for c in classes):
-                continue
-            if el.find('table') is not None:
-                pass  # таблица — почти наверняка характеристики
-            else:
-                text_len = len(el.get_text(' ', strip=True))
-                if text_len < 200:
-                    continue
-                link_len = sum(len(a.get_text(' ', strip=True)) for a in el.find_all('a'))
-                if link_len * 2 > text_len:
-                    continue  # в основном ссылки — скрытое меню, не контент
-            el['style'] = _DISPLAY_NONE_RE.sub('', el.get('style') or '')
-        except Exception:
-            continue
-
-
 def _text_len(tag) -> int:
     try:
         return len(tag.get_text(' ', strip=True))
@@ -506,78 +476,13 @@ def _ensure_adequate(container, soup):
 
 # ==================== СБОРКА MARKDOWN ТОВАРА ====================
 
-def _norm_for_dedup(s: str) -> str:
-    """Нормализация для проверки вхождения в основной markdown: убираем регистр,
-    схлопываем пробелы, выкидываем неалфанумерику кроме цифр/букв."""
-    s = re.sub(r'\s+', '', s.lower())
-    s = re.sub(r'[^0-9a-zа-яё]', '', s)
-    return s
-
-
-def _structured_block(data: dict, body_markdown: str) -> str:
-    """Формирует блок «Данные товара (структурированные)» только из непустых
-    полей, КОТОРЫХ ещё нет в основном markdown (дедуп по нормализованному
-    вхождению). Возвращает '' если добавлять нечего."""
-    norm_body = _norm_for_dedup(body_markdown)
-
-    def absent(value: str) -> bool:
-        nv = _norm_for_dedup(value)
-        return bool(nv) and nv not in norm_body
-
-    lines = []
-    if data.get('name') and absent(data['name']):
-        lines.append(f"- Название: {data['name']}")
-    if data.get('price') and absent(data['price']):
-        lines.append(f"- Цена: {data['price']}")
-    if data.get('sku') and absent(data['sku']):
-        lines.append(f"- Артикул: {data['sku']}")
-    if data.get('brand') and absent(data['brand']):
-        lines.append(f"- Бренд: {data['brand']}")
-    for pname, pval in data.get('properties', []):
-        # Свойство добавляем, только если его значение ещё не встречается в тексте.
-        if absent(pval):
-            lines.append(f"- {pname}: {pval}")
-
-    if not lines:
-        return ''
-    return "## Данные товара (структурированные)\n\n" + "\n".join(lines)
-
-
-# Описание в разметке может прийти сырым HTML (Bitrix кладёт в JSON-LD содержимое поля).
-_HTML_TAG_RE = re.compile(r'<[a-zA-Z!/]')
-
-
-def _description_block(data: dict, body_markdown: str) -> str:
-    """Формирует блок «## Описание» из разметки товара — для страниц, где описания
-    в DOM нет вовсе: вкладка «Описание» рендерится по клику, а её текст лежит только
-    в JSON-LD/RSC-payload (ekontaktor.ru на Next.js — D80).
-
-    OpenGraph как источник НЕ берём: og:description — это SEO-врезка страницы
-    («КТ6033Б. 250А. 3 полюса. Цена от…»), а не описание товара.
-    Возвращает '' если описания нет, оно слишком короткое или уже есть в тексте."""
-    if data.get('source') not in ('json-ld', 'microdata'):
-        return ''
-    desc = (data.get('description') or '').strip()
-    if _HTML_TAG_RE.search(desc):
-        try:
-            desc = re.sub(r'\s+', ' ', BeautifulSoup(desc, 'html.parser').get_text(' ')).strip()
-        except Exception:
-            return ''
-    if len(desc) < 40:
-        return ''
-    # Дедуп по нормализованному ПРЕФИКСУ: в тексте страницы то же описание может
-    # отличаться хвостом (ссылка, перенос, «Подробнее»), сравнение целиком его не ловит.
-    prefix = _norm_for_dedup(desc)[:60]
-    if not prefix or prefix in _norm_for_dedup(body_markdown):
-        return ''
-    return "## Описание\n\n" + desc
-
-
-def extract_product_markdown(html: str, base_url: str = '') -> Optional[str]:
+def extract_product_markdown(html: str, base_url: str = '', *, prepared: bool = False) -> Optional[str]:
     """Конвейер извлечения markdown товарной страницы:
       parse → clean_noise_product → select_content_container →
-      MarkdownConverter(text_extractor) → префикс-блок структурированных данных.
+      MarkdownConverter(text_extractor). Входные сведения — пользовательский DOM.
 
+    prepared=True: вход уже очищен профилем/адаптером в html_to_markdown;
+    повторная базовая очистка и adapter.clean не должны отменять этот результат.
     Возвращает None при пустом/мусорном результате (тогда вызывающий код
     откатится к старому generic-пути)."""
     try:
@@ -588,6 +493,10 @@ def extract_product_markdown(html: str, base_url: str = '') -> Optional[str]:
         except Exception:
             return None
 
+    from product_interactions import preserve_product_panels
+    if not prepared:
+        preserve_product_panels(soup, base_url)
+
     # Структурированные данные собираем ДО чистки шума (разметка может жить в
     # script/meta, которые чистка может затронуть, и в любом контейнере).
     try:
@@ -595,19 +504,13 @@ def extract_product_markdown(html: str, base_url: str = '') -> Optional[str]:
     except Exception:
         structured = {}
 
-    # Расскрываем содержательные скрытые вкладки ДО clean_noise (иначе она
-    # удалит display:none-блоки вместе с характеристиками).
-    try:
-        _unhide_content_blocks(soup)
-    except Exception as e:
-        logging.debug(f"universal_extractor: _unhide_content_blocks: {e}")
-
     # Базовая универсальная чистка из text_extractor (script/style/noscript,
     # .contact-form, скрытые display:none и т.п.). В старом generic-пути её
     # выполнял html_to_markdown; здесь soup парсится заново из сырого HTML,
     # поэтому без этого вызова сырой JavaScript и формы утекали в markdown.
     try:
-        _T.clean_noise(soup, base_url)
+        if not prepared:
+            _T.clean_noise(soup, base_url)
     except Exception as e:
         logging.debug(f"universal_extractor: clean_noise: {e}")
     # template markdownify тоже не вычищает (strip убирает теги, но не текст детей)
@@ -645,16 +548,22 @@ def extract_product_markdown(html: str, base_url: str = '') -> Optional[str]:
             if _prof.extract.custom_module:
                 _ad = _T._get_adapter_by_module(_prof.extract.custom_module) or _ad
             _clean_in_universal = _clean_in_universal or _prof.extract.clean_in_universal
-        if _ad is not None and _clean_in_universal and callable(getattr(_ad, 'clean', None)):
+        if not prepared and _ad is not None and _clean_in_universal and callable(getattr(_ad, 'clean', None)):
             _ad.clean(soup)
     except Exception as e:
         logging.debug(f"universal_extractor: adapter.clean: {e}")
 
     # Выбор контейнера.
     try:
-        container, _how = select_content_container(soup)
+        container = _T._site_product_container(soup, base_url)
+        if container is None:
+            container, _how = select_content_container(soup)
+        else:
+            _how = 'site-product-container'
     except Exception as e:
         logging.debug(f"universal_extractor: select_content_container: {e}")
+        _T._markdown_fallback(base_url, '', 'universal_container', 'universal_document',
+                              'container_selection_error', error=str(e))
         container = soup.body or soup
         _how = 'error'
 
@@ -664,45 +573,31 @@ def extract_product_markdown(html: str, base_url: str = '') -> Optional[str]:
 
     # Конвертация тем же конвертером (степени/таблицы как в основном модуле).
     conv = _T.MarkdownConverter(heading_style='ATX', bullets='-', strip=['script', 'style'])
+    from product_tables import is_table_site
+    conv.structured_tables = is_table_site(base_url)
     try:
         body_md = conv.convert(str(container)).strip()
     except Exception as e:
         logging.debug(f"universal_extractor: конвертация контейнера: {e}")
+        _T._markdown_fallback(base_url, '', 'universal_container', 'universal_document',
+                              'conversion_error', error=str(e))
         try:
             body_md = conv.convert(str(soup.body or soup)).strip()
-        except Exception:
+        except Exception as e:
+            _T._markdown_fallback(base_url, '', 'universal_document', 'empty',
+                                  'conversion_error', error=str(e))
             return None
 
     if not body_md.strip():
-        # Пустой основной markdown — но если есть структурированные данные с
-        # именем, отдадим хотя бы их (лучше, чем ничего). Иначе None.
-        if structured.get('name') or structured.get('properties'):
-            sb = _structured_block(structured, '')
-            return sb or None
         return None
 
-    # Гарантируем заголовок товара: если в markdown контейнера нет '# '-строки,
-    # добавляем её из h1 страницы или имени из разметки. Иначе постпроцессор
-    # увидит имя в структурированном блоке и не добавит '# h1' сам.
+    # В Markdown входят сведения пользовательского DOM. JSON-LD/microdata
+    # остаются диагностикой, но не дополняют отсутствующие на странице факты.
     heading = ''
     if not re.search(r'(?m)^#\s', body_md):
         h1 = soup.find('h1')
-        h1_text = h1.get_text(strip=True) if h1 else ''
-        title = (h1_text or structured.get('name') or '').strip()
+        title = h1.get_text(strip=True) if h1 else ''
         if title:
             heading = f"# {title}"
-
-    # Префикс-блок структурированных данных (только непустое и без дублей).
-    parts = []
-    if heading:
-        parts.append(heading)
-    if structured:
-        sb = _structured_block(structured, body_md)
-        if sb:
-            parts.append(sb)
-        db = _description_block(structured, body_md)
-        if db:
-            parts.append(db)
-    parts.append(body_md)
-    result = "\n\n".join(parts).strip()
+    result = "\n\n".join(part for part in (heading, body_md) if part).strip()
     return result or None

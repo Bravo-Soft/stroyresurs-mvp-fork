@@ -17,6 +17,7 @@ import aiohttp
 import json
 import traceback
 from dataclasses import dataclass
+from file_download_cache import FileDownloadCache, file_sha256
 from folder_renamer import FolderRenamer
 from bot_report.api_client import ApiClient
 
@@ -79,6 +80,9 @@ class ReportArchiveBuilder:
             'Documents_product': 'Файлы товара',
             'Images': 'Изображения товара'
         }
+        self.download_cache = FileDownloadCache(os.getenv("BASE_DIR", str(self.documents_dir.parent / "Base")))
+        self._file_entries = {}
+        self._file_hashes = {}
         self.files_to_delete = ['crawling_stats.json']
         log.info("ReportArchiveBuilder инициализирован")
         # Фильтр содержимого архива (ТЗ I.4.1.2): пользователю передаются PDF и RTF-карточки;
@@ -92,6 +96,22 @@ class ReportArchiveBuilder:
         log.info(f"Директория документов: {self.documents_dir}")
         log.info(f"Используется ApiClient для работы с API")
 
+    def _current_conversion(self, path):
+        """Не выдаём PDF прежней редакции после неудачной переконвертации."""
+        folder = path.parent
+        if folder not in self._file_entries:
+            self._file_entries[folder] = list(self.download_cache.entries(folder))
+        entries = [e for e in self._file_entries[folder]
+                   if e.get('converted_filename') == path.name
+                   or (e.get('filename') and Path(e['filename']).suffix.lower() in self.convertible_extensions
+                       and Path(e['filename']).with_suffix('.pdf').name == path.name)]
+        if not entries:
+            return True  # Файлы до введения кэша: прежний контракт форматов.
+        if path not in self._file_hashes:
+            self._file_hashes[path] = file_sha256(path)
+        return all(e.get('converted_source_sha256') == e.get('sha256')
+                   and e.get('converted_sha256') == self._file_hashes[path] for e in entries)
+
     def _should_include_file(self, file_path: Path) -> bool:
         """Решение, должен ли файл попасть в архив пользователю (ТЗ I.4.1.2)"""
         name_lower = file_path.name.lower()
@@ -99,10 +119,11 @@ class ReportArchiveBuilder:
             return False
         ext = file_path.suffix.lower()
         if ext in self.allowed_extensions:
-            return True
+            return ext != '.pdf' or self._current_conversion(file_path)
         if ext in self.convertible_extensions:
             # Если рядом уже лежит сконвертированный PDF — оригинал является дублем
-            if file_path.with_suffix('.pdf').exists():
+            if (file_path.with_suffix('.pdf').exists()
+                    and self._current_conversion(file_path.with_suffix('.pdf'))):
                 return False
             # Конвертация не состоялась — передаём оригинал, чтобы не потерять данные
             return True
@@ -223,6 +244,8 @@ class ReportArchiveBuilder:
                 # Проверяем все префиксы
                 for prefix, company_id in company_prefixes.items():
                     if folder_name.startswith(prefix):
+                        if company_id in company_folders:
+                            raise ValueError(f"Несколько папок компании {company_id}: требуется выбрать актуальную")
                         company_folders[company_id] = item
                         log.debug(f"Найдена папка для компании {company_id}: {folder_name}")
                         break
@@ -343,7 +366,9 @@ class ReportArchiveBuilder:
         dest_products_folder.mkdir(parents=True, exist_ok=True)
         
         for product_folder in source_products_folder.iterdir():
-            if product_folder.is_dir():
+            if product_folder.is_file() and self._should_include_file(product_folder):
+                shutil.copy2(product_folder, dest_products_folder / product_folder.name)
+            elif product_folder.is_dir():
                 dest_product_folder = dest_products_folder / product_folder.name
                 
                 try:
@@ -362,7 +387,7 @@ class ReportArchiveBuilder:
                                 log.debug(f"Переименована папка в товаре: {subfolder.name} -> {new_name}")
                                 
                 except Exception as e:
-                    log.warning(f"Ошибка обработки папки товара {product_folder.name}: {e}")
+                    raise RuntimeError(f"Ошибка обработки папки товара {product_folder.name}: {e}") from e
     
     def rename_and_restructure_company_folder(self, source_folder: Path, dest_folder: Path, 
                                             company_info: Dict) -> bool:
@@ -407,7 +432,7 @@ class ReportArchiveBuilder:
                         # Копируем файл из корня папки компании
                         shutil.copy2(item, dest_folder / item.name)
                 except Exception as e:
-                    log.warning(f"Ошибка копирования {item}: {e}")
+                    raise RuntimeError(f"Ошибка копирования {item}: {e}") from e
             
             log.info(f"Папка компании {company_info['id']} успешно обработана")
             return True
@@ -468,7 +493,7 @@ class ReportArchiveBuilder:
                     shutil.copy2(detailed_report, reports_folder / detailed_report.name)
                     log.info("Детальный отчет скопирован в архив")
                 except Exception as e:
-                    log.error(f"Ошибка копирования детального отчета: {e}")
+                    raise RuntimeError(f"Ошибка копирования детального отчета: {e}") from e
             else:
                 log.info("Детальный отчет отсутствует (нет изменений), не копируется")
             

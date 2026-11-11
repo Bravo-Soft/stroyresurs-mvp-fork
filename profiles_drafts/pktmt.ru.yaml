@@ -1,0 +1,83 @@
+domain: pktmt.ru
+profile_version: 2
+profiled_at: '2026-09-05'
+confidence: 0.429
+source: mixed
+notes:
+- '2026-11-09: добавлены настройки сайта из config.py и рабочего профиля; показатели переписи и confidence
+  сохранены.'
+crawl:
+  render: html
+  exclude_paths:
+  - /practice/
+  strict_www: true
+sections:
+  contacts_urls:
+  - /contact/
+  - /contacts/
+  distributor_urls:
+  - /about/
+  - /dealers/
+  - /distributors/
+  product_url_patterns:
+  - /produktsiya/[^/]+/?$
+  - /produktsiya/[^/]+/[^/]+/?$
+extract:
+  tier: custom
+  custom_module: pktmt_ru
+baseline:
+  structure_hash: 9c85ee811dbb15580929bb0dc0e8a45f8b02bb7b
+  selector_hit_rate: 1.0
+  pages_crawled: 20
+  product_pages: 11
+  product_cards: 5
+  jsonld_share: 0.0
+  cms_detected: generic-content
+  fetch_fail_rate: 0.1154
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.8333
+  sitemap_url_count: 0
+  extraction_path_share:
+    contacts_universal: 0.5
+    universal: 0.5
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts: &id001
+    main_page: 1
+    distributor: 6
+    contacts: 2
+    product: 11
+census_evidence:
+  fetch_methods:
+    http_first: 7
+    dynamic: 8
+    playwright: 3
+    aiohttp: 5
+  pages_by_category: *id001
+  alerts: []
+  top_urls:
+    product:
+    - https://www.pktmt.ru/produktsiya/
+    - https://www.pktmt.ru/produktsiya/fasadnyi_dekor_iz_poliuretana/
+    - https://www.pktmt.ru/produktsiya/termopaneli_s_klinkernoi_plitkoi/
+    - https://www.pktmt.ru/produktsiya/teploizolyatsiya_iz_poliuretana/otvody_dlya_skorlup_iz_poliuretana/
+    - https://www.pktmt.ru/produktsiya/teploizolyatsiya_iz_poliuretana/skorlupy_iz_penopoliuretana/
+    - https://www.pktmt.ru/produktsiya/teploizolyatsiya_iz_poliuretana/
+    - https://www.pktmt.ru/produktsiya/poliuretanovyi_odnokomponentnyi_klei_regent/
+    - https://www.pktmt.ru/produktsiya/teploizolyatsiya_iz_poliuretana/uteplennyi_gipsokarton_s_penopoliuretanom/
+    - https://www.pktmt.ru/produktsiya/teploizolyatsiya_iz_poliuretana/uteplenie_zapornoi_armatury_teplosetei/
+    - https://www.pktmt.ru/produktsiya/teploizolyatsiya_iz_poliuretana/teploizolyatsionnye_paneli_iz_penopoliuretana/
+    category: []
+    contacts:
+    - https://www.pktmt.ru/contacts
+    - https://www.pktmt.ru/contact
+    distributor:
+    - https://www.pktmt.ru/gde-kupit
+    - https://www.pktmt.ru/where-to-buy
+    - https://www.pktmt.ru/distributors
+    - https://www.pktmt.ru/partners
+    - https://www.pktmt.ru/about/predstavitelstva
+    - https://www.pktmt.ru/dealers
+    price_list: []

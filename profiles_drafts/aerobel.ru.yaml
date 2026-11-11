@@ -1,0 +1,64 @@
+domain: aerobel.ru
+profile_version: 2
+profiled_at: '2026-08-19'
+confidence: 0.47
+source: mixed
+notes:
+- '2026-11-09: добавлены настройки сайта из config.py и рабочего профиля; показатели переписи и confidence
+  сохранены.'
+crawl:
+  render: browser
+  antibot: impersonate
+  exclude_paths:
+  - /manufacturing/
+  - /news/
+  - /our_objects/
+  - /our_projects/
+  - /personal/
+  - /policy/
+  - /services/
+sections:
+  contacts_urls:
+  - /company/
+  distributor_urls:
+  - /distributors.php/
+extract:
+  tier: custom
+  custom_module: aerobel_ru
+baseline:
+  structure_hash: null
+  selector_hit_rate: null
+  pages_crawled: 2
+  product_pages: 0
+  product_cards: 0
+  jsonld_share: null
+  cms_detected: null
+  fetch_fail_rate: 0.0
+  challenge_rate: 0.3214
+  empty_markdown_rate: 0.125
+  gate3_pass_rate: null
+  sitemap_url_count: 40
+  extraction_path_share:
+    adapter_special: 0.125
+    contacts_universal: 0.875
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts: &id001
+    distributor: 1
+    contacts: 1
+census_evidence:
+  fetch_methods:
+    dynamic: 23
+    playwright: 33
+  pages_by_category: *id001
+  alerts:
+  - challenge_rate 0.3214 > 0.2 при baseline none
+  top_urls:
+    product: []
+    category: []
+    contacts:
+    - https://aerobel.ru/company/cookie.php
+    distributor:
+    - https://aerobel.ru/distributors.php
+    price_list: []
