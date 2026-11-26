@@ -1,0 +1,128 @@
+domain: v-kirpich.ru
+profile_version: 1
+profiled_at: '2026-08-29'
+confidence: 0.963
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: html
+  exclude_paths:
+  - /gde-kupit/black-list/
+sections:
+  product_url_patterns:
+  - /catalog/stroitelnyy\-pustotelyy\-kirpich/m\-150/kirpich\-ryadovoy\-keramicheskiy\-odinarnyy\-krasnyy\-m150\-gost\-530\-2012/?(?:\?|$)
+  - /catalog/litsevoy\-kirpich\-seriya\-vintazh/kirpich\-litsevoy\-keramicheskiy\-odinarnyy\-bronza\-boston\-flesh\-m150\-/?(?:\?|$)
+  - /catalog/bavarskaya\-kladka/kirpich\-litsevoy\-keramicheskiy\-miks\-5\-korichnevyy\-rust\-antik\-rust\-glyasse\-rust\-antik\-kvarts/?(?:\?|$)
+  - /catalog/litsevoy\-kirpich\-seriya\-vintazh/kirpich\-litsevoy\-keramicheskiy\-odinarnyy\-krasnyy\-kvarts\-rust\-m150\-/?(?:\?|$)
+  - /catalog/[^/]+/[^/]+/?$
+  - /catalog/[^/]+/[^/]+/[^/]+/?$
+  - /catalog/[^/]+/?$
+  catalog_roots:
+  - /catalog/
+  - /catalog/litsevoy-kirpich-oblitsovochnyy/
+  - /catalog/litsevoy-kirpich-seriya-vintazh/
+  - /catalog/bavarskaya-kladka/
+  - /catalog/stroitelnyy-polnotelyy-kirpich/
+  - /catalog/stroitelnyy-pustotelyy-kirpich/
+  contacts_urls:
+  - /contact/
+  distributor_urls:
+  - /gde-kupit/ofitsialnye-dilery/
+  certificates_urls:
+  - /about/sertifikaty/
+  price_list_urls:
+  - /price/
+  product_url_antipatterns:
+  - /catalog/?(?:\?|$)
+  - /catalog/litsevoy\-kirpich\-oblitsovochnyy/?(?:\?|$)
+  - /catalog/litsevoy\-kirpich\-seriya\-vintazh/?(?:\?|$)
+  - /catalog/bavarskaya\-kladka/?(?:\?|$)
+  - /catalog/stroitelnyy\-polnotelyy\-kirpich/?(?:\?|$)
+  - /catalog/stroitelnyy\-pustotelyy\-kirpich/?(?:\?|$)
+  - /about/sertifikaty/?(?:\?|$)
+  - /price/?(?:\?|$)
+  start_urls:
+  - https://www.v-kirpich.ru/catalog/
+  - https://www.v-kirpich.ru/catalog/litsevoy-kirpich-oblitsovochnyy/
+  - https://www.v-kirpich.ru/catalog/litsevoy-kirpich-seriya-vintazh/
+  - https://www.v-kirpich.ru/catalog/bavarskaya-kladka/
+  - https://www.v-kirpich.ru/catalog/stroitelnyy-polnotelyy-kirpich/
+  - https://www.v-kirpich.ru/catalog/stroitelnyy-pustotelyy-kirpich/
+  - https://www.v-kirpich.ru/contact/
+  - https://www.v-kirpich.ru/gde-kupit/ofitsialnye-dilery/
+  - https://www.v-kirpich.ru/about/sertifikaty/
+  - https://www.v-kirpich.ru/price/
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: .content
+    min_len: 1
+    remove_selectors:
+    - .iblock-vote
+    - form
+    - .breadcrumbs
+    - .popup
+    - .element__f-wrapper
+    - .modal-popup
+    - .element-right-dos
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+    - .same
+    - .stati-catalog
+    - .map__block
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .menu
+        - .popup
+        - .element__f-wrapper
+        - .modal-popup
+        - .feedback-success
+        - .header-mobile
+  - name: category_heading
+    match:
+      path_regex: ^(?:/catalog/|/catalog/litsevoy\-kirpich\-oblitsovochnyy/|/catalog/litsevoy\-kirpich\-seriya\-vintazh/|/catalog/bavarskaya\-kladka/|/catalog/stroitelnyy\-polnotelyy\-kirpich/|/catalog/stroitelnyy\-pustotelyy\-kirpich/)$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: 8ef476878db2869501486b6580eaecb3e1b851bc
+  selector_hit_rate: 1.0
+  pages_crawled: 49
+  product_pages: 48
+  product_cards: 34
+  jsonld_share: 1.0
+  cms_detected: microdata-product
+  fetch_fail_rate: 0.008
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 0
+  extraction_path_share:
+    contacts_universal: 0.0204
+    universal: 0.9592
+    generic: 0.0204
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    main_page: 1
+    product: 48
+schema_version: 2

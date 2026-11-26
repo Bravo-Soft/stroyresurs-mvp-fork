@@ -1,0 +1,110 @@
+domain: carlisle-llc.ru
+profile_version: 1
+profiled_at: '2026-08-22'
+confidence: 0.578
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: html
+  exclude_paths: []
+sections:
+  contacts_urls:
+  - /contacts.html
+  distributor_urls:
+  - /predstaviteli.html
+  product_url_patterns:
+  - /catalog/geomembrane/description\.html/?(?:\?|$)
+  - /catalog/[^/]+/[^/]+\.html/?$
+  catalog_roots: []
+  certificates_urls:
+  - /techdetails/pondliner/certificate.html
+  documents_urls:
+  - /techdetails/pondliner/booklet.html
+  - /techdetails/pondliner/details.html
+  - /techdetails/pondliner/specs.html
+  product_url_antipatterns:
+  - /objects/epdm\.html/?(?:\?|$)
+  - /objects/tpo\.html/?(?:\?|$)
+  - /montazh\-krovli\.html/?(?:\?|$)
+  - /objects/pondliner\.html/?(?:\?|$)
+  - /techdetails/pondliner/booklet\.html/?(?:\?|$)
+  - /techdetails/pondliner/details\.html/?(?:\?|$)
+  - /techdetails/pondliner/specs\.html/?(?:\?|$)
+  - /techdetails/pondliner/certificate\.html/?(?:\?|$)
+  start_urls:
+  - https://www.carlisle-llc.ru/contacts.html
+  - https://www.carlisle-llc.ru/predstaviteli.html
+  - https://www.carlisle-llc.ru/techdetails/pondliner/booklet.html
+  - https://www.carlisle-llc.ru/techdetails/pondliner/details.html
+  - https://www.carlisle-llc.ru/techdetails/pondliner/specs.html
+  - https://www.carlisle-llc.ru/techdetails/pondliner/certificate.html
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: '#midCol'
+    distributor_container: body
+    min_len: 1
+    remove_selectors:
+    - form
+    - button
+    - .breadcrumbs
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+    - .sppb-addon-button-group
+    - .sppb-addon-button
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .menu
+        - '#search-form-holder'
+        - '#rightCol'
+        - .sidebar
+        - .latestnews
+        - '#footer a:not([href^="mailto:"]):not([href^="tel:"])'
+        - iframe
+        - '#footer em'
+        - .djflyer_titles_box
+        - .djflyer_item_box .item_title
+baseline:
+  structure_hash: 1e20f91b953c8d5f3ee46ad3fcc210056fe9696c
+  selector_hit_rate: 0.7778
+  pages_crawled: 23
+  product_pages: 9
+  product_cards: 1
+  jsonld_share: 0.0
+  cms_detected: generic-article
+  fetch_fail_rate: 0.0427
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.2222
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 11
+  extraction_path_share:
+    contacts_universal: 0.6667
+    generic: 0.1852
+    universal: 0.1481
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    contacts: 4
+    product: 9
+    main_page: 2
+    distributor: 8
+schema_version: 2

@@ -2,7 +2,7 @@ import re
 import logging
 import pkgutil
 import importlib
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from urllib.parse import urljoin, urlparse
 from markdownify import MarkdownConverter as BaseMarkdownConverter
 from product_utils import apply_cp1251_replacements
@@ -74,20 +74,54 @@ def attach_sup_to_prev(prev_text: str, sup_tag) -> str:
 
 class MarkdownConverter(BaseMarkdownConverter):
     """Кастомный конвертер с поддержкой таблиц, sup, br, ATX заголовков."""
+    def convert_a(self, el, text, **kwargs):
+        # A visible link may wrap across DOM lines; preserve one complete label.
+        return super().convert_a(el, re.sub(r'\s+', ' ', text), **kwargs)
+
     def convert_h1(self, el, text, **kwargs):
         if not text and el:
             text = el.get_text(strip=True)
+        text = ' '.join(text.splitlines()).strip()
         return f"\n# {text}\n\n"
 
     def convert_h2(self, el, text, **kwargs):
         if not text and el:
             text = el.get_text(strip=True)
+        text = ' '.join(text.splitlines()).strip()
         return f"\n## {text}\n\n"
 
     def convert_h3(self, el, text, **kwargs):
         if not text and el:
             text = el.get_text(strip=True)
+        text = ' '.join(text.splitlines()).strip()
         return f"\n### {text}\n\n"
+
+    def convert_b(self, el, text, **kwargs):
+        # markdownify.chomp сохраняет только ASCII-пробел; NBSP на границе
+        # strong иначе исчезает и склеивает соседние слова/значения.
+        text = text.replace('\u00a0', ' ').replace('\u202f', ' ')
+        # Пустой b может быть единственным разделителем двух слов.
+        # Вложенное выделение не добавляет смысла, но даёт неверные ****.
+        if not text.strip() or el.find_parent(['b', 'strong']) is not None:
+            return text
+        return super().convert_b(el, text, **kwargs)
+
+    convert_strong = convert_b
+
+    def escape(self, text, parent_tags):
+        text = super().escape(text, parent_tags)
+        if not self.options['escape_misc']:
+            text = text.replace('`', r'\`')
+        return text
+
+    def convert_span(self, el, text, **kwargs):
+        # Ноль, поднятый CSS перед C, служит знаком градуса (Xara HTML).
+        style = re.sub(r'\s+', '', el.get('style', '')).lower()
+        if text.strip() == '0' and 'position:relative' in style and re.search(r'top:-\d', style):
+            following = el.find_next(string=lambda value: value.strip() not in ('', '0'))
+            if following and following.strip() in ('C', 'С'):
+                return ''
+        return text
 
     def convert_br(self, el, text, **kwargs):
         return "  \n"
@@ -103,6 +137,14 @@ class MarkdownConverter(BaseMarkdownConverter):
         raw = str(cell.get(attr, 1))
         m = re.match(r'\s*(\d+)', raw)
         return int(m.group(1)) if m else 1
+
+    def _rowspan_in_group(self, cell):
+        height=self._span(cell, 'rowspan')
+        row=cell.find_parent('tr');group=row.find_parent(['thead','tbody','tfoot']) if row else None
+        if group is not None:
+            rows=[r for r in group.find_all('tr') if r.find_parent(['thead','tbody','tfoot']) is group]
+            if row in rows:height=min(height,len(rows)-next(i for i,r in enumerate(rows) if r is row))
+        return height
 
     def _parse_table(self, table):
         rows = table.find_all('tr')
@@ -122,7 +164,7 @@ class MarkdownConverter(BaseMarkdownConverter):
                     col_idx += 1
                 if col_idx >= max_cols:
                     break
-                rowspan = self._span(cell, 'rowspan')
+                rowspan = self._rowspan_in_group(cell)
                 colspan = self._span(cell, 'colspan')
                 matrix[i][col_idx] = cell
                 for r in range(i, min(i + rowspan, len(rows))):
@@ -145,6 +187,8 @@ class MarkdownConverter(BaseMarkdownConverter):
 
         def walk(node):
             for child in node.children:
+                if isinstance(child, Comment):
+                    continue
                 name = getattr(child, 'name', None)
                 if name is None:
                     # NavigableString
@@ -155,12 +199,17 @@ class MarkdownConverter(BaseMarkdownConverter):
                 elif name == 'br':
                     parts.append(' ')
                 else:
+                    block = name in {'p', 'div', 'li', 'dt', 'dd'}
+                    if block:
+                        parts.append(' ')
                     walk(child)
+                    if block:
+                        parts.append(' ')
 
         walk(cell)
         text = ''.join(parts)
         # Схлопываем повторные пробелы и обрезаем края.
-        text = re.sub(r'[ \t ]+', ' ', text).strip()
+        text = re.sub(r'\s+', ' ', text).strip()
         return text
 
     def _denormalize_table_matrix(self, matrix):
@@ -177,7 +226,7 @@ class MarkdownConverter(BaseMarkdownConverter):
                 if not cell or isinstance(cell, str):
                     continue
                 if hasattr(cell, 'get'):
-                    rowspan = self._span(cell, 'rowspan')
+                    rowspan = self._rowspan_in_group(cell)
                     colspan = self._span(cell, 'colspan')
                     text = self._cell_to_text(cell)
                     # Баннер на всю ширину таблицы (секционный заголовок) не размножаем во все
@@ -210,6 +259,9 @@ class MarkdownConverter(BaseMarkdownConverter):
             return ""
         def row_to_md(row):
             values = [str(cell) if cell else " " for cell in row]
+            # Ячейки содержат обычный текст DOM. Парные подчёркивания в кодах
+            # исполнения (_S_, _W_) должны оставаться видимыми в Markdown.
+            values = [re.sub(r'(?<![\w\\])_([^_\s]+)_(?!\w)', r'\\_\1\\_', value) for value in values]
             if getattr(self, 'structured_tables', False):
                 values = [v.replace('|', r'\|').replace('\n', '<br>') for v in values]
             return "| " + " | ".join(values) + " |"
@@ -410,13 +462,21 @@ def _resolve_profile(url: str):
         from site_profiles import get_resolver
         profile = get_resolver().resolve(url)
         return None if profile.is_default() else profile
-    except Exception:
+    except Exception as exc:
+        try:
+            from site_profiles.format_v2 import ProfileRuleError
+        except ImportError:
+            return None
+        if isinstance(exc, ProfileRuleError):
+            raise
         return None
 
 
 
 # Колбэк телеметрии профилирования (census/метрики): sink(event, **data).
 # None = выключено (прод по умолчанию). Ошибки sink никогда не роняют конвертацию.
+from site_profiles.quick_check import emit as quick_check_event
+
 _census_sink = None
 
 
@@ -427,6 +487,7 @@ def set_census_sink(sink) -> None:
 
 
 def _emit_census(event, **data):
+    quick_check_event(event, **data)
     if _census_sink is None:
         return
     try:
@@ -589,6 +650,7 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
     общий конвертер (товарный extract при этом НЕ вызывается, чтобы не разбирать
     страницу компании как карточку товара).
     """
+    quick_check_source_html = html
     from product_interactions import isolate_product_state, preserve_product_panels
     if page_type not in ('company', 'distributor'):
         html = isolate_product_state(html, url)
@@ -602,9 +664,66 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
 
     if page_type not in ('company', 'distributor') and preserve_product_panels(soup, url):
         html = str(soup)
+    host = (urlparse(url).hostname or '').removeprefix('www.')
+    if host == 'vacma.ru' and '/vakuumnye-nasosy/' in urlparse(url).path:
+        for panel in soup.select('#desc, #char, [data-product-panel="desc"], [data-product-panel="char"]'):
+            # The source uses literal Cyrillic superscripts in some units and subscripts
+            # in pressure labels. Retain the original characters and their position.
+            for node in panel.select('sup, sub'):
+                prefix = '^' if node.name == 'sup' else '_'
+                node.replace_with(prefix + node.get_text(strip=True))
+            for emphasis in panel.select('b,strong,i,em'):
+                emphasis.unwrap()
+        html = str(soup)
+    if host == 'gorgaz.ru' and urlparse(url).path.startswith('/catalog/show/'):
+        from source_product_tables import unwrap_irvis_layout
+        unwrap_irvis_layout(soup)
+        html = str(soup)
+    if host == 'chemkor.ru' and page_type == 'company':
+        # Contact widgets wrap multiple paragraphs inside a single heading.
+        soup = BeautifulSoup(html, 'html.parser')
+        for heading in soup.select('article h4:has(> p)'):
+            for br in heading.select('br'):
+                br.replace_with(' ')
+            for paragraph in heading.find_all('p', recursive=False):
+                paragraph.insert_before(' ')
+                paragraph.unwrap()
+        html = str(soup)
+    if host == 'ivanovo.dipos.ru' and urlparse(url).path.rstrip('/') == '/rekvizity':
+        for emphasis in soup.select('.content-wrapper h3 i, .content-wrapper h3 em'):
+            emphasis.unwrap()
+        html = str(soup)
+    if (urlparse(url).hostname or '').removeprefix('www.') == 'cteed.ru' and urlparse(url).path == '/ac-konk-elem.htm':
+        # Xara рисует заголовки и маркеры отдельными span. Возвращаем структуру
+        # трёх видимых описаний, сохраняя каждый опубликованный фрагмент.
+        for block in soup.select('div[id^="xr_mvp_"]:not(.xr_mvpo) div.xr_txt'):
+            spans = block.find_all('span', recursive=False)
+            if not spans or not spans[0].get_text(' ', strip=True).startswith('Коньковый элемент '):
+                continue
+            heading = soup.new_tag('h2')
+            heading.string = spans[0].get_text(' ', strip=True)
+            items = []
+            for span in spans[1:]:
+                text = span.get_text(' ', strip=True)
+                if text == '•':
+                    items.append([])
+                elif text:
+                    if not items:
+                        items.append([])
+                    items[-1].append(text)
+            block.clear()
+            block.append(heading)
+            listing = soup.new_tag('ul')
+            for fragments in items:
+                if fragments:
+                    item = soup.new_tag('li')
+                    item.string = ' '.join(fragments)
+                    listing.append(item)
+            block.append(listing)
+        html = str(soup)
     if page_type in ('company', 'distributor'):
         from contact_interactions import preserve_contact_panels
-        preserve_contact_panels(soup)
+        preserve_contact_panels(soup, url)
         html = str(soup)
 
     # Определяем base_url для относительных ссылок
@@ -626,6 +745,16 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
     adapter = None
     domain = _normalize_domain(url) if url else ''
     profile = _resolve_profile(url)
+    if profile is not None and profile.schema_version == 2:
+        from site_profiles.format_v2 import select_page, ProfileRuleError
+        try:
+            profile = select_page(profile, url, page_type, soup)
+        except ProfileRuleError as e:
+            _markdown_fallback(url, page_type, 'page_rules', 'error', 'profile_rule_error', error=str(e))
+            raise
+        _emit_census('profile_rule', url=url, page_type=page_type,
+                     schema_version=profile.schema_version, profile_version=profile.profile_version,
+                     **{k:v for k,v in profile.diagnostics.items() if k != 'source'})
     if profile is not None:
         tier = profile.extract.tier
         if tier == 'custom':
@@ -685,10 +814,21 @@ def html_to_markdown(html: str, url: str = '', page_type: str = '') -> str:
                 except Exception:
                     pass
             _emit_census('extraction', **data)
+        quick_check_event('markdown', url=url, page_type=page_type,
+                          html=quick_check_source_html, markdown=result)
         return result
 
-    if profile_container:
-        selected = soup.select_one(profile_container)
+    content_blocks = md_profile.content_blocks if md_profile is not None else []
+    if profile_container or content_blocks:
+        if content_blocks:
+            from site_profiles.format_v2 import collect_blocks, ProfileRuleError
+            try:
+                selected = collect_blocks(soup, md_profile, page_type, keep_hidden_tabs)
+            except ProfileRuleError as e:
+                _markdown_fallback(url, page_type, 'content_blocks', 'error', 'required_block_missing', error=str(e))
+                raise
+        else:
+            selected = soup.select_one(profile_container)
         if selected is not None:
             # Явная область имеет приоритет над адаптером и эвристиками контейнера.
             # Сохраняем её классы/таблицы, но не исполняемые и скрытые служебные узлы.
@@ -914,6 +1054,50 @@ def _literal_superscripts_to_caret(text: str) -> str:
     return _SUP_POW_RE.sub(lambda m: '^' + ''.join(_SUP_POW_MAP[ch] for ch in m.group(0)), text)
 
 
+def _ryazan_nominal_dimensions(soup, base_url):
+    """Carry the public explanatory label onto its own NF dimension record.
+
+    The heading only selects the current NF; all dimensions must be present
+    in a separate visible tab record. Never decode dimensions from the name
+    or the illustrative 1NF example in the explanatory paragraph.
+    """
+    parsed = urlparse(base_url)
+    if (parsed.hostname or '').removeprefix('www.') != 'ryazanbrick.ru' or '/tproduct/' not in parsed.path:
+        return ''
+    root = soup.select_one('.js-store-product')
+    if root is None:
+        return ''
+    heading = root.find('h1')
+    if heading is None:
+        return ''
+    nf_pattern = r'(?<![\d.,])(\d+(?:[.,]\d+)?)\s*нф\b'
+    identities = re.findall(nf_pattern, heading.get_text(' ', strip=True), re.I)
+    if len(identities) != 1:
+        return ''
+    identity = identities[0].replace(',', '.')
+    records = []
+    for block in root.select('.t-store__tabs__content'):
+        nodes = [block, *block.parents]
+        if any(n.has_attr('hidden') or n.get('aria-hidden') == 'true' or
+               re.search(r'display\s*:\s*none|visibility\s*:\s*hidden', n.get('style', ''), re.I)
+               for n in nodes if getattr(n, 'attrs', None) is not None):
+            continue
+        context = block.get_text(' ', strip=True).casefold()
+        if 'обозначение нф' not in context or 'номинальные размеры' not in context:
+            continue
+        for strong in block.select('strong, b'):
+            text = strong.get_text(' ', strip=True).replace('\ufeff', '').strip()
+            match = re.fullmatch(r'(\d+(?:[.,]\d+)?)\s*НФ\s*[—–-]\s*'
+                                 r'(\d+(?:[.,]\d+)?\s*[×хx]\s*\d+(?:[.,]\d+)?\s*[×хx]\s*\d+(?:[.,]\d+)?)'
+                                 r'(?:\s*(мм))?', text, re.I)
+            if match and match[1].replace(',', '.') == identity:
+                records.append((match[1], match[2], match[3] or ''))
+    if len(records) != 1:
+        return ''
+    nf, dimensions, unit = records[0]
+    return f'Номинальные размеры ({nf} НФ): {dimensions}' + (f' {unit}' if unit else '')
+
+
 def _postprocess_markdown(markdown: str, soup: BeautifulSoup, base_url: str = '') -> str:
     """Добавляет title и h1, если они отсутствуют в markdown."""
     title_text = ""
@@ -931,7 +1115,42 @@ def _postprocess_markdown(markdown: str, soup: BeautifulSoup, base_url: str = ''
         result_parts.append(f"\n# {h1_text}\n")
     if markdown.strip():
         result_parts.append(markdown.strip())
+    nominal_dimensions = _ryazan_nominal_dimensions(soup, base_url)
+    if nominal_dimensions:
+        result_parts.append(nominal_dimensions)
+    if (urlparse(base_url).hostname or '').removeprefix('www.') == 'ryazanbrick.ru':
+        from source_detail_fields import visible_ryazan_images
+        for photo in visible_ryazan_images(soup, base_url):
+            if photo not in markdown:
+                result_parts.append(f'![Фото товара]({photo})')
+    if (urlparse(base_url).hostname or '').removeprefix('www.') == 'nppnfl.ru':
+        from source_detail_fields import visible_nfl_icons
+        icons = visible_nfl_icons(soup, base_url)
+        if icons:
+            result_parts.append('Публичные пиктограммы:\n' + '\n'.join(f'- {k}: {v}' for k, v in icons.items()))
     result = "\n\n".join(result_parts).strip()
+    # Нормализация единиц относится к тексту, но не к адресам ресурсов:
+    # например, каталог 1x5... и thumb500x500 должны остаться побайтно прежними.
+    urls = set()
+    for node in soup.find_all(True):
+        for attr in ('href', 'src', 'data-src'):
+            value = node.get(attr)
+            if isinstance(value, str) and value and not value.startswith(('data:', '#', 'javascript:')):
+                urls.add(value)
+                if base_url:
+                    urls.add(urljoin(base_url, value))
+    prefix = 'STROYRESOURCEURL'
+    while prefix in result:
+        prefix += 'X'
+    protected = {}
+    for index, value in enumerate(sorted(urls, key=len, reverse=True)):
+        if value in result:
+            token = f'{prefix}{index}END'
+            if value.startswith(('https://', 'http://', '//')):
+                result = result.replace(value, token)
+            else:
+                result = re.sub(r'(?<=\]\()' + re.escape(value) + r'(?=[\s\)])', lambda _: token, result)
+            protected[token] = value
     # Утверждённые заказчиком замены символов вне Windows-1251 (Ø→d, →→->, ÷→-, Ω→Ом, λ→лямбда …).
     # (синхронно с docx_generator._clean_text и sanitize_card_filename).
     result = apply_cp1251_replacements(result)
@@ -957,9 +1176,9 @@ def _postprocess_markdown(markdown: str, soup: BeautifulSoup, base_url: str = ''
     # 1а) Градус, набранный НУЛЁМ в суперскрипте (<sup>0</sup>С → «^0С» после конверсии sup):
     #     каретка с нулём перед С/C — значок градуса, не степень (синхронно с docx_generator._clean_text).
     result = re.sub(r'\^0(?=[ \t]*[СCсc](?![А-Яа-яёЁA-Za-z]))', '°', result)
-    result = re.sub('[ \t]*[°˚º⁰\u030a][ \t]*[СCсc](?![А-Яа-яёЁA-Za-z])', ' C', result)
+    result = re.sub('[ \t]*[°˚º⁰ᵒᴼ◦\u030a][ \t]*[СCсc](?![А-Яа-яёЁA-Za-z])', ' C', result)
     # 3) Любой оставшийся значок градуса (угол «90°», «300°ВУ» и т.п.) удаляем полностью.
-    result = re.sub('[°˚º⁰\u030a]', '', result)
+    result = re.sub('[°˚º⁰ᵒᴼ◦\u030a]', '', result)
     # Юникод-дроби (¾, ½, ⅔ …) → обычная запись N/M. Если перед дробью цифра — отделяем пробелом
     # («1¾» → «1 3/4»), чтобы не склеить в «13/4».
     result = re.sub(r'(?<=\d)(?=[' + _FRACTION_CHARS + r'])', ' ', result)
@@ -983,6 +1202,8 @@ def _postprocess_markdown(markdown: str, soup: BeautifulSoup, base_url: str = ''
     # 2) прогоны подчёркиваний (линии форм/разделители, в т.ч. экранированные '\_') — схлопнуть.
     result = re.sub(r'(?:\\_){8,}', r'\\_' * 5, result)
     result = re.sub(r'_{8,}', '_' * 5, result)
+    for token, value in protected.items():
+        result = result.replace(token, value)
     return result
 
 

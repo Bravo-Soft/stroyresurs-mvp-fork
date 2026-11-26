@@ -44,6 +44,7 @@ class RunMetricsCollector:
         self.page_urls = []                     # [(url, category)] сохранённых страниц
         self.extraction_paths = Counter()       # adapter/adapter_special/contacts_universal/universal/generic
         self.markdown_fallbacks = []            # URL, исходный/резервный путь и причина перехода
+        self.profile_rules = []                # v2: выбранное правило и версии входов
         self.markdown_lens = []
         self.min_len = 200                      # порог «пустого» markdown (профиль может сменить)
         self.jsonld_pages = 0
@@ -54,6 +55,8 @@ class RunMetricsCollector:
         self.limits = {}                        # эффективные лимиты прогона (pages/product_pages):
                                                 # baseline сравним только при одинаковых лимитах
         self.card_specs = []                    # число числовых ТХ у товаров, прошедших гейт >=3
+        self.card_spec_counts = []              # Только реально записанные карточки.
+        self.card_sources = []                  # Связь карточки, URL, числа ТХ и доказательств.
         self.gate_specs = []                    # то же у всех товаров, дошедших до гейта
         self.output = {}                        # срез CompanyStatistics
         # P05 U2: периметр обхода. Если база уехала на зеркало/поддомен, гейт периметра
@@ -138,7 +141,9 @@ class RunMetricsCollector:
 
     @_safe
     def sink(self, event, **data):
-        if event == 'markdown_fallback':
+        if event == 'profile_rule':
+            self.profile_rules.append(dict(data))
+        elif event == 'markdown_fallback':
             self.markdown_fallbacks.append(dict(data))
         elif event == 'extraction':
             self.extraction_paths[data.get('path') or 'generic'] += 1
@@ -163,6 +168,13 @@ class RunMetricsCollector:
         self.gate_specs.append(n)
         if passed:
             self.card_specs.append(n)
+
+    @_safe
+    def record_card(self, card_id, url, numeric_specs, path, **evidence):
+        """Вызывать после успешного сохранения карточки, а не после прохождения гейта."""
+        self.card_spec_counts.append(int(numeric_specs))
+        self.card_sources.append(dict(card_id=card_id, url=url, numeric_specs=int(numeric_specs),
+                                      path=str(path), **evidence))
 
     @_safe
     def record_output(self, stats: dict):
@@ -207,11 +219,14 @@ class RunMetricsCollector:
             'card_yield': (self._rate(product_cards, product_pages)
                            if isinstance(product_cards, int) else None),
             'avg_specs_per_card': avg_specs,
+            'card_spec_counts': list(self.card_spec_counts),
+            'card_sources': list(self.card_sources),
             'sitemap_url_count': self.sitemap_url_count,
             # Extraction
             'extraction_path_share': {k: self._rate(v, extraction_total)
                                       for k, v in self.extraction_paths.items()},
             'markdown_fallbacks': list(self.markdown_fallbacks),
+            'profile_rules': list(self.profile_rules),
             'empty_markdown_rate': self._rate(empty_md, len(self.markdown_lens)),
             'gate3_pass_rate': self._rate(products_processed, gate3_total),
             'jsonld_share': self._rate(self.jsonld_pages, self.universal_detail_pages),

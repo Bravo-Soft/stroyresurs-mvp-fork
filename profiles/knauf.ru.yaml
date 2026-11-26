@@ -1,0 +1,114 @@
+domain: knauf.ru
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.858
+source: mixed
+notes:
+- 'Родительские категории уточнены по видимым хлебным крошкам и обследованным страницам;
+  информационные разделы исключены только из товарной роли. Полный каталог не заявляется.
+  Доказательства: profile_te24_20261118/category_plan22.json и coverage_revision6.'
+crawl:
+  render: html
+sections:
+  catalog_roots:
+  - /catalog/instrumenty/
+  - /catalog/
+  - /catalog/instrumenty/malyarnye-shtukaturnye-i-shpaklevochnye-raboty/
+  - /catalog/instrumenty/malyarnye-shtukaturnye-i-shpaklevochnye-raboty/prochee/
+  - /catalog/instrumenty/malyarnye-shtukaturnye-i-shpaklevochnye-raboty/shpateli/
+  - /catalog/komplektuyushchie/
+  - /catalog/komplektuyushchie/akvapanel/
+  - /catalog/komplektuyushchie/lenty-stroitelnye-rulonnye-materialy/
+  - /catalog/komplektuyushchie/lenty-stroitelnye-rulonnye-materialy/lenty-dlya-shpaklevaniya/
+  - /catalog/komplektuyushchie/lenty-stroitelnye-rulonnye-materialy/lenty-dlya-shpaklevaniya/bumazhnaya/
+  - /catalog/komplektuyushchie/lenty-stroitelnye-rulonnye-materialy/lenty-dlya-shpaklevaniya/kurt/
+  - /catalog/komplektuyushchie/lenty-stroitelnye-rulonnye-materialy/lenty-uplotnitelnye/
+  - /catalog/komplektuyushchie/lenty-stroitelnye-rulonnye-materialy/lenty-uplotnitelnye/knauf-dikhtungsband/
+  - /catalog/krepyezhnye-izdeliya/
+  - /catalog/krepyezhnye-izdeliya/ankery/
+  - /catalog/krepyezhnye-izdeliya/krepezh-akvapanel/
+  - /catalog/krepyezhnye-izdeliya/shurupy/
+  - /catalog/listovye-i-plitnye-materialy/
+  - /catalog/listovye-i-plitnye-materialy/gipsokarton-gkl/
+  - /catalog/listovye-i-plitnye-materialy/gipsovoloknistye-listy-gvl/
+  - /catalog/listovye-i-plitnye-materialy/knauf-akvapanel/
+  - /catalog/listovye-i-plitnye-materialy/knauf-akvapanel/naruzhnaya/
+  - /catalog/modulnye-podvesnye-potolki/
+  - /catalog/modulnye-podvesnye-potolki/podvesnye-sistemy/
+  - /catalog/penopolistirol/
+  - /catalog/penopolistirol/izgotovlenie-sendvich-paneley/
+  - /catalog/potolochnye-paneli/
+  - /catalog/potolochnye-paneli/akusticheskie-ostrova/
+  - /catalog/profili-metallicheskie/
+  - /catalog/profili-metallicheskie/led-profil-kamennye-doma/
+  - /catalog/sukhie-stroitelnye-smesi-i-gotovye-sostavy/
+  - /catalog/sukhie-stroitelnye-smesi-i-gotovye-sostavy/Ochistiteli-i-propitki/
+  - /catalog/utepliteli-i-izolyatsionnye-materialy/
+  - /catalog/utepliteli-i-izolyatsionnye-materialy/drevesnaya-izolyatsiya/
+  product_url_patterns:
+  - ^https?://(?:www\.)?knauf\.ru/catalog/(?:[^/]+/){2,3}[^/]+/?$
+  product_url_antipatterns:
+  - /catalog/instrumenty//?$
+  contacts_urls:
+  - /company/contacts/
+  distributor_urls: []
+  start_urls:
+  - /catalog/instrumenty/
+  - /company/contacts/
+extract:
+  tier: llm
+  markdown:
+    product_container: main.main
+    company_container: body
+    remove_selectors:
+    - nav
+    - button
+    - form
+    - .breadcrumbs
+    - .breadcrumb
+    - .menu
+    - .popup
+    - '[class*=ymaps]'
+    - .product-recommendations
+    - .feedback
+    - '#DOCUMENTS'
+    - .main__breadcrumbs
+    - a.btn
+    - .profile-picker
+    - .offcanvas
+    - .header__navigation
+    - .expandable__control
+  page_rules:
+  - name: category
+    match:
+      path_regex: ^/catalog/instrumenty/?$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: de7f0e3c3bd38698d3de23fbb499f2d9263374a7
+  selector_hit_rate: 1.0
+  pages_crawled: 533
+  product_pages: 511
+  product_cards: 256
+  card_yield: 0.501
+  avg_specs_per_card: 6.91
+  jsonld_share: 0.7476
+  cms_detected: generic-main
+  fetch_fail_rate: 0.0051
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.9481
+  sitemap_url_count: 500
+  extraction_path_share:
+    universal: 0.8791
+    generic: 0.0035
+    contacts_universal: 0.1174
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    product: 511
+    category: 20
+    main_page: 2
+schema_version: 2

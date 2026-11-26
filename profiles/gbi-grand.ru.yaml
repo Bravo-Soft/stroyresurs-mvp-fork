@@ -1,0 +1,83 @@
+domain: gbi-grand.ru
+profile_version: 2
+profiled_at: '2026-10-23'
+confidence: 0.692
+source: mixed
+notes:
+- Карта и контейнеры уточнены по живым HTML 13.11.2026; исторические метрики сохранены.
+  Приёмка только по отдельному контрольному прогону.
+- 'Партия 24: проверка 13.11.2026 с обязательной цепочкой цены; исторические метрики
+  сохранены.'
+crawl:
+  render: html
+sections:
+  price_list_urls:
+  - /price/
+  product_url_patterns:
+  - /product/[^/?#]+(?:/[^/?#]+)?/?$
+  product_url_antipatterns:
+  - /product/?$
+  - /price/
+  contacts_urls:
+  - /contacts/
+  distributor_urls: []
+  catalog_roots:
+  - /product/
+  start_urls:
+  - /contacts/
+extract:
+  tier: llm
+  markdown:
+    product_container: null
+    company_container: .right_block
+    distributor_container: .right_block
+    remove_selectors:
+    - .bx-yandex-view-layout
+    - ymaps
+    - .breadcrumb
+    - '[id^="BX_YMAP_MAP_"]'
+    - .hidden
+    - .left_block
+    content_blocks:
+    - name: title
+      selector: h1
+      required: true
+    - name: body
+      selector: .right_block
+      required: true
+  keep_hidden_tabs: false
+  page_rules:
+  - name: catalog_navigation
+    match:
+      path_regex: ^/product/$
+    extract:
+      markdown:
+        product_container: h1
+        content_blocks: []
+baseline:
+  structure_hash: b273c1388432efd57233398c3b5fa7912d4234ee
+  selector_hit_rate: 1.0
+  pages_crawled: 27
+  product_pages: 23
+  product_cards: 17
+  card_yield: 0.7391
+  avg_specs_per_card: 126.0
+  jsonld_share: 1.0
+  cms_detected: generic-role-main
+  fetch_fail_rate: 0.0741
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 1.0
+  sitemap_url_count: null
+  extraction_path_share:
+    universal: 0.2632
+    generic: 0.3947
+    contacts_universal: 0.3421
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    price_list: 3
+    main_page: 1
+    product: 23
+schema_version: 2

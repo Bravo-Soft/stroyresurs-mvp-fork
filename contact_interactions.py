@@ -1,5 +1,6 @@
 """Полный снимок связанных панелей контактов без кликов по меню и формам."""
 from collections import Counter
+import re
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -104,8 +105,46 @@ async def collect_contact_panels(page, selectors):
     return str(base)
 
 
-def preserve_contact_panels(soup):
+def preserve_contact_panels(soup, page_url=''):
     """Перед очисткой переносим подтверждённые панели из скрытых контейнеров."""
+    from product_interactions import _control_available
+    parsed = urlparse(page_url or '')
+    if ((parsed.hostname or '').removeprefix('www.') == 'carlisle-llc.ru'
+            and parsed.path == '/predstaviteli.html'):
+        for control in soup.select('.djflyer_title[id][onclick]'):
+            match = re.fullmatch(r'mod(\d+)_title(\d+)', control['id'])
+            if not match or not _control_available(control):
+                continue
+            module, number = match.groups()
+            if control['onclick'].strip() != f'show{module}({number});':
+                continue
+            panels = soup.select(f'#mod{module}_item{number}')
+            label = control.select_one('.item_name')
+            if len(panels) != 1 or label is None or panels[0].select_one('form,input,textarea'):
+                continue
+            panel = panels[0]
+            if not panel.select_one('.item_desc h4'):
+                continue  # Общая карта не является источником контактов.
+            for frame in list(panel.select('iframe')):
+                frame.decompose()
+            title = panel.select_one('.item_title')
+            if title is not None:
+                title.decompose()
+            panel['data-contact-panel'] = panel['id']
+            panel['data-tab'] = 'Представители: ' + label.get_text(' ', strip=True)
+    for tabs in soup.select('.djtabs'):
+        for control in tabs.select('.djtabs-title[data-tab-no]'):
+            if not _control_available(control):
+                continue
+            number = control['data-tab-no']
+            panels = [p for p in tabs.select('.djtabs-body[data-tab-no]') if p['data-tab-no'] == number]
+            if len(panels) != 1 or panels[0].select_one('form,input,textarea'):
+                continue
+            panel = panels[0]
+            if not panel.get_text(' ', strip=True):
+                continue
+            panel['data-contact-panel'] = tabs.get('id', 'djtabs') + '-' + number
+            panel['data-tab'] = control.get_text(' ', strip=True)
     root = soup.find('main') or soup.find('article') or soup.body or soup
     for panel in list(soup.select('[data-contact-panel]')):
         if panel is root or root in panel.descendants or panel.find_parent(attrs={'data-contact-panel': True}):

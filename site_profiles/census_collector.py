@@ -188,6 +188,16 @@ class CensusCollector:
             draft['crawl']['antibot'] = antibot
         if not draft['crawl']:
             del draft['crawl']
+        if self.profile is not None and self.profile.schema_version == 2:
+            # Перепись не заменяет ручные правила эвристическими настройками.
+            from dataclasses import asdict
+            source = deepcopy(self.profile.diagnostics.get('source'))
+            if source is None:
+                source = asdict(self.profile)
+                source.pop('diagnostics', None)
+            for key in ('profile_version', 'profiled_at', 'confidence', 'baseline', 'census_evidence'):
+                source[key] = draft[key]
+            draft = source
         return draft
 
     def write_draft(self, drafts_dir: str) -> str:
@@ -198,7 +208,13 @@ class CensusCollector:
             import yaml
             from .models import profile_from_dict
             draft = self.build_draft()
-            _, errors = profile_from_dict(draft)
+            if draft.get('schema_version') == 2:
+                from .format_v2 import compose
+                from .resolver import get_resolver
+                effective, _ = compose(draft, get_resolver().profiles_dir)
+            else:
+                effective = draft
+            _, errors = profile_from_dict(effective)
             if errors:
                 logger.warning(f'Черновик профиля {self.metrics.domain} невалиден: {errors}')
                 return ''

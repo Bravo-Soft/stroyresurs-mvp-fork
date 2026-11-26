@@ -1,0 +1,149 @@
+domain: oooapogei.ru
+profile_version: 1
+profiled_at: '2026-08-26'
+confidence: 0.791
+source: mixed
+notes:
+- 'Партия 104: проверка 13.11.2026 с обязательной цепочкой цены; исторические метрики
+  сохранены.'
+- 'Редакция2: точечная коррекция контейнеров контактов/категорий; checker v7, новый
+  контроль.'
+crawl:
+  render: html
+sections:
+  product_url_patterns:
+  - ^/product/id/[0-9]+/?$
+  product_url_antipatterns: []
+  contacts_urls:
+  - /contacts/
+  - /company/requisites/
+  distributor_urls: []
+  catalog_roots:
+  - /product/
+  - /product/balansirovochnye-avtomaticheskie/
+  start_urls:
+  - /product/
+  - /contacts/
+extract:
+  tier: llm
+  markdown:
+    product_container: null
+    company_container: null
+    distributor_container: .right_block
+    content_blocks:
+    - name: title
+      selector: h1
+      required: true
+    - name: body
+      selector: .right_block
+      required: true
+    remove_selectors:
+    - .tabs
+    - .catalog-detail__fixed-info
+    - .breadcrumbs
+    - .item-action
+    - form
+    - .breadcrumb
+    - .btn
+    - '#map'
+    - ymaps
+    - .hint__icon
+  keep_hidden_tabs: true
+  page_rules:
+  - name: category
+    match:
+      path_regex: ^/product/balansirovochnye-avtomaticheskie/$
+    extract:
+      markdown:
+        product_container: h1
+        content_blocks: []
+  - name: company_1
+    match:
+      path_regex: ^/contacts/$
+    extract:
+      markdown:
+        company_container: null
+        content_blocks:
+        - name: part0
+          selector: h1
+          required: true
+        - name: part1
+          selector: .right_block
+          required: true
+        - name: part2
+          selector: footer .footer__copy
+          required: true
+        remove_selectors:
+        - .tabs
+        - .catalog-detail__fixed-info
+        - .breadcrumbs
+        - .item-action
+        - form
+        - .breadcrumb
+        - .btn
+        - '#map'
+        - ymaps
+        - .contacts__filter
+        - .bx-yandex-view-layout
+        - '[id^="BX_YMAP_MAP_"]'
+        - footer .items
+        - footer .callback-block
+        - .hidden
+      keep_hidden_tabs: false
+  - name: company_2
+    match:
+      path_regex: ^/company/requisites/$
+    extract:
+      markdown:
+        company_container: null
+        content_blocks:
+        - name: part0
+          selector: h1
+          required: true
+        - name: part1
+          selector: .right_block
+          required: true
+        - name: part2
+          selector: footer .footer__copy
+          required: true
+        remove_selectors:
+        - .tabs
+        - .catalog-detail__fixed-info
+        - .breadcrumbs
+        - .item-action
+        - form
+        - .breadcrumb
+        - .btn
+        - '#map'
+        - ymaps
+        - .contacts__filter
+        - .bx-yandex-view-layout
+        - '[id^="BX_YMAP_MAP_"]'
+        - footer .items
+        - footer .callback-block
+        - .hidden
+      keep_hidden_tabs: false
+baseline:
+  structure_hash: 4a13cf4275ad1eebadc55092c3859a175374cef2
+  selector_hit_rate: 1.0
+  pages_crawled: 11
+  product_pages: 9
+  product_cards: 8
+  jsonld_share: 1.0
+  cms_detected: microdata-product
+  fetch_fail_rate: 0.0217
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 482
+  extraction_path_share:
+    contacts_universal: 0.7692
+    universal: 0.2051
+    generic: 0.0256
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    product: 9
+    main_page: 2
+schema_version: 2

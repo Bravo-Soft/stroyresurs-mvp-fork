@@ -1,0 +1,125 @@
+domain: emufta.com
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.912
+source: mixed
+notes:
+- 'Партия ТЭ24: проверка 18.11.2026 с обязательной цепочкой цены; исторические метрики
+  сохранены.'
+- Параметры пагинации не являются третьим сегментом товарного пути; запрещено поглощать
+  ?/# в product_url_patterns.
+- 'Исключен canvas интерактивного 3D-просмотра: проверенные характеристики опубликованы
+  отдельным текстом; модель и чертежи не служат источником измерений. Доказательства:
+  manual_reviews/revision9/emufta.com.json.'
+crawl:
+  render: html
+sections:
+  product_url_patterns:
+  - ^https?://(?:www\.)?emufta\.com/(?:analogi-importnyh-muft|mufty-esm-seriya|mufty-etm-em-seriya)/[^/?#]+/[^/?#]+/?$
+  catalog_roots:
+  - /mufty-esm-seriya/
+  - /mufty-esm-seriya/esm-1/
+  - /mufty-esm-seriya/esm-3/
+  - /mufty-esm-seriya/esm-5/
+  - /mufty-etm-em-seriya/
+  - /mufty-etm-em-seriya/beskontaktnye/
+  - /mufty-etm-em-seriya/kontaktnye/
+  - /mufty-etm-em-seriya/tormoznye/
+  - /analogi-importnyh-muft/ek-er/
+  - /analogi-importnyh-muft/mufty-dlya-sh-tehniki/
+  - /analogi-importnyh-muft/warner-electric/
+  contacts_urls:
+  - /contacts/
+  distributor_urls: []
+  product_url_antipatterns: []
+  start_urls:
+  - /contacts/
+  - /mufty-esm-seriya/
+  - /mufty-esm-seriya/esm-1/
+  - /mufty-esm-seriya/esm-3/
+  - /mufty-esm-seriya/esm-5/
+  - /mufty-etm-em-seriya/
+  - /mufty-etm-em-seriya/beskontaktnye/
+  - /mufty-etm-em-seriya/kontaktnye/
+  - /mufty-etm-em-seriya/tormoznye/
+  - /analogi-importnyh-muft/ek-er/
+  - /analogi-importnyh-muft/mufty-dlya-sh-tehniki/
+  - /analogi-importnyh-muft/warner-electric/
+extract:
+  tier: llm
+  keep_hidden_tabs: false
+  markdown:
+    product_container: .product-page
+    company_container: body
+    distributor_container: body
+    remove_selectors:
+    - button
+    - form
+    - .breadcrumbs
+    - .breadcrumb
+    - nav
+    - .desktop-catalog
+    - .formback
+    - .form_modal59
+    - '#cookie-wrap'
+    - '[class*=ymaps]'
+    - .qty
+    - label[for="quantity"]
+    - ul.breadcrumbs
+    - input
+    - select
+    - textarea
+    - .product-page__btn label.hidden
+    - a[href*="_shema-"]
+    - a[href*="chertezhy"]
+    - img[src*="_shema-"]
+    - img[src*="chertezhy"]
+    - canvas
+  page_rules:
+  - name: negative_example
+    match:
+      path_regex: ^/mufty-esm-seriya/?$
+    extract:
+      markdown:
+        product_container: h1
+  - name: product_and_faq
+    match:
+      path_regex: /elektromagnitnaya-mufta-
+    extract:
+      markdown:
+        content_blocks:
+        - name: faq
+          selector: .faq
+          required: false
+  - name: warner_catalog_pagination
+    match:
+      path_regex: ^/analogi-importnyh-muft/warner-electric/?$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: 74f1380039e5d1fc425413a93623ecfd1bf1bb33
+  selector_hit_rate: 0.9364
+  pages_crawled: 522
+  product_pages: 519
+  product_cards: 314
+  card_yield: 0.605
+  avg_specs_per_card: 3.47
+  jsonld_share: 1.0
+  cms_detected: microdata-product
+  fetch_fail_rate: 0.005
+  challenge_rate: 0.0017
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.9968
+  sitemap_url_count: 0
+  extraction_path_share:
+    universal: 0.9792
+    contacts_universal: 0.0208
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    main_page: 1
+    product: 519
+    category: 2
+schema_version: 2

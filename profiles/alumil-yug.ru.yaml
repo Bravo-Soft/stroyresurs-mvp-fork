@@ -1,0 +1,98 @@
+domain: alumil-yug.ru
+profile_version: 1
+profiled_at: '2026-08-31'
+confidence: 0.0
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+- '18.11.2026: Carlito закреплён в browser_fonts и Dockerfile; подтверждена видимость
+  полных товарных блоков без изменения HTML/CSS. Удалены устаревшие отсечения абзацев
+  для отсутствующего Calibri. Контакты только из текста, карты не используются.'
+sections:
+  catalog_roots:
+  - /products.html
+  - /sliding%20system.html
+  - /doors%20and%20windows.html
+  - /curtainwalls.html
+  - /vhodnie_dveri_alumil.html
+  - /accordion.html
+  contacts_urls:
+  - /contact.html
+  product_url_patterns:
+  - /s650_alumil_razdvizhnaya_dver\.html/?(?:\?|$)
+  - /s650\ e\-motion_razdvizhnaya_gver_elektroprivod_avtomatika\.html/?(?:\?|$)
+  - /sd95_alumil_vhodnie_dveri\.html/?(?:\?|$)
+  - /m19800\.html/?(?:\?|$)
+  - /s67_aluminievie_okna_alumil\.html/?(?:\?|$)
+  - /md9660_alumil_aluminievie_dvei\.html/?(?:\?|$)
+  product_url_antipatterns:
+  - /products\.html/?(?:\?|$)
+  - /sliding\ system\.html/?(?:\?|$)
+  - /doors\ and\ windows\.html/?(?:\?|$)
+  - /curtainwalls\.html/?(?:\?|$)
+  - /vhodnie_dveri_alumil\.html/?(?:\?|$)
+  - /accordion\.html/?(?:\?|$)
+  start_urls:
+  - https://alumil-yug.ru/products.html
+  - https://alumil-yug.ru/sliding%20system.html
+  - https://alumil-yug.ru/doors%20and%20windows.html
+  - https://alumil-yug.ru/curtainwalls.html
+  - https://alumil-yug.ru/vhodnie_dveri_alumil.html
+  - https://alumil-yug.ru/accordion.html
+  - https://alumil-yug.ru/contact.html
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: '#text1'
+    distributor_container: body
+    min_len: 1
+    remove_selectors:
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .menu
+  - name: category_heading
+    match:
+      path_regex: ^(?:/products\.html|/sliding\ system\.html|/doors\ and\ windows\.html|/curtainwalls\.html|/vhodnie_dveri_alumil\.html|/accordion\.html)$
+    extract:
+      markdown:
+        product_container: '#text1'
+baseline:
+  structure_hash: null
+  selector_hit_rate: null
+  pages_crawled: 0
+  product_pages: 0
+  product_cards: 0
+  jsonld_share: null
+  cms_detected: null
+  fetch_fail_rate: 1.0
+  challenge_rate: 0.0
+  empty_markdown_rate: null
+  gate3_pass_rate: null
+  sitemap_url_count: null
+  extraction_path_share: {}
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts: {}
+crawl:
+  exclude_paths: []
+schema_version: 2

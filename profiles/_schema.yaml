@@ -1,9 +1,12 @@
+# Формат v2 и наследование: profiles/FORMAT_V2.md. Без schema_version действует v1.
 # Схема профиля сайта (документ-эталон; программная валидация — site_profiles/models.py,
 # enum-значения там же: RENDER_VALUES/ANTIBOT_VALUES/TIER_VALUES/SOURCE_VALUES).
 # Принцип: null / пустой список / false = текущее глобальное поведение пайплайна;
 # профиль из одних дефолтов байт-в-байт эквивалентен отсутствию профиля.
 # Файлы профилей: <домен>.yaml (канонический домен, без www). Файлы _*.yaml — служебные.
 
+schema_version: 1            # 1 = прежний формат; 2 = page_rules/content_blocks/extends
+extends: {}                  # v2: rules_version, необязательные group/group_version
 domain: example.ru            # ОБЯЗАТЕЛЬНОЕ. Канонический домен = ключ резолюции.
 profile_version: 1            # инкремент при каждом изменении профиля
 profiled_at: "2026-08-18"     # когда перепись/человек мерил сайт
@@ -49,6 +52,7 @@ crawl:
     max_concurrent_files: null
     fetch_timeout_s: null     # null -> config.http_timeout
     file_timeout_s: null
+    max_company_file_size_mb: null # файлы компании, null -> config.max_file_size_mb
     page_retry_attempts: null # null -> page_retry_max_attempts (D40)
 
 sections:                     # карта разделов сайта
@@ -79,12 +83,14 @@ extract:
   llm_program: null           # именованная LLM-программа (фаза 2)
   streaming: null             # null = глобальная настройка; false = принудительно батч (D85)
   markdown:                   # точный профиль markdown per page_type
-    product_container: null   # CSS-контейнер карточки (первым в цепочке generic-выбора)
+    product_container: null   # найденный контейнер имеет приоритет над адаптером и автоматикой
     remove_selectors: []      # пер-сайтовый шум ДОПОЛНИТЕЛЬНО к универсальной чистке
     min_len: null             # null -> 200: порог «пустого» markdown / отката universal
     max_len: null             # null -> без обрезки; иначе жёсткий лимит символов markdown
     company_container: null
     distributor_container: null
+    content_blocks: []        # v2: [{name, selector, required}], см. FORMAT_V2.md
+  page_rules: []              # v2: [{name, priority, match, extract}]
 
 baseline:                     # метрики последней переписи/успешного прогона (пишет census;
                               # свободный словарь — программной схемы нет, состав ниже)

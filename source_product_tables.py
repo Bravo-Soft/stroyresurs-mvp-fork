@@ -626,6 +626,20 @@ def restore_deterministic_tables(ai_data, html, url):
     if not isinstance(product, dict):
         return []
     soup = BeautifulSoup(html, 'lxml')
+    if _host(url) == 'bazismetall.ru' and urlparse(url).path.startswith('/product/'):
+        classifiers = set()
+        for row in soup.select('#tab-additional_information table.woocommerce-product-attributes tr'):
+            if not _ui_available(row, soup, url):
+                continue
+            cells = row.find_all(['th', 'td'], recursive=False)
+            if len(cells) == 2 and cells[0].get_text(' ', strip=True).casefold() == 'классификатор':
+                value = cells[1].get_text(' ', strip=True)
+                if value:
+                    classifiers.add(value)
+        if len(classifiers) == 1:
+            specs = product.setdefault('specifications', {})
+            if isinstance(specs, dict):
+                specs['Классификатор'] = classifiers.pop()
     purposes = (soup.select('main[data-source-family] p[data-source-common-purpose]')
                 if _host(url) == 'nzmk22.ru' else [])
     if purposes:
@@ -859,6 +873,65 @@ def restore_deterministic_tables(ai_data, html, url):
     return layouts
 
 
+def unwrap_irvis_layout(soup):
+    """Keep both technical grids intact; other tables arrange gallery, text and file links."""
+    root = soup.select_one('td.contents > div')
+    if not root:
+        return
+    for table in reversed(root.select('table')):
+        if 'td_table' in table.get('class', []) or any(td.find_parent('table') is table for td in table.select('td.tovart, td.tovart2')):
+            continue
+        own = [tag for tag in table.find_all(['tr', 'td', 'th', 'tbody', 'thead', 'tfoot'])
+               if tag.find_parent('table') is table]
+        for tag in own:
+            tag.name = 'div'
+        table.name = 'div'
+
+
+def _istra_heaters(soup, url):
+    from copy import deepcopy
+    from urllib.parse import quote
+    from text_extractor import MarkdownConverter
+    content = soup.select_one('#content .field-name-body .field-item')
+    tables = content.find_all('table') if content else []
+    if len(tables) != 1 or not _ui_available(tables[0], soup, url):
+        return []
+    converter = MarkdownConverter()
+    _, grid = _grid(tables[0], converter)
+    if len(grid) < 3 or any(cell is None for row in grid for cell in row):
+        return []
+    headers = [cell_text(cell, converter) for cell in grid[0]]
+    if headers[:2] not in (['№', 'Название'], ['№', 'Наименование']) or 'Паспорт' not in headers:
+        return []
+    families = []
+    for row in grid[1:]:
+        name = cell_text(row[1], converter)
+        if not re.fullmatch(r'СФО-\d+(?:/\d+)?М?', name, re.I):
+            return []
+        doc = BeautifulSoup('<html><body><main id="content"></main></body></html>', 'lxml')
+        key = 'source-family=' + quote(name, safe='')
+        doc.main['data-source-family'] = key
+        heading = doc.new_tag('h1')
+        heading.string = 'Электрокалорифер ' + name
+        doc.main.append(heading)
+        for block in content.find_all(['p', 'ul'], recursive=False):
+            if 'tblname' not in block.get('class', []) and (block.get_text(strip=True) or block.find('img')):
+                doc.main.append(deepcopy(block))
+        properties = doc.new_tag('table')
+        doc.main.append(properties)
+        for label, cell in zip(headers[2:], row[2:], strict=True):
+            line = doc.new_tag('tr')
+            properties.append(line)
+            prop = doc.new_tag('th')
+            prop.string = label
+            value = deepcopy(cell)
+            value.name = 'td'
+            value.attrs = {}
+            line.extend([prop, value])
+        families.append(dict(url=urlparse(url)._replace(fragment=key).geturl(), title=name, html=str(doc)))
+    return families if len({f['url'] for f in families}) == len(families) else []
+
+
 def source_catalog_families(html, url):
     """Отдельные товарные секции смешанного каталога, явно озаглавленные DOM.
 
@@ -869,12 +942,35 @@ def source_catalog_families(html, url):
     from urllib.parse import quote, urlunparse
     host = _host(url)
     prefixes = {'bsdbel.ru': '/catalog/', 'ventexpress.ru': '/produkciya/',
-                'nzmk22.ru': '/products/', 'npo-stekloplastic.ru': '/products/'}
+                'nzmk22.ru': '/products/', 'npo-stekloplastic.ru': '/products/', 'demidovo.ru': '/products/specifications/', 'omskblok.ru': '/stroitelnye-smesi/', 'istra-vniieto.ru': '/elektrokalorifery-sfo-'}
     if host not in prefixes or not urlparse(url).path.startswith(prefixes[host]):
         return []
     soup = BeautifulSoup(html, 'lxml')
     if soup.select_one('main[data-source-family]'):
         return []
+    if host == 'istra-vniieto.ru':
+        return _istra_heaters(soup, url)
+    if host == 'omskblok.ru':
+        families = []
+        shared = soup.select_one('main .wpb_column.vc_col-sm-12 .wpb_text_column')
+        for column in soup.select('main .wpb_column.vc_col-sm-6'):
+            title = column.select_one('ol li')
+            if not title or not column.select_one('img[src]') or not _ui_available(column, soup, url):
+                continue
+            name = title.get_text(' ', strip=True)
+            key = 'source-family=' + quote(name, safe='')
+            result = BeautifulSoup('<html><head></head><body><main id="main-content"></main></body></html>', 'lxml')
+            result.main['data-source-family'] = key
+            header = result.new_tag('h1')
+            header.string = name
+            result.main.append(header)
+            result.main.append(deepcopy(column))
+            if shared and _ui_available(shared, soup, url):
+                result.main.append(deepcopy(shared))
+            families.append(dict(title=name, url=urlunparse(urlparse(url)._replace(fragment=key)), html=str(result)))
+        if len(families) < 2 or len({item['url'] for item in families}) != len(families):
+            return []
+        return families
     if host == 'npo-stekloplastic.ru':
         # Четыре опубликованных Elementor-таблицы имеют собственные
         # именные caption в полной первой строке thead. Общие тексты каталога
@@ -915,6 +1011,8 @@ def source_catalog_families(html, url):
     groups = {}
     for table in soup.find_all('table'):
         if not _ui_available(table, soup, url):
+            continue
+        if host == 'demidovo.ru' and ('sertif' not in table.get('class', []) or not table.find_parent(class_='content-wrapper')):
             continue
         if host == 'nzmk22.ru' and 'table-product' not in table.get('class', []):
             continue
@@ -961,6 +1059,12 @@ def source_catalog_families(html, url):
                 copied = deepcopy(purpose)
                 copied['data-source-common-purpose'] = 'true'
                 result.main.append(copied)
+        if host == 'demidovo.ru':
+            for _, table in items:
+                result.main.append(deepcopy(table))
+            families.append(dict(url=urlunparse(urlparse(url)._replace(fragment=key)),
+                                 title=name, html=str(result)))
+            continue
         headings = {id(h) for h, _ in items}
         # Только блоки, принадлежащие этой секции, вне самих таблиц.
         for block in soup.find_all(['p', 'img', 'table']):
@@ -980,9 +1084,26 @@ def source_family_catalog_reason(html, url):
     Виртуальный адрес сначала изолирует вызывающая сторона. Родительский
     смешанный каталог не становится карточкой даже при ошибочном AI product.
     """
+    host = _host(url)
+    path = urlparse(url).path
+    if host == 't-sila.ru' and re.fullmatch(r'/catalog/\d+/?', path):
+        soup = BeautifulSoup(html, 'lxml')
+        product_paths = set()
+        for link in soup.select('.content-intro table td a[href]'):
+            address = urljoin(url, link['href'])
+            child_path = urlparse(address).path
+            if (_host(address) == host and re.fullmatch(r'/catalog/view/\d+/?', child_path)
+                    and _ui_available(link, soup, url)):
+                product_paths.add(child_path.rstrip('/'))
+        if len(product_paths) >= 2 and not soup.select_one('.content .head-left-cart-h1'):
+            return 'Сравнительная таблица каталога с отдельными страницами моделей насосов'
+    if host == 'keramika102.com' and re.fullmatch(r'/catalog/[^/]+/[^/]+/?', path):
+        soup = BeautifulSoup(html, 'lxml')
+        if not soup.select_one('.catalog-detail') and soup.select_one('.catalog-categories__item'):
+            return 'По товарному адресу опубликован список категорий, отдельного товара нет'
     prefixes = {'bsdbel.ru': '/catalog/', 'ventexpress.ru': '/produkciya/',
-                'nzmk22.ru': '/products/', 'npo-stekloplastic.ru': '/products/'}
-    if _host(url) not in prefixes or not urlparse(url).path.startswith(prefixes[_host(url)]):
+                'nzmk22.ru': '/products/', 'npo-stekloplastic.ru': '/products/', 'demidovo.ru': '/products/specifications/', 'omskblok.ru': '/stroitelnye-smesi/', 'istra-vniieto.ru': '/elektrokalorifery-sfo-'}
+    if host not in prefixes or not path.startswith(prefixes[host]):
         return None
     if urlparse(url).fragment.startswith('source-family='):
         return None
@@ -991,7 +1112,7 @@ def source_family_catalog_reason(html, url):
         return None
     # В опубликованном Elementor-каталоге ссылки на готовые изделия и
     # сравнительная таблица базовых материалов не образуют один товар.
-    if _host(url) == 'npo-stekloplastic.ru':
+    if host == 'npo-stekloplastic.ru':
         base = urlparse(url)
         root = soup.select_one('.di-page-contents .elementor, [data-elementor-type="wp-page"]') or soup.new_tag('div')
         children = {}

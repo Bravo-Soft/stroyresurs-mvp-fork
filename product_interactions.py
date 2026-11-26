@@ -1,7 +1,7 @@
 """Публичные товарные окна Tilda и связанные панели характеристик."""
 import re
 from copy import deepcopy
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, urljoin
 
 from bs4 import BeautifulSoup
 from inline_products import inline_product_key, isolate_inline_product
@@ -13,6 +13,43 @@ PRODUCT_PANEL_SELECTOR = ('[data-toggle="collapse"], [data-bs-toggle="collapse"]
 PRODUCT_PANEL_LABEL = re.compile(
     r'характеристик|параметр|описани|документ|сертификат|инструкци|'
     r'размер|specification|technical|description|document|download', re.I)
+
+
+async def capture_public_product_links_html(page):
+    """У AKSA фиксирует видимость ссылок браузером, не раскрывая скрытые блоки.
+
+    Служебные атрибуты не являются источником характеристик. Они подтверждают
+    только маршрут обнаружения товара на текущей пользовательской странице.
+    """
+    if (urlparse(page.url).hostname or '').removeprefix('www.') == 'aksa.com.ru':
+        if urlparse(page.url).path.startswith('/product/'):
+            trigger=page.locator('.app-select-main__field')
+            if await trigger.count() and await trigger.first.is_visible():
+                options=page.locator('.app-dropdown-item button')
+                if not await options.count() or not await options.first.is_visible():
+                    await trigger.first.click(timeout=5000)
+                await page.wait_for_function("""() => {
+                    const el=document.querySelector('.app-dropdown-item button');
+                    if (!el) return false;
+                    for(let n=el;n;n=n.parentElement) {
+                        const s=getComputedStyle(n);
+                        if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<.99)return false;
+                    }
+                    return el.getBoundingClientRect().height>0;
+                }""",timeout=5000)
+                await options.evaluate_all("els=>els.forEach(el=>el.setAttribute('data-stroy-public-option','1'))")
+        await page.evaluate("""() => {
+            for (const el of document.querySelectorAll('a[href],[onclick],[data-href],[data-url]')) {
+                let visible=el.getClientRects().length>0;
+                for (let node=el;visible && node;node=node.parentElement) {
+                    const s=getComputedStyle(node);
+                    visible=!node.hidden && node.getAttribute('aria-hidden')!=='true'
+                        && s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity)>0;
+                }
+                el.setAttribute('data-stroy-public-link',visible?'1':'0');
+            }
+        }""")
+    return await page.content()
 
 
 def tilda_product_key(url):
@@ -175,12 +212,74 @@ def preserve_public_slider_panels(soup, page_url):
     return changed
 
 
+def preserve_rvul_size_rows(soup, page_url):
+    """Строки штатной кнопки «Показать еще», проверенной живыми кликами.
+
+    Скрипт catalog.element раскрывает tbody tr.hidden-offer по десять.
+    Отфильтрованные, явно hidden и несвязанные строки не раскрываются.
+    """
+    url = urlparse(page_url)
+    if (url.hostname or '').removeprefix('www.') != 'rvul.ru' or not url.path.startswith('/vse-produkty/'):
+        return False
+    changed = False
+    for block in soup.select('#sizes .product-sizes'):
+        control = block.select_one('.product-sizes__pagination .pagination__more button')
+        if not _control_available(control) or control.get_text(' ', strip=True) != 'Показать еще':
+            continue
+        for row in block.select('.product-sizes__table tbody tr.hidden-offer:not(.not-in-filter):not([hidden])'):
+            style = row.get('style', '')
+            clean = re.sub(r'display\s*:\s*none\s*;?', '', style, flags=re.I)
+            if clean != style:
+                row['style'] = clean
+                changed = True
+    return changed
+
+
+def preserve_metalloinvest_panels(soup, page_url):
+    if urlparse(page_url).hostname != 'products.metalloinvest.com':
+        return False
+    root=soup.select_one('#catalog-offer-id')
+    if root is None:
+        return False
+    changed=False
+    panel=root.select_one('#offer-selector #form-row-1')
+    control=root.select_one('a[href="#form-row-1"]')
+    if panel is not None and control is not None and _control_available(control) and not panel.get('data-public-config'):
+        panel['data-public-config']='1'
+        panel['style']=re.sub(r'display\s*:\s*none\s*;?', '',panel.get('style',''),flags=re.I)
+        panel.attrs.pop('hidden',None);panel.attrs.pop('aria-hidden',None)
+        panel['class']=[c for c in panel.get('class',[]) if c not in ('collapse','d-none','hidden')]
+        changed=True
+    for anchor in root.select('a.slide-img.js-gallery-link[href]'):
+        if (not anchor.select_one('img') and _control_available(anchor)
+                and 'background-image' in anchor.get('style','')):
+            href=urljoin(page_url,anchor['href'])
+            if urlparse(href).hostname == 'products.metalloinvest.com' and re.search(r'\.(?:jpe?g|png|webp)$',href,re.I):
+                img=soup.new_tag('img',src=href,alt=anchor.get('title','Фото товара'))
+                anchor.append(img);changed=True
+    for control in root.select('.tooltip-mark[data-toggle="tooltip"]'):
+        if control.get('data-public-tooltip') or not _control_available(control):
+            continue
+        text=control.get('data-original-title') or control.get('title') or ''
+        tip=BeautifulSoup(text,'html.parser')
+        if tip.select('script,style,form,input,iframe'):
+            continue
+        value=tip.get_text(' ',strip=True)
+        if not value:
+            continue
+        span=soup.new_tag('span');span['data-public-tooltip-text']='1';span.string=' '+value+' '
+        control.insert_after(span);control['data-public-tooltip']='1';changed=True
+    return changed
+
+
 def _preserve_product_panels_once(soup, page_url=''):
     """Переносит связанные панели из modal/hidden в основной товарный контейнер.
 
     Вызывается до удаления шума. Формы заказа и несвязанные окна не раскрываются.
     """
-    slider_changed = preserve_public_slider_panels(soup, page_url)
+    slider_changed = preserve_metalloinvest_panels(soup, page_url)
+    slider_changed = preserve_public_slider_panels(soup, page_url) or slider_changed
+    slider_changed = preserve_rvul_size_rows(soup, page_url) or slider_changed
     root = (soup.select_one('[itemtype*="Product"]') or soup.find('article')
             or soup.find('main') or soup.select_one('.content') or soup.body or soup)
     # .content может оказаться скрытым меню, а не карточкой. Перенос туда
@@ -239,6 +338,12 @@ def _preserve_product_panels_once(soup, page_url=''):
 def preserve_product_panels(soup, page_url=''):
     """Раскрывает связанные панели снаружи внутрь, не открывая скрытых соседей."""
     changed = False
+    if (urlparse(page_url).hostname or '').removeprefix('www.')=='aksa.com.ru':
+        for option in soup.select('.app-dropdown-item button[data-stroy-public-option="1"]'):
+            if _control_available(option):
+                option.name='div'
+                option['class']=['public-product-option']
+                changed=True
     while _preserve_product_panels_once(soup, page_url):
         changed = True
     return changed

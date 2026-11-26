@@ -25,6 +25,7 @@ class LoadProfile:
     max_concurrent_files: Optional[int] = None   # None -> config.max_concurrent_file_downloads
     fetch_timeout_s: Optional[int] = None        # None -> config.http_timeout
     file_timeout_s: Optional[int] = None         # None -> текущие таймауты FileDownloadManager
+    max_company_file_size_mb: Optional[int] = None  # None -> config.max_file_size_mb
     page_retry_attempts: Optional[int] = None    # None -> page_retry_max_attempts (D40)
 
 
@@ -59,6 +60,7 @@ class CrawlProfile:
     inline_products: Optional[InlineProductsProfile] = None
     equivalent_domains: list = field(default_factory=list)  # <- config.equivalent_domains
     file_hosts: list = field(default_factory=list)  # точные CDN-хосты, только файлы/картинки
+    external_page_urls: list = field(default_factory=list)  # отдельные внешние страницы, без алиаса на весь домен
     strict_www: bool = False              # <- config.strict_www_domains
     subdomain_collapse: list = field(default_factory=list)  # ['*.hms.ru'] -> hms.ru
     ignored_query_params: list = field(default_factory=list)  # подтверждённый шум этого сайта
@@ -66,6 +68,7 @@ class CrawlProfile:
     strip_ru_prefix_paths: list = field(default_factory=list) # префиксы путей без /ru
     repair_region_entity: bool = False                       # D98: только ®ion=, не произвольный ®
     exclude_paths: list = field(default_factory=list)       # <- config.exclude_url_patterns_by_domain
+    exclude_url_patterns: list = field(default_factory=list)  # regex полного URL после percent-decoding
     limits: CrawlLimits = field(default_factory=CrawlLimits)
     load: LoadProfile = field(default_factory=LoadProfile)
 
@@ -81,6 +84,7 @@ class SectionsProfile:
     distributor_urls: list = field(default_factory=list) # дилеры/где купить/представительства
     # Общие документы компании — 4 блока, зеркалят папки компании
     # Certificates/Documents/Instructions/Price_lists:
+    file_index_paths: list = field(default_factory=list)  # смешанные страницы: только явно указанные файлы
     certificates_urls: list = field(default_factory=list)  # сертификаты/декларации/свидетельства
     documents_urls: list = field(default_factory=list)     # прочая общая документация
     instructions_urls: list = field(default_factory=list)  # инструкции/руководства
@@ -96,6 +100,7 @@ class MarkdownProfile:
     max_len: Optional[int] = None             # None -> без обрезки (страховка text[:100000] в LLM остаётся)
     company_container: Optional[str] = None
     distributor_container: Optional[str] = None
+    content_blocks: list = field(default_factory=list)  # v2: упорядоченные дополнительные блоки
 
 
 @dataclass
@@ -107,13 +112,18 @@ class ExtractProfile:
     needs_raw_html: bool = False          # <- NEEDS_RAW_HTML
     clean_in_universal: bool = False      # <- CLEAN_IN_UNIVERSAL
     llm_program: Optional[str] = None     # фаза 2 (LLM-роутер)
+    second_pass: bool = True              # Повторное товарное извлечение с нетоварных страниц
     streaming: Optional[bool] = None      # None = глобально; False = батч (chelaz.ru, D85)
     markdown: MarkdownProfile = field(default_factory=MarkdownProfile)
+    page_rules: list = field(default_factory=list)  # v2: выбор настроек по шаблону страницы
 
 
 @dataclass
 class SiteProfile:
     domain: str = ''
+    schema_version: int = 1
+    extends: dict = field(default_factory=dict)
+    diagnostics: dict = field(default_factory=dict, compare=False, repr=False)
     profile_version: int = 1
     profiled_at: Optional[str] = None
     confidence: Optional[float] = None    # < порога -> REVIEW queue
@@ -184,6 +194,9 @@ def _build_load(data, errors, path='crawl.load') -> LoadProfile:
                  'fetch_timeout_s', 'file_timeout_s', 'page_retry_attempts'):
         if name in data:
             setattr(lp, name, _check_opt_int(errors, f'{path}.{name}', data[name]))
+    if 'max_company_file_size_mb' in data:
+        name = 'max_company_file_size_mb'
+        lp.max_company_file_size_mb = _check_opt_int(errors, f'{path}.{name}', data[name], minimum=1)
     return lp
 
 
@@ -224,10 +237,17 @@ def _build_crawl(data, errors) -> CrawlProfile:
                 _err(errors, f'crawl.{name}', 'ожидается строка или null')
             else:
                 setattr(cp, name, data[name])
-    for name in ('equivalent_domains', 'file_hosts', 'subdomain_collapse', 'exclude_paths',
+    for name in ('equivalent_domains', 'file_hosts', 'external_page_urls', 'subdomain_collapse', 'exclude_paths',
                  'ignored_query_params', 'query_noise_paths', 'strip_ru_prefix_paths'):
         if name in data:
             setattr(cp, name, _check_str_list(errors, f'crawl.{name}', data[name]))
+    if 'exclude_url_patterns' in data:
+        cp.exclude_url_patterns = _check_str_list(errors, 'crawl.exclude_url_patterns', data['exclude_url_patterns'])
+        for pattern in cp.exclude_url_patterns:
+            try:
+                re.compile(pattern)
+            except re.error:
+                _err(errors, 'crawl.exclude_url_patterns', 'невалидное регулярное выражение')
     if 'limits' in data:
         cp.limits = _build_limits(data['limits'], errors)
     if 'load' in data:
@@ -298,6 +318,11 @@ def _build_markdown(data, errors, path='extract.markdown') -> MarkdownProfile:
     for name in ('min_len', 'max_len'):
         if name in data:
             setattr(mp, name, _check_opt_int(errors, f'{path}.{name}', data[name]))
+    if 'content_blocks' in data:
+        if not isinstance(data['content_blocks'], list):
+            _err(errors, path+'.content_blocks', 'ожидается список')
+        else:
+            mp.content_blocks = data['content_blocks']
     return mp
 
 
@@ -318,7 +343,7 @@ def _build_extract(data, errors) -> ExtractProfile:
                 _err(errors, f'extract.{name}', 'ожидается строка или null')
             else:
                 setattr(ep, name, data[name])
-    for name in ('keep_hidden_tabs', 'needs_raw_html', 'clean_in_universal'):
+    for name in ('keep_hidden_tabs', 'needs_raw_html', 'clean_in_universal', 'second_pass'):
         if name in data:
             setattr(ep, name, _check_bool(errors, f'extract.{name}', data[name]))
     if 'streaming' in data and data['streaming'] is not None:
@@ -328,12 +353,17 @@ def _build_extract(data, errors) -> ExtractProfile:
             ep.streaming = data['streaming']
     if 'markdown' in data:
         ep.markdown = _build_markdown(data['markdown'], errors)
+    if 'page_rules' in data:
+        if not isinstance(data['page_rules'], list):
+            _err(errors, 'extract.page_rules', 'ожидается список')
+        else:
+            ep.page_rules = data['page_rules']
     if ep.tier == 'custom' and not ep.custom_module:
         _err(errors, 'extract', 'tier=custom требует custom_module')
     return ep
 
 
-TOP_LEVEL_KEYS = ('domain', 'profile_version', 'profiled_at', 'confidence',
+TOP_LEVEL_KEYS = ('domain', 'schema_version', 'extends', 'profile_version', 'profiled_at', 'confidence',
                   'source', 'notes', 'crawl', 'sections', 'extract', 'baseline')
 # Служебные блоки черновиков переписи — допускаются и игнорируются при загрузке.
 IGNORED_TOP_LEVEL_KEYS = ('census_evidence',)
@@ -351,6 +381,16 @@ def profile_from_dict(data: dict):
     _pop_known(errors, 'профиль', data, TOP_LEVEL_KEYS, IGNORED_TOP_LEVEL_KEYS)
 
     profile = SiteProfile()
+    version = data.get('schema_version', 1)
+    if type(version) is not int or version not in (1, 2):
+        _err(errors, 'schema_version', 'поддерживаются только 1 и 2')
+    else:
+        profile.schema_version = version
+    if 'extends' in data:
+        if not isinstance(data['extends'], dict):
+            _err(errors, 'extends', 'ожидается объект')
+        else:
+            profile.extends = data['extends']
     domain = data.get('domain')
     if not isinstance(domain, str) or not domain:
         _err(errors, 'domain', 'обязательное непустое строковое поле')
@@ -386,4 +426,10 @@ def profile_from_dict(data: dict):
             _err(errors, 'baseline', 'ожидается объект')
         else:
             profile.baseline = data['baseline']
+    if profile.schema_version == 1:
+        if profile.extends or profile.extract.page_rules or profile.extract.markdown.content_blocks:
+            _err(errors, 'schema_version', 'extends/page_rules/content_blocks требуют схему 2')
+    elif not errors:
+        from .format_v2 import validate_v2
+        errors.extend(validate_v2(data, profile))
     return profile, errors

@@ -66,8 +66,8 @@ class BotConfig:
     # Путь к файлу инвайтов
     invites_file: Path = None
 
-    # Webhook URL (куда Пачка будет стучаться)
-    webhook_url: str = "http://80.64.17.26:5500/webhook"
+    # Адрес обработчика. Доставка настраивается в карточке бота Пачки.
+    webhook_url: str = "http://198.13.188.36:5500/webhook"
     
     def __post_init__(self):
         """Инициализация путей и загрузка переменных окружения"""        

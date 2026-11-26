@@ -1,0 +1,9 @@
+{
+  "source": "https://github.com/google/fonts/tree/main/ofl/carlito",
+  "files": {
+    "fonts.conf": "72f7ee14c4f83248024e409f521850275ff200d3456095ada1aca0611f473f46",
+    "OFL.txt": "58402f82a7c332a700294988fe7554fbb0a63a8d27ccc1ee3bbc640311990a00",
+    "fonts/Carlito-Bold.ttf": "bb5d20f79b82599ec72983597437373a80f2d2085fa91fc144fd74e876a594db",
+    "fonts/Carlito-Regular.ttf": "f6418f708baede9789daef5d458c0f53d2a888af9820e8062934e504fedc6595"
+  }
+}

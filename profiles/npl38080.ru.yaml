@@ -1,0 +1,117 @@
+domain: npl38080.ru
+profile_version: 1
+profiled_at: '2026-08-30'
+confidence: 0.94
+source: mixed
+notes:
+- 'Разметка пользователя 19.11.2026; исторические метрики не пересчитаны. /about:
+  только скачивание документов; текстовую информацию страницы не извлекать.'
+- '/about классифицируется как other с profile_document_section=documents: ссылки
+  и файлы обрабатываются, HTML не сохраняется в Company_pages и не передаётся как
+  текст компании. Контакты отдельно /contacts.'
+crawl:
+  render: html
+sections:
+  product_url_patterns:
+  - ^https?://(?:www\.)?npl38080\.ru/products/[^/?#]+/[^/?#]+/?$
+  contacts_urls:
+  - /contacts
+  distributor_urls: []
+  catalog_roots:
+  - /products
+  - /products/ognezashchita-metallokonstruktsiy
+  - /products/ognezashchita-vozdukhovodov
+  - /products/ognezashchita-kabeley-i-kabelnykh-prokhodok
+  - /products/ognezashchita-dereva
+  - /products/ognezashchita-tuk
+  - /products/materialy-dlya-ustraneniya-avariynykh-utechek-vody-i-para
+  product_url_antipatterns:
+  - /products/?(?:[?#].*)?$
+  - /products/ognezashchita\-metallokonstruktsiy/?(?:[?#].*)?$
+  - /products/ognezashchita\-vozdukhovodov/?(?:[?#].*)?$
+  - /products/ognezashchita\-kabeley\-i\-kabelnykh\-prokhodok/?(?:[?#].*)?$
+  - /products/ognezashchita\-dereva/?(?:[?#].*)?$
+  - /products/ognezashchita\-tuk/?(?:[?#].*)?$
+  - /products/materialy\-dlya\-ustraneniya\-avariynykh\-utechek\-vody\-i\-para/?(?:[?#].*)?$
+  - /(?:materials|package)/?$
+  start_urls:
+  - /products
+  - /products/ognezashchita-metallokonstruktsiy
+  - /products/ognezashchita-vozdukhovodov
+  - /products/ognezashchita-kabeley-i-kabelnykh-prokhodok
+  - /products/ognezashchita-dereva
+  - /products/ognezashchita-tuk
+  - /products/materialy-dlya-ustraneniya-avariynykh-utechek-vody-i-para
+  - /contacts
+  - /price
+  - /about
+  price_list_urls:
+  - /price
+  documents_urls:
+  - /about
+  - /upload/iblock/e3d/gkrxanjlqjv1vakc1d2cbl11zo50em3g.jpg
+  - /upload/iblock/1ee/mmccyvjfx15za7bnw9upe8vo6wga9dty.jpg
+  - /upload/iblock/a38/tbup19914e8c5ytwszd7rcrwvlgoxfuh.jpg
+  - /upload/iblock/60d/1lvo68e9q0wn7ly90bx82fcxyvd2lsq2.jpg
+  - /upload/iblock/2c7/o5egt22w3zqaummrhysvn2un68nuqnyr.jpg
+  - /upload/iblock/513/fqowgjkiyt05mhlk2a5gtwguocw7xt2e.pdf
+  - /upload/iblock/35f/toywe91j52xhqmieb7x977j5rby1qkxk.pdf
+  - /upload/iblock/bda/sw3g4ohcj7hu43eh39or2hjnl7h3l7b9.pdf
+  - /upload/iblock/461/aq71cb20t89e6g8j7zhnryip7bf91hsb.pdf
+  - /upload/iblock/d56/oupm35z2eeohd311yy42xey8qk99fk3q.pdf
+extract:
+  tier: llm
+  keep_hidden_tabs: false
+  markdown:
+    product_container: .col-8.col-l-12
+    company_container: body
+    distributor_container: body
+    remove_selectors:
+    - button
+    - form
+    - .breadcrumbs
+    - .breadcrumb
+    - .product-detail__btn
+    - a[data-fancybox]
+    - .b-breadcrumbs
+    - nav
+    - .b-adaptive-menu
+    - .b-menu
+    - .footer-menu
+    - .b-feedback
+  page_rules:
+  - name: current_catalog_negative
+    match:
+      path_regex: ^/products/?$
+    extract:
+      markdown:
+        product_container: h1
+  - name: negative_example
+    match:
+      path_regex: ^/products/ognezashchita-dereva/?$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: b26cbc644c51fbfafefd0edf30c233051e9e27d2
+  selector_hit_rate: 1.0
+  pages_crawled: 23
+  product_pages: 22
+  product_cards: 14
+  jsonld_share: 1.0
+  cms_detected: microdata-product
+  fetch_fail_rate: 0.1935
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 25
+  extraction_path_share:
+    contacts_universal: 0.12
+    universal: 0.88
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    product: 22
+    main_page: 1
+schema_version: 2

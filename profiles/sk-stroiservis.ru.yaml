@@ -1,0 +1,127 @@
+domain: sk-stroiservis.ru
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.864
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: html
+  exclude_paths: []
+sections:
+  contacts_urls:
+  - /contacts/
+  distributor_urls:
+  - /predstaviteli/
+  price_list_urls:
+  - /prajs/
+  product_url_patterns:
+  - /product/bruschatka\-kirpich\-200x100x40\-chjornaya/?(?:\?|$)
+  - /product/shagovaya\-plita\-1000x550x60\-kras/?(?:\?|$)
+  - /product/bordjur\-trotuarnyj\-1000h200h80\-seriya\-granit\-chastichnyj\-prokras/?(?:\?|$)
+  - /product/plita\-prospekt\-33kg\-belaya/?(?:\?|$)
+  - /product/dorozhnoe\-ograzhdenie\-polushar\-h\-330mm/?(?:\?|$)
+  - /product/[^/]+/?$
+  - /razmer/[^/]+/?$
+  - /product\-category/[^/]+/[^/]+/?$
+  catalog_roots:
+  - /product-category/bruschatka/
+  - /product-category/trotuarnaya-plitka/
+  - /product-category/bordjury/
+  - /product-category/stupeni-lestnicy/
+  - /product-category/dorozhnye-ograzhdeniya/
+  certificates_urls:
+  - /dostizheniya/
+  product_url_antipatterns:
+  - /product\-category/bruschatka/?(?:\?|$)
+  - /product\-category/trotuarnaya\-plitka/?(?:\?|$)
+  - /product\-category/bordjury/?(?:\?|$)
+  - /product\-category/stupeni\-lestnicy/?(?:\?|$)
+  - /product\-category/dorozhnye\-ograzhdeniya/?(?:\?|$)
+  - /dostizheniya/?(?:\?|$)
+  - /prajs/?(?:\?|$)
+  start_urls:
+  - https://sk-stroiservis.ru/product-category/bruschatka/
+  - https://sk-stroiservis.ru/product-category/trotuarnaya-plitka/
+  - https://sk-stroiservis.ru/product-category/bordjury/
+  - https://sk-stroiservis.ru/product-category/stupeni-lestnicy/
+  - https://sk-stroiservis.ru/product-category/dorozhnye-ograzhdeniya/
+  - https://sk-stroiservis.ru/contacts/
+  - https://sk-stroiservis.ru/predstaviteli/
+  - https://sk-stroiservis.ru/dostizheniya/
+  - https://sk-stroiservis.ru/prajs/
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: div.product
+    min_len: 1
+    remove_selectors:
+    - .related
+    - .upsells
+    - .woocommerce-product-rating
+    - .woocommerce-Reviews
+    - button
+    - .quantity
+    - .reset_variations
+    - .calc-field
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .menu
+        - .header__menu
+        - .footer__menu
+        - .header-menu__container-nav
+        - .products-categories__nav
+  - name: category_heading
+    match:
+      path_regex: ^(?:/product\-category/bruschatka/|/product\-category/trotuarnaya\-plitka/|/product\-category/bordjury/|/product\-category/stupeni\-lestnicy/|/product\-category/dorozhnye\-ograzhdeniya/)$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: ec24a92b47bc62432ea4b50cd2a87daa44b0fb37
+  selector_hit_rate: 0.6618
+  pages_crawled: 211
+  product_pages: 204
+  product_cards: 130
+  card_yield: 0.6373
+  avg_specs_per_card: 8.94
+  jsonld_share: 0.9804
+  cms_detected: cms:woocommerce
+  fetch_fail_rate: 0.2809
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.9924
+  sitemap_url_count: 172
+  extraction_path_share:
+    generic: 0.8235
+    universal: 0.0995
+    contacts_universal: 0.0769
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    product: 204
+    main_page: 4
+    distributor: 1
+    contacts: 1
+    price_list: 1
+schema_version: 2

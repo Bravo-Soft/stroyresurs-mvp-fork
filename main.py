@@ -3,6 +3,7 @@ import asyncio
 import logging
 import pandas as pd
 import pipeline_control
+from site_profiles.quick_check import start_run, finish_run, emit as quick_check_event
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
@@ -27,7 +28,7 @@ from product_source_url import resolve_product_source_url
 from checkpoint_manager import CheckpointManager
 from rate_limiter import RateLimiter
 from performance_monitor import PerformanceMonitor
-from product_id_manager import ProductIDManager, restore_source_variant_name
+from product_id_manager import ProductIDManager
 from file_id_manager import FileIDManager
 from distributor_id_manager import DistributorIDManager
 from graph_db_uploader import GraphDBUploader, GraphDBFatalError
@@ -37,18 +38,11 @@ from pipeline_orchestrator import PipelineOrchestrator
 import activity_heartbeat
 # from site_profiler import SiteProfiler
 from text_extractor import html_to_markdown
-from product_tables import restore_source_tables, TableStructureError
-from source_product_tables import compact_source_tables, restore_deterministic_tables, source_family_catalog_reason
+from profnastil_configurator import restore_configurator
+from product_preparation import prepare_product, count_numeric_characteristics, _count_value_numeric, TableStructureError
+from source_product_tables import compact_source_tables, source_family_catalog_reason
 from processing_time_tracker import ProcessingTimeTracker
-from Profile_Markdown.tegola_ru import restore_source_product
-from product_quality import normalize_product_fields
-from labelled_source_instructions import restore_labelled_instructions
-from quality_source_fields import restore_quality_source_fields
-from labelled_product_sections import restore_labelled_product_sections
-from visible_product_sections import restore_visible_product_sections
-from source_detail_fields import restore_source_detail_fields
-from bitumex_source_sections import restore_bitumex_source_sections
-from product_extraction_revision import product_extraction_revision
+from product_extraction_revision import NUMERIC_GATE_REVISION, product_extraction_revision
 
 log = logging.getLogger("main")
 
@@ -65,73 +59,6 @@ def is_excluded_product_name(product_name: str, patterns: List[str]) -> bool:
             return True
     return False
 
-
-def _count_value_numeric(value: Any) -> int:
-    """Сколько ЧИСЛОВЫХ характеристик несёт ОДНО значение.
-    Габариты вида AAA×BBB×CCC считаются по числу осей (12×12×123 → 3, 390×90×188 → 3,
-    60×60 → 2); прочее значение с числом → 1; значение без числа → 0."""
-    s = str(value)
-    if not re.search(r'\d', s):
-        return 0
-    # размеры: 2+ числовых компонента, разделённых ×/x/х/X/Х/*
-    parts = re.split(r'\s*[×xхXХ*]\s*', s)
-    nums = [p for p in parts if re.search(r'\d', p)]
-    if len(nums) >= 2:
-        return len(nums)
-    return 1
-
-
-def count_numeric_characteristics(product: Dict[str, Any]) -> int:
-    """Числовой гейт с исключениями v37: коды, упаковка и условия не являются ТХ.
-
-    Перечень/диапазон значений одного поля — одна ТХ. Только явно размерное
-    поле с записью через ×/х/* даёт независимые оси габаритов.
-    """
-    if not isinstance(product, dict):
-        return 0
-    excluded = re.compile(
-        r'\bгост\b|(?:^|\W)ту(?:\W|$)|стандарт|норматив|артикул|модель|код|'
-        r'маркир|марка\s+(?:стали|материала|изделия|полотна|нити)|цвет|ral|гарант|срок\s+(?:хранения|годности|службы|эксплуатации)|хранени|упаков|палл[её]т|фасов|\bтара\b|'
-        r'цен[аы]|стоимост|заказ|достав|телефон|адрес|инструкц|'
-        r'услови[яй]|окружающ|наименован|производител|сертификат|единиц[аы] измер',
-        re.IGNORECASE)
-    axes = re.compile(r'габарит|размер|длин|ширин|высот|dimensions', re.IGNORECASE)
-
-    def walk(value, key=''):
-        if isinstance(value, dict):
-            # Имя модели/исполнения — контейнер, а не характеристика.
-            if re.search(r'упаков|палл[её]т|фасов|\bтара\b', key, re.IGNORECASE):
-                return 0
-            return sum(walk(v, str(k)) for k, v in value.items())
-        if isinstance(value, list):
-            if all(not isinstance(v, (dict, list)) for v in value):
-                # Несколько значений одной ТХ не создают новых параметров.
-                return max((walk(v, key) for v in value), default=0)
-            return sum(walk(v, key) for v in value)
-        key = re.sub(r'\s*\((?:по\s+)?(?:ГОСТ|ТУ|СТБ|ISO)\b[^)]*\)', '', key, flags=re.I)
-        if re.fullmatch(r'металл|материал|покрытие|замасливатель|состав стекла|нд|нтд|примечани[ея]|конструкция|устройство|принцип работы|состав и свойства материала|(?:строка|столбец)\s+\d+', key.strip(), re.I):
-            return 0  # Обозначение материала/покрытия не физическая величина.
-        if excluded.search(key) or re.search(
-                r'температур.*(?:монтаж|окружающ|хранени)', key, re.IGNORECASE):
-            return 0
-        if value is None:
-            return 0
-        text = str(value)
-        if (re.fullmatch(r'нити\s+в\s+(?:основе|утке)', key.strip(), re.I)
-                and re.fullmatch(r'[А-ЯA-Z]+[\d\w(),./×х*+-]+', text.strip(), re.I)):
-            return 0  # Код использованной нити, не её числовое свойство.
-        if re.search(r'₽|\b(?:руб(?:ль|ля|лей)?|RUB|USD|EUR)\b', key + ' ' + text, re.I):
-            return 0  # Денежные колонки не становятся ТХ без слова «цена».
-        # Классы покрытий и цветовые коды — идентификаторы, не значения толщины.
-        text = re.sub(r'\b(?:RAL|Zn|AlZn|RR)\s*\d+\b', '', text, flags=re.IGNORECASE)
-        if not re.search(r'\d', text):
-            return 0
-        return _count_value_numeric(text) if axes.search(key) else 1
-
-    count = walk(product.get('specifications', {}))
-    count += walk(product.get('dimensions'), 'dimensions')
-    count += walk(product.get('weight'), 'Масса')
-    return count
 
 def collapse_chelaz_size_variants(pages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """D85 (типоразмеры + URL-алиасы chelaz.ru, вариант A): в каталоге /katalog/.../<модель>/
@@ -922,11 +849,13 @@ class MonitoringSystem:
                             await self.crawler.temp_storage.save_product_result(page['file_path'], product)
                         except Exception as e:
                             log.error(f"Ошибка сохранения кэша товара {normalized_url}: {e}")
+                    quick_check_event('result', url=metadata.get('url', ''), outcome='reused')
                     return product
                 # Старые метаданные не содержат product_result: используем сохранённый
                 # JSON модели, если он есть. Запрос к модели для той же версии не нужен.
                 ai_path = metadata.get('ai_text_path')
-                if page['category'] == 'product' and ai_path and Path(ai_path).is_file():
+                if (page['category'] == 'product' and metadata.get('numeric_gate_revision') == NUMERIC_GATE_REVISION
+                        and ai_path and Path(ai_path).is_file()):
                     try:
                         async with aiofiles.open(ai_path, 'r', encoding='utf-8') as f:
                             saved_ai = await f.read()
@@ -989,7 +918,8 @@ class MonitoringSystem:
         совсем: товарных страниц не было вовсе либо все вернули Trash_418#. Расход LLM
         ограничен потолком config.second_pass_max_pages (0 отключает проход)."""
         limit = getattr(self.config, 'second_pass_max_pages', 0)
-        if limit <= 0:
+        profile = getattr(getattr(self, 'crawler', None), 'profile', None)
+        if limit <= 0 or (profile is not None and not profile.extract.second_pass):
             return []
         candidates = [p for p in all_pages
                       if p.get('category') in ('category', 'price_list', 'other')][:limit]
@@ -1051,6 +981,7 @@ class MonitoringSystem:
         Fail-open: любая ошибка телеметрии логируется и не влияет на пайплайн."""
         self._profile_metrics = None
         self._company_profile = None
+        self._resolved_profile = None
         try:
             from site_profiles import get_resolver
             from site_profiles.profile_metrics import RunMetricsCollector
@@ -1062,6 +993,7 @@ class MonitoringSystem:
             resolver = get_resolver(profiles_dir)
             resolver.reload_if_changed()
             profile = resolver.resolve(company_data['website'])
+            self._resolved_profile = profile
             domain = profile.domain
             if profile.is_default():
                 log.info(f"Профиль сайта для {domain}: отсутствует — generic-поведение")
@@ -1194,8 +1126,24 @@ class MonitoringSystem:
             manufacturer_name = (company_data.get('product_extraction_name')
                                  or company_data.get('actual_name', company_data['original_name']))
 
+            from pathlib import Path
+            from hashlib import sha256
+            from source_image_text import public_image_markdown, image_text_urls
+            image_markdown = ''
+            if image_text_urls(html_content, metadata.get('url', '')):
+                image_output = (Path(self.crawler.temp_storage.base_dir) / sanitize_filename(company_data['original_name'])
+                                / 'Image_text' / sha256(metadata.get('url', '').encode()).hexdigest()[:24])
+                image_markdown, image_usage, image_sources = await public_image_markdown(
+                    html_content, metadata.get('url', ''), self.ai_client, image_output)
+                if image_sources:
+                    # Байтам изображения нельзя доверять кэш ответа только по HTML.
+                    cached_ai_data = None
+                    company_stats.input_tokens += image_usage['input_tokens']
+                    company_stats.output_tokens += image_usage['output_tokens']
+                    self.statistics.total_input_tokens += image_usage['input_tokens']
+                    self.statistics.total_output_tokens += image_usage['output_tokens']
             with self.processing_tracker.clean_span('text'):
-                markdown_content = html_to_markdown(html_content, url=metadata.get('url', ''))
+                markdown_content = html_to_markdown(html_content, url=metadata.get('url', '')) + image_markdown
             await self._save_markdown_file(
                 company_data['original_name'],
                 'product',
@@ -1212,7 +1160,7 @@ class MonitoringSystem:
             # Полный Markdown сохраняется для аудита; большие ряды восстанавливаются из HTML.
             compact_html = compact_source_tables(html_content, metadata.get('url', ''))
             prompt_markdown = (markdown_content if compact_html == html_content else
-                               html_to_markdown(compact_html, url=metadata.get('url', '')))
+                               html_to_markdown(compact_html, url=metadata.get('url', '')) + image_markdown)
 
             # Добавляем метаданные в промпт
             enhanced_text = f"""
@@ -1245,6 +1193,7 @@ class MonitoringSystem:
                 company_stats.products_failed += 1
                 return None
             
+            restore_configurator(ai_data, html_content, metadata.get('url', ''), manufacturer_name)
             # Проверяем наличие ошибки Trash_418#
             if isinstance(ai_data, dict) and ai_data.get("error") == "Trash_418#":
                 log.info(f"AI вернул ошибку Trash_418#, сохраняем в Not_products: {metadata.get('url', '')}")
@@ -1261,17 +1210,7 @@ class MonitoringSystem:
             # габариты AAA×BBB×CCC считаются по числу осей). Пустой specifications — тоже не товар.
             elif isinstance(ai_data, dict) and "product" in ai_data:
                 try:
-                    restore_source_tables(ai_data, html_content, metadata.get('url', ''))
-                    restore_deterministic_tables(ai_data, html_content, metadata.get('url', ''))
-                    restore_source_product(ai_data, html_content, metadata.get('url', ''))
-                    restore_labelled_instructions(ai_data, html_content, metadata.get('url', ''))
-                    normalize_product_fields(ai_data, enhanced_text)
-                    restore_quality_source_fields(ai_data, html_content, metadata.get('url', ''))
-                    restore_labelled_product_sections(ai_data, html_content, metadata.get('url', ''))
-                    restore_visible_product_sections(ai_data, html_content, metadata.get('url', ''))
-                    restore_source_detail_fields(ai_data, html_content, metadata.get('url', ''))
-                    restore_bitumex_source_sections(ai_data, html_content, metadata.get('url', ''))
-                    restore_source_variant_name(ai_data, html_content, metadata.get('url', ''))
+                    prepare_product(ai_data, html_content, metadata.get('url', ''), enhanced_text)
                 except TableStructureError as exc:
                     log.error(f"Таблица не перенесена без потерь, страница будет повторена: {metadata.get('url', '')}: {exc}")
                     company_stats.products_failed += 1
@@ -1301,6 +1240,8 @@ class MonitoringSystem:
                 text_type = "not_product"
                 is_product = False
             
+            quick_check_event('result', url=metadata.get('url', ''),
+                              outcome='passed_gate' if is_product else 'rejected')
             # Обновляем статистику токенов
             company_stats.input_tokens += token_usage['input_tokens']
             company_stats.output_tokens += token_usage['output_tokens']
@@ -1466,6 +1407,8 @@ class MonitoringSystem:
                         card_path = await self.docx_generator.generate_product_card(product_data, company_data, product_folder_abs)
                     if card_path:
                         company_stats.cards_generated += 1
+                        if metrics is not None:
+                            metrics.record_card(product_id, metadata.get('url', ''), numeric_specs, card_path)
                 except Exception as e:
                     log.error(f"Ошибка генерации карточки товара: {e}")
                     # Продолжаем обработку даже при ошибке генерации карточки
@@ -1806,17 +1749,35 @@ class MonitoringSystem:
         
         log.info(f"Добавлено {len(structured_products)} товаров в базу данных")
 
+    async def _distributor_source_pages(self, company_name):
+        storage = self.crawler.temp_storage
+        pages = list(await storage.get_company_files(company_name, category='distributor'))
+        profile = getattr(self.crawler, 'profile', None)
+        if profile is None:
+            return pages
+        # Some companies publish dealers on the same page as their own contacts.
+        # The crawler saves that page once, in Company_pages.
+        sections = profile.sections
+        shared = {p.rstrip('/') for p in sections.contacts_urls if p.startswith('/')} & {
+            p.rstrip('/') for p in sections.distributor_urls if p.startswith('/')}
+        if shared:
+            seen = {page['metadata'].get('normalized_url') or page['metadata'].get('url') for page in pages}
+            for page in await storage.get_company_files(company_name, category='contacts'):
+                meta = page['metadata']
+                url = meta.get('url') or ''
+                key = meta.get('normalized_url') or url
+                if meta.get('category') == 'contacts' and urlparse(url).path.rstrip('/') in shared and key not in seen:
+                    pages.append(page)
+                    seen.add(key)
+        return pages
+
     async def process_distributor_pages(self, company_data: Dict[str, str], company_dir: str, 
                                   company_stats: CompanyStatistics) -> List[Dict[str, Any]]:
         log.info(f"Начинаем обработку страниц дистрибьюторов для компании: {company_data['original_name']}")
     
         try:
-            # Получаем все страницы дистрибьюторов из временного хранилища
-            distributor_pages = await self.crawler.temp_storage.get_company_files(
-                company_data['original_name'], 
-                category='distributor'
-            )
-            
+            distributor_pages = await self._distributor_source_pages(company_data['original_name'])
+
             if not distributor_pages:
                 log.info(f"Не найдено страниц дистрибьюторов для {company_data['original_name']}")
                 return []
@@ -1932,6 +1893,11 @@ class MonitoringSystem:
             if not (isinstance(s, dict) and (s.get('Наименование') or '').strip()):
                 continue
             key = ' '.join(s['Наименование'].split()).lower()
+            # Подтверждённые отдельные публичные карточки филиалов RVUL
+            # нельзя схлопывать по имени: у них разные адреса и телефоны.
+            source_key = s.get('_public_dealer_address_key')
+            if source_key and source_key == s['Наименование'] + '\n' + (s.get('Адрес') or ''):
+                key += '\n' + ' '.join(s['Адрес'].split()).lower()
             prev = by_name.get(key)
             if prev is None:
                 by_name[key] = dict(s)
@@ -2168,25 +2134,30 @@ class MonitoringSystem:
             'errors': []
         }
 
+        quick_check_handle = start_run(
+            self.config, company_data, getattr(self, "_resolved_profile", None),
+            is_update=is_update, crawl_run_id=getattr(self.crawler, "crawl_run_id", ""),
+            limits=getattr(getattr(self, "_profile_metrics", None), "limits", {}))
+
         # Потоковая обработка (конвейер внутри компании): товарные страницы уходят в
         # markdown/LLM сразу по мере сохранения краулером (гейты — в _resolve_streaming_mode)
         stream_workers = []
         streamed_products = []
         page_queue = None
-        use_streaming, cached_actual_name = self._resolve_streaming_mode(company_data)
-        if use_streaming:
-            company_data['product_extraction_name'] = cached_actual_name
-            page_queue = asyncio.Queue()
-            stream_workers = [
-                asyncio.create_task(self._page_stream_worker(
-                    page_queue, company_data, company_stats, company_dir, streamed_products))
-                for _ in range(self.config.pipeline_page_workers)
-            ]
-            self.crawler.page_sink = page_queue
-            log.info(f"Потоковая обработка включена: {self.config.pipeline_page_workers} воркеров, "
-                     f"производитель закреплён: '{cached_actual_name}'")
-
         try:
+            use_streaming, cached_actual_name = self._resolve_streaming_mode(company_data)
+            if use_streaming:
+                company_data['product_extraction_name'] = cached_actual_name
+                page_queue = asyncio.Queue()
+                stream_workers = [
+                    asyncio.create_task(self._page_stream_worker(
+                        page_queue, company_data, company_stats, company_dir, streamed_products))
+                    for _ in range(self.config.pipeline_page_workers)
+                ]
+                self.crawler.page_sink = page_queue
+                log.info(f"Потоковая обработка включена: {self.config.pipeline_page_workers} воркеров, "
+                         f"производитель закреплён: '{cached_actual_name}'")
+
             # ЧЕКПОИНТ 1: Начало обработки компании
             await self.checkpoint_manager.save_checkpoint(
                 company_data=company_data,
@@ -2689,6 +2660,10 @@ class MonitoringSystem:
                     if not w.done():
                         w.cancel()
                 await asyncio.gather(*stream_workers, return_exceptions=True)
+            # Cancellation also produces a report; no parsing on the event loop.
+            if sys.exc_info()[0] is not None:
+                result["status"] = "interrupted"
+            await finish_run(quick_check_handle, result, vars(company_stats))
 
         # Профилирование: метрики прогона + черновик переписи (fail-open)
         self._finalize_profiling(result.get('crawling_result'), company_stats)

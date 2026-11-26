@@ -1,0 +1,137 @@
+domain: vemz.net
+profile_version: 1
+profiled_at: '2026-08-27'
+confidence: 0.853
+source: mixed
+notes:
+- 'Разметка пользователя 19.11.2026; исторические метрики не пересчитаны. Документы:
+  кнопка на главной с href=#, не отдельная HTTP-страница.'
+- 'Кнопка Документы открывает #modal-docs. /# не отдельная HTTP-страница и не общий
+  префикс документов для всего сайта; явные ссылки файлов сохранены по свежему HTML
+  в /ai/projects/stroy-resurs/codex_work/profile_te4_maps_20261119/vemz.net/document_button.json'
+crawl:
+  render: html
+sections:
+  contacts_urls:
+  - /kontakty/
+  product_url_patterns:
+  - ^https?://(?:www\.)?vemz\.net/product/[^/?#]+/?$
+  distributor_urls: []
+  catalog_roots:
+  - /produkcija/
+  - /products/komplektnye-transformatornye-podstancii/
+  - /products/raspredelitelnye-ustrojstva-10-6-kv-i-0-4-kv/
+  - /products/vysokovoltnye-razediniteli/
+  - /products/razedeniteli-serii-r-rp-p/
+  - /products/vykljuchateli-nagruzki/
+  product_url_antipatterns:
+  - /produkcija/?(?:[?#].*)?$
+  - /products/komplektnye\-transformatornye\-podstancii/?(?:[?#].*)?$
+  - /products/raspredelitelnye\-ustrojstva\-10\-6\-kv\-i\-0\-4\-kv/?(?:[?#].*)?$
+  - /products/vysokovoltnye\-razediniteli/?(?:[?#].*)?$
+  - /products/razedeniteli\-serii\-r\-rp\-p/?(?:[?#].*)?$
+  - /products/vykljuchateli\-nagruzki/?(?:[?#].*)?$
+  start_urls:
+  - /produkcija/
+  - /products/komplektnye-transformatornye-podstancii/
+  - /products/raspredelitelnye-ustrojstva-10-6-kv-i-0-4-kv/
+  - /products/vysokovoltnye-razediniteli/
+  - /products/razedeniteli-serii-r-rp-p/
+  - /products/vykljuchateli-nagruzki/
+  - /kontakty/
+  documents_urls:
+  - /wp-content/uploads/2025/10/КАТАЛОГ-2025.pdf
+  - /wp-content/uploads/2020/10/доверительное-письмо-для-транспортной-компании.doc
+  - /wp-content/uploads/2020/10/довер.письмо-для-физического-лица.doc
+  - /wp-content/uploads/2020/06/Опросные-лист-малогабаритные-КТП.docx
+  - /wp-content/uploads/2024/04/7.2.-Опросный-лист-для-заказа-однотрансформаторных-КТП-киоскового-типа-тупикового-и-проходного-исполнения.docx
+  - /wp-content/uploads/2024/04/7.3.-Опросный-лист-для-заказа-двухтрансформаторных-КТП-киоскового-и-контейнерного-типа-1.docx
+  - /wp-content/uploads/2020/06/7.4.-Опросный-лист-для-заказа-КТП-шкафного-столбового-и-мачтового-типа.docx
+  - /wp-content/uploads/2020/06/Опросный-лист-ПКУ.docx
+  - /wp-content/uploads/2020/06/Опросный-лист-ВНА.docx
+  - /wp-content/uploads/2023/01/Опросный-лист-РВЗ-РВФЗ.docx
+  - /wp-content/uploads/2024/12/ДС-КТП.jpg
+  - /wp-content/uploads/2024/12/ДС-КСО.jpg
+  - /wp-content/uploads/2024/11/ДС-выключатели.pdf
+  - /wp-content/uploads/2024/11/ДС-разъединители.pdf
+  - /wp-content/uploads/2024/04/ЩО-70.pdf
+  - /wp-content/uploads/2024/11/Сертификат-ТР-ТС-рубильники.jpg
+  - /wp-content/uploads/2020/06/Изоляторы.pdf
+  - /wp-content/uploads/2020/08/РЭ_ВНА.pdf
+  - /wp-content/uploads/2025/04/РЭ_РВЗ.pdf
+  - /wp-content/uploads/2025/01/ВНРкз2024.pdf
+extract:
+  tier: llm
+  keep_hidden_tabs: true
+  markdown:
+    product_container: .product-wrapper
+    company_container: body
+    distributor_container: body
+    remove_selectors:
+    - button
+    - form
+    - .breadcrumbs
+    - .breadcrumb
+    - nav
+    - .product-navigation
+    - .custom-modal
+    - .simple-modal
+    - '[class*=ymaps]'
+    - .menu
+    - .navbar
+    - .request-popup
+    - img.wp-image-1734
+    - img.wp-image-1667
+    - img.wp-image-691
+    - img.wp-image-690
+    - img.wp-image-1110
+    - img.wp-image-800
+    - img.wp-image-1775
+    - img.wp-image-1776
+    - img.wp-image-1777
+    - .content-text > p:-soup-contains("1 — фиксатор положения")
+    - .content-text > p:-soup-contains("2 — скоба фиксатора")
+    - .content-text > p:-soup-contains("3 — кронштейн для установки")
+    - .content-text > p:-soup-contains("4 — тяга.")
+    - .product-buttons
+    - '#docs'
+    - a.button
+    - div.button
+    - img.wp-image-776
+    - img.wp-image-768
+    - img.wp-image-775
+    - .content-text p:has(a[href*="disk.yandex"])
+    - .content-text p:-soup-contains("3Д модель")
+    - .employee:has(.employee__name)
+    - .content-text p:-soup-contains("3D")
+  page_rules:
+  - name: current_catalog_negative
+    match:
+      path_regex: ^/produkcija/?$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: 0fb01dd3d0bac0a8755f11f39bafe46722c8f7ef
+  selector_hit_rate: 1.0
+  pages_crawled: 51
+  product_pages: 49
+  product_cards: 42
+  jsonld_share: 1.0
+  cms_detected: generic-main
+  fetch_fail_rate: 0.358
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.913
+  sitemap_url_count: 347
+  extraction_path_share:
+    contacts_universal: 0.0577
+    universal: 0.9423
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    product: 49
+    main_page: 1
+    contacts: 1
+schema_version: 2

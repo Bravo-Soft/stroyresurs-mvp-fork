@@ -1,0 +1,129 @@
+domain: hagerrussia.ru
+profile_version: 1
+profiled_at: '2026-08-27'
+confidence: 0.643
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: browser
+  antibot: impersonate
+  exclude_paths: []
+sections:
+  contacts_urls:
+  - /contacts
+  - /contacts-opt
+  catalog_roots:
+  - /schity/
+  - /avtomaty/
+  - /uzo/
+  - /kontaktory/
+  - /rubilniki/
+  - /rele/
+  - /aksessuary/
+  product_url_patterns:
+  - /schit\-hager\-volta\-vstraivaemyj\-dlja\-pustotelyx\-sten\-multimedijnyj\-s\-dvertsej\-s\-montazhnymi\-paneljami\-trojnoj\-rozetkoj\-schuko\-patch\-panelju\-ip30/?(?:\?|$)
+  - /avtomaticheskij\-vykljuchatel\-hager\-1p\-4\-5ka\-c\-20a\-1m/?(?:\?|$)
+  - /ustrojstvo\-zaschitnogo\-otkljuchenija\-hager\-2p\-40a\-300ma\-ac/?(?:\?|$)
+  - /rubilnik\-modulnyj\-hager\-4r\-63a\-do\-690v\-as23/?(?:\?|$)
+  - /binarnyj\-vxod\-4\-kanalnyj\-hager\-dlja\-skrytogo\-montazha/?(?:\?|$)
+  product_url_antipatterns:
+  - /schity/?(?:\?|$)
+  - /avtomaty/?(?:\?|$)
+  - /uzo/?(?:\?|$)
+  - /kontaktory/?(?:\?|$)
+  - /rubilniki/?(?:\?|$)
+  - /rele/?(?:\?|$)
+  - /aksessuary/?(?:\?|$)
+  start_urls:
+  - https://hagerrussia.ru/schity/
+  - https://hagerrussia.ru/avtomaty/
+  - https://hagerrussia.ru/uzo/
+  - https://hagerrussia.ru/kontaktory/
+  - http://hagerrussia.ru/rubilniki/
+  - https://hagerrussia.ru/rele/
+  - https://hagerrussia.ru/aksessuary/
+  - https://hagerrussia.ru/contacts
+  - https://hagerrussia.ru/contacts-opt
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: '#content'
+    distributor_container: body
+    min_len: 1
+    remove_selectors:
+    - '#alsobuy'
+    - '#product-review'
+    - .last-review-block
+    - '#product'
+    - .rating
+    - button
+    - form
+    - .nav-tabs
+    - .prod-buttons
+    - '[role="button"]'
+    - .navi-item.hidden
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .breadcrumb
+        - .breadcrumbs
+        - .menu
+        - script
+        - style
+        - '#lowprice'
+        - '#downprice'
+        - '#oneclick'
+        - '#schet'
+        - '#subemail'
+        - '#callme_modal'
+        - '#modal-cart'
+        - '[role="button"]'
+        - .catalog-block
+        - .cart-block
+        - .content-top-box
+        - .content-bottom-box
+        - .modal
+        - .findus
+        - footer .h5
+        - footer ul
+        - .subscribe-block
+        - .menu-top-box
+  - name: category_heading
+    match:
+      path_regex: ^(?:/schity/|/avtomaty/|/uzo/|/kontaktory/|/rubilniki/|/rele/|/aksessuary/)$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: null
+  selector_hit_rate: null
+  pages_crawled: 2
+  product_pages: 0
+  product_cards: 0
+  jsonld_share: null
+  cms_detected: null
+  fetch_fail_rate: 0.9811
+  challenge_rate: 0.1887
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: null
+  sitemap_url_count: 250
+  extraction_path_share:
+    contacts_universal: 1.0
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    contacts: 2
+schema_version: 2

@@ -105,7 +105,7 @@ def scope_host(url: str) -> str:
 
 
 def url_in_scope(url: str, base_url: str, *, profile_domains=(),
-                 profile_suffixes=(), file_hosts=(), resource='page') -> bool:
+                 profile_suffixes=(), file_hosts=(), external_page_urls=(), resource='page') -> bool:
     """Общий периметр: исходный сайт, явный профиль; CDN разрешён только для файлов.
 
     Группа глобального config и ссылки страницы сами по себе не расширяют обход.
@@ -129,6 +129,8 @@ def url_in_scope(url: str, base_url: str, *, profile_domains=(),
                 or any(suffix and candidate.endswith('.' + suffix) for suffix in suffixes))
     if not in_profile(base):
         return False
+    if resource == 'page' and url.partition('#')[0] in external_page_urls:
+        return True
     if in_profile(host):
         return True
     return resource == 'file' and host in {scope_host('https://' + str(item)) for item in file_hosts}

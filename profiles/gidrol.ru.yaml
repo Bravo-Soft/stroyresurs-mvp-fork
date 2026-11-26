@@ -1,0 +1,125 @@
+domain: gidrol.ru
+profile_version: 1
+profiled_at: '2026-09-01'
+confidence: 0.52
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: html
+  exclude_paths: []
+sections:
+  product_url_patterns:
+  - /elon\-super\.html/?(?:\?|$)
+  - /zhidkaya\-rezina\-unimast\.html/?(?:\?|$)
+  - /krovlelon\-a\.html/?(?:\?|$)
+  - /lenta\-gidroizolacionnaya\-s\-folgoi\.html/?(?:\?|$)
+  - /unimast\-cv\.html/?(?:\?|$)
+  - /elon\-super\-l\.html/?(?:\?|$)
+  - /videos/[^/]+\.html/?$
+  catalog_roots:
+  - /materials.html
+  - /membrana-pvh-krovelnaja.html
+  - /gidroizolatsionnye-smesi.html
+  - /epdm-membrana.html
+  contacts_urls:
+  - /contacts.html
+  documents_urls:
+  - /docs.html
+  price_list_urls:
+  - /price.html
+  - /price-smesi.html
+  product_url_antipatterns:
+  - /materials\.html/?(?:\?|$)
+  - /membrana\-pvh\-krovelnaja\.html/?(?:\?|$)
+  - /gidroizolatsionnye\-smesi\.html/?(?:\?|$)
+  - /epdm\-membrana\.html/?(?:\?|$)
+  - /docs\.html/?(?:\?|$)
+  - /price\.html/?(?:\?|$)
+  - /price\-smesi\.html/?(?:\?|$)
+  start_urls:
+  - https://gidrol.ru/materials.html
+  - https://gidrol.ru/membrana-pvh-krovelnaja.html
+  - https://gidrol.ru/gidroizolatsionnye-smesi.html
+  - https://gidrol.ru/epdm-membrana.html
+  - https://gidrol.ru/contacts.html
+  - https://gidrol.ru/docs.html
+  - https://gidrol.ru/price.html
+  - https://gidrol.ru/price-smesi.html
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: '#box_wrapper'
+    distributor_container: body
+    min_len: 1
+    remove_selectors:
+    - header
+    - footer
+    - nav
+    - .page_topline
+    - .page_header
+    - .page_copyright
+    - form
+    - .widget
+    - '#toTop'
+    - img[alt*="Схема"]
+    - img[src$="/kleevaya.png"]
+    - img[src$="/mechaniceskaya.png"]
+    - img[src$="/ballastnaya.png"]
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+    - a:has(img[alt*="Схема"])
+    - img[src$="/mechanic.png"]
+    - img[src$="/ballast.png"]
+    - img[src$="/inverse.png"]
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .sf-menu
+        - .widget_nav_menu
+        - .menu
+  - name: category_heading
+    match:
+      path_regex: ^(?:/materials\.html|/membrana\-pvh\-krovelnaja\.html|/gidroizolatsionnye\-smesi\.html|/epdm\-membrana\.html)$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: a97a8b2aefece9a68e12d9cf9f07f0cef4759ba6
+  selector_hit_rate: 0.0
+  pages_crawled: 26
+  product_pages: 25
+  product_cards: 0
+  jsonld_share: 1.0
+  cms_detected: readability
+  fetch_fail_rate: 0.0521
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: null
+  sitemap_url_count: 33
+  extraction_path_share:
+    contacts_universal: 0.3902
+    universal: 0.6098
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    main_page: 1
+    product: 25
+schema_version: 2

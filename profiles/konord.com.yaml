@@ -1,0 +1,115 @@
+domain: konord.com
+profile_version: 1
+profiled_at: '2026-08-26'
+confidence: 0.75
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: browser
+  exclude_paths: []
+sections:
+  contacts_urls:
+  - /contacts
+  distributor_urls:
+  - /contacts
+  - /roznica
+  product_url_patterns:
+  - /catalog/chugunnye\-gazovye\-kotly\-konord/odnokonturnyy\-chugunnyy\-gazovyy\-kotel\-kch\-g\-20r\-e/?(?:\?|$)
+  - /catalog/gazovye\-kotly\-konord/odnokonturnye\-stalnye/ksts\-g\-12s\-3/?(?:\?|$)
+  - /catalog/gazovye\-kotly\-konord\-eko/ks\-g\-12t\-e/?(?:\?|$)
+  - /catalog/tverdotoplivnye\-kotly/ks\-t\-20d/?(?:\?|$)
+  - /catalog/[^/]+/[^/]+/?$
+  - /catalog/[^/]+/[^/]+/[^/]+/?$
+  - /catalog/[^/]+/?$
+  catalog_roots:
+  - /catalog
+  - /catalog/chugunnye-gazovye-kotly-konord
+  - /catalog/gazovye-kotly-konord
+  - /catalog/gazovye-kotly-konord-eko
+  - /catalog/tverdotoplivnye-kotly
+  certificates_urls:
+  - /ehkspluataciya
+  documents_urls:
+  - /promomaterial
+  product_url_antipatterns:
+  - /catalog/?(?:\?|$)
+  - /catalog/chugunnye\-gazovye\-kotly\-konord/?(?:\?|$)
+  - /catalog/gazovye\-kotly\-konord/?(?:\?|$)
+  - /catalog/gazovye\-kotly\-konord\-eko/?(?:\?|$)
+  - /catalog/tverdotoplivnye\-kotly/?(?:\?|$)
+  - /promomaterial/?(?:\?|$)
+  - /ehkspluataciya/?(?:\?|$)
+  start_urls:
+  - https://konord.com/catalog
+  - https://konord.com/catalog/chugunnye-gazovye-kotly-konord
+  - https://konord.com/catalog/gazovye-kotly-konord
+  - https://konord.com/catalog/gazovye-kotly-konord-eko
+  - https://konord.com/catalog/tverdotoplivnye-kotly
+  - https://konord.com/contacts
+  - https://konord.com/roznica
+  - https://konord.com/promomaterial
+  - https://konord.com/ehkspluataciya
+extract:
+  tier: llm
+  markdown:
+    product_container: .scontent-body
+    company_container: body
+    distributor_container: body
+    min_len: 1
+    remove_selectors:
+    - form
+    - button
+    - .also-recommend
+    - '#reviews'
+    - '[href="#reviews"]'
+    - .btn-frontSlider
+    - '#visiri-cookies-panel'
+    - '#visiri-cookies-modal'
+  page_rules:
+  - name: contacts_text
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - header
+        - nav
+        - form
+        - button
+        - .modal
+        - '#map'
+        - iframe
+        - '#visiri-cookies-panel'
+        - '#visiri-cookies-modal'
+        - .back-top
+        - .ChooseCity .card-header
+baseline:
+  structure_hash: ca5603a23c57950e95a5f5eef604d79824367bcd
+  selector_hit_rate: 0.0
+  pages_crawled: 62
+  product_pages: 53
+  product_cards: 37
+  jsonld_share: 0.8868
+  cms_detected: readability
+  fetch_fail_rate: 0.0
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.2462
+  gate3_pass_rate: 1.0
+  sitemap_url_count: null
+  extraction_path_share:
+    contacts_universal: 0.1846
+    generic: 0.6154
+    universal: 0.2
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    main_page: 1
+    contacts: 1
+    distributor: 7
+    product: 53
+schema_version: 2

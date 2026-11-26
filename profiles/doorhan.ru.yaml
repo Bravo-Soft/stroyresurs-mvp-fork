@@ -1,0 +1,208 @@
+domain: doorhan.ru
+profile_version: 1
+profiled_at: '2026-09-04'
+confidence: 0.684
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: browser
+  antibot: impersonate
+  exclude_paths:
+  - /catalog/domostroenie/
+  equivalent_domains:
+  - moscow.doorhan.ru
+sections:
+  distributor_urls:
+  - /gde_kupit/regions/rossiya/g-moskva/
+  - /gde_kupit/ID/CB0002221/
+  - /gde_kupit/ID/MS0002847/
+  - /gde_kupit/ID/MS0000646/
+  catalog_roots:
+  - /catalog/
+  - /catalog/garazhnye-vorota/
+  - /catalog/ulichnye-vorota/
+  - /catalog/ulichnye-vorota/otkatnye/
+  - /catalog/dveri/
+  - /catalog/dveri/vhodnye/
+  - /catalog/avtomatika/
+  - /catalog/avtomatika/potolochnye-privody-dlya-sekcionnyh-vorot/
+  contacts_urls:
+  - /contacts/
+  product_url_patterns:
+  - /catalog/garazhnye\-vorota/sekcionnye/?(?:\?|$)
+  - /catalog/ulichnye\-vorota/otkatnye/s\-zapolneniem\-sendvich\-panelyami/?(?:\?|$)
+  - /catalog/dveri/vhodnye/dveri\-termo/?(?:\?|$)
+  - /catalog/avtomatika/potolochnye\-privody\-dlya\-sekcionnyh\-vorot/se\-800pro/?(?:\?|$)
+  product_url_antipatterns:
+  - /catalog/?(?:\?|$)
+  - /catalog/garazhnye\-vorota/?(?:\?|$)
+  - /catalog/ulichnye\-vorota/?(?:\?|$)
+  - /catalog/ulichnye\-vorota/otkatnye/?(?:\?|$)
+  - /catalog/dveri/?(?:\?|$)
+  - /catalog/dveri/vhodnye/?(?:\?|$)
+  - /catalog/avtomatika/?(?:\?|$)
+  - /catalog/avtomatika/potolochnye\-privody\-dlya\-sekcionnyh\-vorot/?(?:\?|$)
+  start_urls:
+  - https://moscow.doorhan.ru/catalog/
+  - https://moscow.doorhan.ru/catalog/garazhnye-vorota/
+  - https://moscow.doorhan.ru/catalog/ulichnye-vorota/
+  - https://moscow.doorhan.ru/catalog/ulichnye-vorota/otkatnye/
+  - https://moscow.doorhan.ru/catalog/dveri/
+  - https://moscow.doorhan.ru/catalog/dveri/vhodnye/
+  - https://moscow.doorhan.ru/catalog/avtomatika/
+  - https://moscow.doorhan.ru/catalog/avtomatika/potolochnye-privody-dlya-sekcionnyh-vorot/
+  - https://doorhan.ru/contacts/
+  - https://doorhan.ru/gde_kupit/regions/rossiya/g-moskva/
+  - https://doorhan.ru/gde_kupit/ID/CB0002221/
+  - https://doorhan.ru/gde_kupit/ID/MS0002847/
+  - https://doorhan.ru/gde_kupit/ID/MS0000646/
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: .product-page
+    distributor_container: body
+    min_len: 1
+    remove_selectors:
+    - form
+    - button
+    - .breadcrumbs
+    - .tabs-mob
+    - header
+    - footer
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+    - .tabs__content-item[data-content="construction"]
+    - .tabs__item[data-tab="construction"]
+    - .header-mobile
+    - .bx_vertical_menu_advanced
+    - .product-menu
+    - .measurement img
+    content_blocks:
+    - name: product_title
+      selector: h1
+      required: false
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .menu
+        - '#search-form-holder'
+        - .product-menu
+        - .regions-filter
+  - name: category_heading
+    match:
+      path_regex: ^(?:/catalog/|/catalog/garazhnye\-vorota/|/catalog/ulichnye\-vorota/|/catalog/ulichnye\-vorota/otkatnye/|/catalog/dveri/|/catalog/dveri/vhodnye/|/catalog/avtomatika/|/catalog/avtomatika/potolochnye\-privody\-dlya\-sekcionnyh\-vorot/)$
+    extract:
+      markdown:
+        product_container: h1
+  - name: visible_content_2
+    match:
+      path_regex: ^(?:/catalog/garazhnye\-vorota/sekcionnye/)$
+    extract:
+      markdown:
+        remove_selectors:
+        - form
+        - button
+        - .breadcrumbs
+        - .tabs-mob
+        - header
+        - footer
+        - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+        - img[alt*="Черт"], img[alt*="черт"]
+        - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+        - .tabs__content-item[data-content="construction"]
+        - .tabs__item[data-tab="construction"]
+        - .header-mobile
+        - .bx_vertical_menu_advanced
+        - .product-menu
+        - .tabs__content-item[data-content="prepare"]
+        - .tabs__item[data-tab="prepare"]
+        - .measurement img
+  - name: visible_content_3
+    match:
+      path_regex: ^(?:/catalog/ulichnye\-vorota/otkatnye/s\-zapolneniem\-sendvich\-panelyami/)$
+    extract:
+      markdown:
+        remove_selectors:
+        - form
+        - button
+        - .breadcrumbs
+        - .tabs-mob
+        - header
+        - footer
+        - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+        - img[alt*="Черт"], img[alt*="черт"]
+        - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+        - .tabs__content-item[data-content="construction"]
+        - .tabs__item[data-tab="construction"]
+        - .header-mobile
+        - .bx_vertical_menu_advanced
+        - .product-menu
+        - .tabs__content-item[data-content="prepare"]
+        - .tabs__item[data-tab="prepare"]
+        - .measurement img
+  - name: visible_content_4
+    match:
+      path_regex: ^(?:/gde_kupit/regions/rossiya/g\-moskva/)$
+    extract:
+      markdown:
+        remove_selectors:
+        - header
+        - footer
+        - .header-mobile
+        - .main-footer
+        - .menu
+        - .regions-filter
+        - form
+        - button
+        - nav
+        - .product-menu
+        - .breadcrumbs
+        - .breadcrumb
+        - .popup
+  - name: dealer_passports
+    match:
+      path_regex: ^/gde_kupit/ID/[^/]+/$
+    extract:
+      markdown:
+        distributor_container: .dealer__subtitle, .dealer-cart
+        remove_selectors:
+        - form
+        - button
+        - .dealer-cart__certificates
+baseline:
+  structure_hash: null
+  selector_hit_rate: null
+  pages_crawled: 31
+  product_pages: 0
+  product_cards: 0
+  jsonld_share: null
+  cms_detected: null
+  fetch_fail_rate: 0.876
+  challenge_rate: 0.052
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: null
+  sitemap_url_count: 496
+  extraction_path_share:
+    contacts_universal: 1.0
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    distributor: 31
+schema_version: 2

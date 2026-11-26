@@ -1,0 +1,104 @@
+domain: ryazanbrick.ru
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.907
+source: mixed
+notes:
+- Разметка пользователя 19.11.2026; исторические метрики не пересчитаны. Прайс-лист
+  расположен на внешнем хосте demo6.victoria-studio.ru; не считать его сайтом производителя.
+crawl:
+  render: html
+  file_hosts:
+  - demo6.victoria-studio.ru
+sections:
+  contacts_urls:
+  - /contacts
+  distributor_urls:
+  - /partners
+  product_url_patterns:
+  - ^https?://(?:www\.)?ryazanbrick\.ru/[^/?#]+/tproduct/[^/?#]+/?$
+  catalog_roots:
+  - /catalog
+  - /odinarnyi-licevoj-evro-kirpich
+  - /kamni-dobornye
+  - /polnotelyj-rjadovoj-kirpich
+  - /utolshhennyj-licevoj-kirpich
+  - /keramicheskji-porizovannyj-kamen
+  product_url_antipatterns:
+  - /catalog/?(?:[?#].*)?$
+  - /odinarnyi\-licevoj\-evro\-kirpich/?(?:[?#].*)?$
+  - /kamni\-dobornye/?(?:[?#].*)?$
+  - /polnotelyj\-rjadovoj\-kirpich/?(?:[?#].*)?$
+  - /utolshhennyj\-licevoj\-kirpich/?(?:[?#].*)?$
+  - /keramicheskji\-porizovannyj\-kamen/?(?:[?#].*)?$
+  - /catalog/?$
+  start_urls:
+  - /catalog
+  - /odinarnyi-licevoj-evro-kirpich
+  - /kamni-dobornye
+  - /polnotelyj-rjadovoj-kirpich
+  - /utolshhennyj-licevoj-kirpich
+  - /keramicheskji-porizovannyj-kamen
+  - /contacts
+  - /partners
+  price_list_urls:
+  - https://demo6.victoria-studio.ru/assets/files/price.pdf
+extract:
+  tier: llm
+  markdown:
+    product_container: .js-store-product
+    company_container: body
+    remove_selectors:
+    - nav
+    - button
+    - form:not(.t-product__option-variants_custom)
+    - .breadcrumbs
+    - .breadcrumb
+    - .menu
+    - .popup
+    - '[class*=ymaps]'
+    - .t-popup
+    - .t-store__prod-popup__btn-wrapper
+    - .t-store__prod-popup__rec-products
+    - .t-form
+    - .t450
+    - .t228
+    - .t758
+    - a[href="#feedback"]
+    - a[href^="#popup:"]
+    - '#rec867156075'
+    distributor_container: body
+  page_rules:
+  - name: current_catalog_negative
+    match:
+      path_regex: ^/catalog/?$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: ca08efa941b80dfa5cd9fcfdd706fdeaba62fd98
+  selector_hit_rate: 1.0
+  pages_crawled: 69
+  product_pages: 62
+  product_cards: 58
+  card_yield: 0.9355
+  avg_specs_per_card: 3.45
+  jsonld_share: 1.0
+  cms_detected: microdata-product
+  fetch_fail_rate: 0.0348
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0959
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 65
+  extraction_path_share:
+    universal: 0.8493
+    contacts_universal: 0.1507
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    product: 62
+    main_page: 1
+    distributor: 5
+    contacts: 1
+schema_version: 2

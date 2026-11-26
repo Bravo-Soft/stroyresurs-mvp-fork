@@ -1,0 +1,91 @@
+domain: albanydoorsystems.ru
+profile_version: 1
+profiled_at: '2026-08-20'
+confidence: 0.893
+source: mixed
+notes:
+- 'Разметка пользователя 18.11.2026; карта примеров ручная, исторические метрики не
+  пересчитаны. Каталожные якоря главной сохраняются без отдельной загрузки. '
+- 'Родительские категории уточнены по видимым хлебным крошкам и обследованным страницам;
+  информационные разделы исключены только из товарной роли. Полный каталог не заявляется.
+  Доказательства: profile_te24_20261118/category_plan22.json и coverage_revision6.'
+crawl:
+  render: html
+sections:
+  product_url_patterns:
+  - ^https?://(?:www\.)?albanydoorsystems\.ru/catalog/[^/]+/[^/]+/?$
+  contacts_urls:
+  - /contacts/
+  distributor_urls: []
+  catalog_roots:
+  - /catalog/
+  - /catalog/vysokoskorostnye-vorota/
+  - /catalog/promyshlennye-vorota/
+  - /catalog/angarnye-vorota/
+  - /catalog/vorota-dlya-gipermarketa/
+  - /catalog/avtomaticheskie-dveri/
+  - /catalog/dopolnitelnoe-osnashchenie/
+  - /catalog/pogruzochnye/
+  - /catalog/doklevellery/
+  - /catalog/rulonnye/
+  - /catalog/sektsionnye-vorota/
+  - /catalog/skladchatye/
+  - /catalog/s-myagkim-polotnom-pvkh/
+  - /catalog/avtomoyka/
+  - /catalog/besam-albany-door-systems/
+  product_url_antipatterns:
+  - /razdel-4-sout/?$
+  start_urls:
+  - /catalog/
+  - /catalog/vysokoskorostnye-vorota/
+  - /catalog/promyshlennye-vorota/
+  - /catalog/angarnye-vorota/
+  - /catalog/vorota-dlya-gipermarketa/
+  - /contacts/
+extract:
+  tier: llm
+  keep_hidden_tabs: true
+  markdown:
+    product_container: .element
+    company_container: body
+    distributor_container: body
+    remove_selectors:
+    - button
+    - form
+    - .breadcrumbs
+    - .breadcrumb
+    - nav
+    - .tabs__items
+    - .body__left
+    - .cookie-notice
+    - '[class*=ymaps]'
+  page_rules:
+  - name: negative_example
+    match:
+      path_regex: ^/catalog/?$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: b67b0a501912390e50706d2de1bdc59fe093566a
+  selector_hit_rate: 1.0
+  pages_crawled: 51
+  product_pages: 50
+  product_cards: 20
+  jsonld_share: 0.0
+  cms_detected: generic-content
+  fetch_fail_rate: 0.0328
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.9524
+  sitemap_url_count: 134
+  extraction_path_share:
+    contacts_universal: 0.1803
+    universal: 0.8197
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    main_page: 1
+    product: 50
+schema_version: 2

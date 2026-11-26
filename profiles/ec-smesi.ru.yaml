@@ -1,0 +1,120 @@
+domain: ec-smesi.ru
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.908
+source: mixed
+notes:
+- 'Разметка пользователя 18.11.2026; карта примеров ручная, исторические метрики не
+  пересчитаны. Каталожные якоря главной сохраняются без отдельной загрузки. '
+- 'Родительские категории уточнены по видимым хлебным крошкам и обследованным страницам;
+  информационные разделы исключены только из товарной роли. Полный каталог не заявляется.
+  Доказательства: profile_te24_20261118/category_plan22.json и coverage_revision6.'
+crawl:
+  render: html
+sections:
+  product_url_patterns:
+  - ^https?://(?:www\.)?ec\-smesi\.ru/product/[^/]+/?$
+  contacts_urls:
+  - /kontakty-ec/
+  distributor_urls: []
+  catalog_roots:
+  - /catalog/all/
+  - /catalog/kleevye-smesi/
+  - /catalog/kladochnye-smesi/
+  - /catalog/shpatlevochnye-smesi/
+  - /catalog/gidroizolyaciya/
+  - /catalog/grunty/
+  - /catalog/karkasnye-profili/
+  - /catalog/metalloprodukciya/
+  - /catalog/shtukaturnye-smesi/
+  - /catalog/smesi-dlya-pola/
+  product_url_antipatterns:
+  - /text-newsec/
+  - /ud_uzunov(?:/|[?]|$)
+  - /text-5/?$
+  start_urls:
+  - /catalog/all/
+  - /catalog/kleevye-smesi/
+  - /catalog/kladochnye-smesi/
+  - /catalog/shpatlevochnye-smesi/
+  - /catalog/gidroizolyaciya/
+  - /kontakty-ec/
+extract:
+  tier: llm
+  keep_hidden_tabs: true
+  markdown:
+    product_container: .rs-product
+    company_container: body
+    distributor_container: body
+    remove_selectors:
+    - button
+    - form
+    - .breadcrumbs
+    - .breadcrumb
+    - nav
+    - .nav-pills
+    - .cookies-policy
+    - .mobile-bar
+    - '[class*=ymaps]'
+    - .head-bar__menu
+    - .head-bar__link
+    - .head-bar__catalog
+    - .rs-userlinks
+    - .rs-category
+    - .offcanvas
+    - .dropdown-menu
+    - .head-catalog
+    - .head-catalog__list
+    - .head-catalog-category
+    - .ud-cat-var
+    - .foot-menu
+    - .footer-menu
+  page_rules:
+  - name: negative_example
+    match:
+      path_regex: ^/catalog/kleevye-smesi/?$
+    extract:
+      markdown:
+        product_container: h1
+  - name: own_contacts
+    match:
+      page_types:
+      - company
+    extract:
+      keep_hidden_tabs: false
+      markdown:
+        company_container: null
+        content_blocks:
+        - name: contacts
+          selector: .ec-contact
+          required: true
+        - name: footer
+          selector: footer
+          required: false
+baseline:
+  structure_hash: a5fc6d10c35409635e41277731edaaa593a4aa95
+  selector_hit_rate: 1.0
+  pages_crawled: 79
+  product_pages: 77
+  product_cards: 33
+  card_yield: 0.4286
+  avg_specs_per_card: 10.27
+  jsonld_share: 0.9351
+  cms_detected: generic-main
+  fetch_fail_rate: 0.0347
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.025
+  gate3_pass_rate: 0.9167
+  sitemap_url_count: 258
+  extraction_path_share:
+    universal: 0.9125
+    generic: 0.05
+    contacts_universal: 0.0375
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    product: 77
+    main_page: 1
+    category: 1
+schema_version: 2

@@ -1,0 +1,97 @@
+domain: thermona-rus.ru
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.906
+source: mixed
+notes:
+- 'Разметка пользователя 18.11.2026; карта примеров ручная, исторические метрики не
+  пересчитаны. Каталожные якоря главной сохраняются без отдельной загрузки. '
+- 'Родительские категории уточнены по видимым хлебным крошкам и обследованным страницам;
+  информационные разделы исключены только из товарной роли. Полный каталог не заявляется.
+  Доказательства: profile_te24_20261118/category_plan22.json и coverage_revision6.'
+crawl:
+  render: html
+sections:
+  contacts_urls:
+  - /kontakti/
+  distributor_urls: []
+  product_url_patterns:
+  - ^https?://(?:www\.)?thermona\-rus\.ru/kat_[^/]+/(?:[^/]+/)?tov_[^/]+/?$
+  catalog_roots:
+  - /kat_gazovie-kotli/
+  - /kat_kaskadnie-kotelnie/
+  - /kat_bojleri/
+  - /kat_otvod-dimovih-gazov/
+  - /kat_komnatnye-termostaty/
+  - /helpers/goods/hits/
+  - /kat_bojleri/boyleri-kosvennie/
+  - /kat_gazovie-kotli/napolnie-kotli/
+  - /kat_zapchasti/avtomatika/
+  - /kotly-dlja-otoplenija-doma/n_bojleri/boyleri-kosvennie/
+  - /kotly-dlja-otoplenija-doma/n_zapchasti/avtomatika/
+  product_url_antipatterns: []
+  start_urls:
+  - /kat_gazovie-kotli/
+  - /kat_kaskadnie-kotelnie/
+  - /kat_bojleri/
+  - /kat_otvod-dimovih-gazov/
+  - /kat_komnatnye-termostaty/
+  - /kontakti/
+extract:
+  tier: llm
+  markdown:
+    product_container: .content-catalog-cust
+    company_container: body
+    distributor_container: body
+    remove_selectors:
+    - button
+    - form
+    - nav
+    - .breadcrumbs
+    - .breadcrumb
+    - .cookie-notice
+    - '[class*=ymaps]'
+    - .same_category
+    - .seo.module
+    - .menu
+    - .filter
+    - .catalogue.items
+    - .last_viewed
+    - a.cart
+    - a[href*="71375ccc8dc5dc6a7e2140e5c5708430"]
+    - a[href*="22582e7dbbf67a29d8a849c5b2ad1f02"]
+  page_rules:
+  - name: negative_5
+    match:
+      path_regex: ^/kat_gazovie\-kotli/?$
+    extract:
+      markdown:
+        product_container: h1
+        content_blocks: []
+baseline:
+  structure_hash: 4a6b5a9d7f98c0eae079904441893c0996f86d35
+  selector_hit_rate: 1.0
+  pages_crawled: 416
+  product_pages: 402
+  product_cards: 122
+  card_yield: 0.3035
+  avg_specs_per_card: 8.7
+  jsonld_share: 0.898
+  cms_detected: microdata-product
+  fetch_fail_rate: 0.0124
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0239
+  gate3_pass_rate: 0.9839
+  sitemap_url_count: 238
+  extraction_path_share:
+    universal: 0.9594
+    contacts_universal: 0.0406
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    product: 402
+    main_page: 1
+    distributor: 10
+    contacts: 3
+schema_version: 2

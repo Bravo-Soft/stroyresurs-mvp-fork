@@ -1,0 +1,90 @@
+domain: lzsom.ru
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.923
+source: mixed
+notes:
+- Карта и контейнеры уточнены по живым HTML 13.11.2026; исторические метрики сохранены.
+  Приёмка только по отдельному контрольному прогону.
+crawl:
+  render: html
+sections:
+  catalog_roots:
+  - /catalog/
+  - /catalog/category/bordyur-dekorativnye/
+  - /catalog/category/bytovye-betonosmesiteli/
+  - /catalog/category/izdeliya-iz-plastika/
+  - /catalog/category/motobloki/
+  - /catalog/category/navesnoe-oborudovanie-dlya-motoblokov/
+  - /catalog/category/novinki/
+  - /catalog/category/perchatki/
+  - /catalog/category/poluprofessionalnye-betonosmesiteli/
+  - /catalog/category/professionalnye-betonosmesiteli/
+  - /catalog/category/rastvorosmesiteli/
+  - /catalog/category/ruchnoy-instrument/
+  - /catalog/category/shlangi-sadovye/
+  - /catalog/category/shpateli/
+  - /catalog/category/tachki-sadovye-stroitelnye/
+  - /catalog/category/tazy-i-vedra-stroitelnye/
+  - /catalog/category/terki/
+  - /catalog/category/zabory-dekorativnye/
+  product_url_patterns:
+  - /catalog/product/[^/?#]+/?$
+  product_url_antipatterns:
+  - /blog/
+  - /catalog/(?:category|tag|search)/
+  contacts_urls:
+  - /kontakty/
+  distributor_urls:
+  - /dillery/
+  start_urls:
+  - /kontakty/
+extract:
+  tier: llm
+  markdown:
+    product_container: .main-pane
+    company_container: .main-pane
+    distributor_container: .main-pane
+    remove_selectors:
+    - .breadcrumb
+  keep_hidden_tabs: false
+  page_rules:
+  - name: company_contacts
+    match:
+      page_types:
+      - company
+    extract:
+      markdown:
+        content_blocks:
+        - name: phones
+          selector: .top-header .phones
+          required: true
+        - name: address
+          selector: .top-header .address
+          required: true
+baseline:
+  structure_hash: 7b784d802c44af03599db09f90de64250009a8b8
+  selector_hit_rate: 0.9948
+  pages_crawled: 201
+  product_pages: 194
+  product_cards: 119
+  card_yield: 0.6134
+  avg_specs_per_card: 7.24
+  jsonld_share: 0.9485
+  cms_detected: microdata-product
+  fetch_fail_rate: 0.011
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.9917
+  sitemap_url_count: 198
+  extraction_path_share:
+    universal: 0.8981
+    contacts_universal: 0.1019
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    product: 194
+    main_page: 1
+    category: 6
+schema_version: 2

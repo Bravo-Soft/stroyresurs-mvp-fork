@@ -1,0 +1,96 @@
+domain: ascold.ru
+profile_version: 1
+profiled_at: '2026-08-26'
+confidence: 0.607
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: browser
+  exclude_paths: []
+sections:
+  catalog_roots:
+  - /catalog/
+  - /catalog/truboprovodnaia-armatura-dlia-sudostroeniia-i-sudoremonta/
+  - /catalog/pozharnaia-armatura/
+  contacts_urls:
+  - /contacts/
+  product_url_patterns:
+  - /catalog/pozharnaia\-armatura/klapany/491216\.005/?(?:\?|$)
+  - /catalog/pozharnaia\-armatura/zaglushki/491126\.001/?(?:\?|$)
+  - /catalog/truboprovodnaia\-armatura\-dlia\-sudostroeniia\-i\-sudoremonta/klapany\-zapornye/491112\.005/?(?:\?|$)
+  - /catalog/truboprovodnaia\-armatura\-dlia\-sudostroeniia\-i\-sudoremonta/klapany\-zapornye/491112\.015/?(?:\?|$)
+  product_url_antipatterns:
+  - /catalog/?(?:\?|$)
+  - /catalog/truboprovodnaia\-armatura\-dlia\-sudostroeniia\-i\-sudoremonta/?(?:\?|$)
+  - /catalog/pozharnaia\-armatura/?(?:\?|$)
+  start_urls:
+  - https://www.ascold.ru/catalog/
+  - https://www.ascold.ru/catalog/truboprovodnaia-armatura-dlia-sudostroeniia-i-sudoremonta/
+  - https://www.ascold.ru/catalog/pozharnaia-armatura/
+  - https://www.ascold.ru/contacts/
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: main
+    min_len: 1
+    remove_selectors:
+    - .product-gallery
+    - .breadcrumbs
+    - .product-info .btn
+    - .variant-row .btn
+    - a[href*='topic=kp']
+    - nav
+    - '[class^="product-gallery__"]'
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+    - .product-grid
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - a[href="/en/"]
+  - name: category_heading
+    match:
+      path_regex: ^(?:/catalog/|/catalog/truboprovodnaia\-armatura\-dlia\-sudostroeniia\-i\-sudoremonta/|/catalog/pozharnaia\-armatura/)$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: 1a176f334613ccf59e15261dfa4fc8678858a867
+  selector_hit_rate: 1.0
+  pages_crawled: 2
+  product_pages: 1
+  product_cards: 0
+  jsonld_share: 1.0
+  cms_detected: generic-main
+  fetch_fail_rate: 0.8
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: null
+  sitemap_url_count: null
+  extraction_path_share:
+    contacts_universal: 0.9167
+    universal: 0.0833
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    main_page: 1
+    product: 1
+schema_version: 2

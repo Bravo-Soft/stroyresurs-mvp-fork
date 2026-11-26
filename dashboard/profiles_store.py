@@ -228,8 +228,11 @@ def validate(domain, text):
     domain = valid_domain(domain)
     yaml = _yaml()
     try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as e:
+        from site_profiles.format_v2 import load_yaml, compose
+        data = load_yaml(text)
+        if isinstance(data, dict) and data.get('schema_version') == 2:
+            data, _ = compose(data, profiles_dir())
+    except (yaml.YAMLError, ValueError, OSError) as e:
         return [f'YAML: {e}']
     if not isinstance(data, dict):
         return ['профиль: ожидается объект YAML']

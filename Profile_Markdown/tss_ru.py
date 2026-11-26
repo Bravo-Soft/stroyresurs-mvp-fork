@@ -63,7 +63,7 @@ def clean(soup: BeautifulSoup):
             tag.decompose()
 
     # Удаляем динамические классы sliderdop-SLADER_* (слайдеры похожих/аналогов)
-    for tag in soup.find_all('div'):
+    for tag in reversed(soup.find_all('div')):
         cls_list = tag.get('class') or []
         if any(c.startswith('sliderdop-') for c in cls_list):
             tag.decompose()

@@ -1,0 +1,61 @@
+domain: nppnfl.ru
+profile_version: 1
+profiled_at: '2026-08-21'
+confidence: 0.598
+source: mixed
+notes:
+- Карта и контейнеры уточнены по живым HTML 13.11.2026; исторические метрики сохранены.
+  Приёмка только по отдельному контрольному прогону.
+crawl:
+  render: html
+sections:
+  product_url_patterns:
+  - '[?&]route=product/product(?:&|$)'
+  product_url_antipatterns:
+  - '[?&]route=(?!product/product(?:&|$))'
+  contacts_urls: []
+  distributor_urls: []
+  catalog_roots: []
+  start_urls:
+  - /index.php?route=information/contact
+extract:
+  tier: llm
+  markdown:
+    product_container: '#content'
+    company_container: '#content'
+    distributor_container: '#content'
+    remove_selectors:
+    - '#tab-review'
+    - .nav-tabs
+    - '#product'
+    - .rating
+    - .product-layout
+    - '#content > h3'
+    - .magiczoomplus-hint
+    - .mz-hint
+    - .mz-poweredby
+    - button
+    - form
+  keep_hidden_tabs: true
+baseline:
+  structure_hash: ddc1200e3f93bbd1e47746311cb8c8b27af203d6
+  selector_hit_rate: 1.0
+  pages_crawled: 27
+  product_pages: 26
+  product_cards: 1
+  jsonld_share: 0.0
+  cms_detected: generic-id-content
+  fetch_fail_rate: 0.1775
+  challenge_rate: 0.0043
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 0
+  extraction_path_share:
+    contacts_universal: 0.1034
+    generic: 0.8966
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    main_page: 1
+    product: 26

@@ -1,0 +1,107 @@
+domain: bitumast.com
+profile_version: 1
+profiled_at: '2026-08-30'
+confidence: 0.71
+source: mixed
+notes:
+- 'Партия 104: проверка 13.11.2026 с обязательной цепочкой цены; исторические метрики
+  сохранены.'
+- 'Редакция2: точечная коррекция контейнеров контактов/категорий; checker v7, новый
+  контроль.'
+crawl:
+  render: html
+sections:
+  contacts_urls:
+  - /kontaktyi/
+  - /contacts-en/
+  - /contact-kz/
+  - /contact-uk/
+  distributor_urls: []
+  product_url_patterns:
+  - ^/goods/[^/]+/?$
+  product_url_antipatterns: []
+  catalog_roots:
+  - /good_atributes/akril/
+  - /good_atributes/aerozol/
+  - /good_atributes/bitumniye_bitumast/
+  - /good_atributes/rulonnyie-materialyi/
+  start_urls:
+  - /
+  - /kontaktyi/
+extract:
+  tier: llm
+  markdown:
+    product_container: .content
+    company_container: .content, .footer-blocks
+    distributor_container: .content
+    remove_selectors:
+    - .breadcrumb
+    - '#goods_tabs'
+    - '#order-form'
+    - .single_good_title_buttons
+    - form
+    - iframe
+    - .footer-blocks .widget_nav_menu
+    - select
+  keep_hidden_tabs: true
+  page_rules:
+  - name: category
+    match:
+      path_regex: ^/good_atributes/[^/]+/?$
+    extract:
+      markdown:
+        product_container: .owner-text > .post > h2
+        content_blocks: []
+  - name: all_company_contacts
+    match:
+      path_regex: ^/kontaktyi/?$
+    extract:
+      markdown:
+        company_container: null
+        content_blocks:
+        - name: part0
+          selector: .content
+          required: true
+        - name: part1
+          selector: '#text-3'
+          required: true
+        - name: part2
+          selector: '#text-6'
+          required: true
+        remove_selectors:
+        - .breadcrumb
+        - '#goods_tabs'
+        - '#order-form'
+        - .single_good_title_buttons
+        - form
+        - iframe
+        - .footer-blocks .widget_nav_menu
+        - select
+        - '#action'
+        - .wp-block-file
+baseline:
+  structure_hash: ae44e6f9b7fe65139bb33c9b63ef9a5789a01655
+  selector_hit_rate: 1.0
+  pages_crawled: 65
+  product_pages: 51
+  product_cards: 31
+  jsonld_share: 0.0
+  cms_detected: generic-content
+  fetch_fail_rate: 0.043
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0141
+  gate3_pass_rate: 0.7209
+  sitemap_url_count: 136
+  extraction_path_share:
+    contacts_universal: 0.2817
+    universal: 0.7042
+    generic: 0.0141
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    main_page: 1
+    product: 51
+    contacts: 6
+    distributor: 7
+schema_version: 2

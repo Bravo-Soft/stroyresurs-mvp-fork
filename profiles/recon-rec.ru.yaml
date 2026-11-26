@@ -1,0 +1,99 @@
+domain: recon-rec.ru
+profile_version: 1
+profiled_at: '2026-09-06'
+confidence: 0.747
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: html
+  exclude_paths: []
+sections:
+  contacts_urls:
+  - /contact/
+  distributor_urls:
+  - /about/
+  - /dealers/
+  - /distributors/
+  product_url_patterns:
+  - /veimix\-vep\-74/?(?:\?|$)
+  - /veimix\-vep\-74\-m/?(?:\?|$)
+  - /veimix\-vep\-58/?(?:\?|$)
+  - /veimix\-vep\-70r/?(?:\?|$)
+  - /veimix\-vep\-58r/?(?:\?|$)
+  - /repair\-strengthening/[^/]+/?$
+  - /remont\-i\-usilenie\-stroitelnyh\-konstruktsiy/[^/]+/?$
+  - /kratkaya\-harakteristika\-plenkoobrazovateley\-i\-appretov\-veimix\-vep/[^/]+/?$
+  catalog_roots:
+  - /veimix-vep/
+  documents_urls:
+  - /docs/
+  product_url_antipatterns:
+  - /veimix\-vep/?(?:\?|$)
+  - /docs/?(?:\?|$)
+  start_urls:
+  - https://recon-rec.ru/veimix-vep/
+  - https://recon-rec.ru/contact/
+  - https://recon-rec.ru/docs/
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: .industify_fn_without_sidebar_page .inner
+    min_len: 1
+    remove_selectors:
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .menu-main-menu-container
+        - .industify_fn_breadcrumbs
+        - ul:has(a[href*="bonusy-kazino"])
+  - name: category_heading
+    match:
+      path_regex: ^(?:/veimix\-vep/)$
+    extract:
+      markdown:
+        product_container: .industify_fn_pagetitle h3
+baseline:
+  structure_hash: 1953a5ac64d3440469b5d2b69693823323e8c4e8
+  selector_hit_rate: 0.08
+  pages_crawled: 60
+  product_pages: 50
+  product_cards: 21
+  jsonld_share: 1.0
+  cms_detected: readability
+  fetch_fail_rate: 0.104
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 58
+  extraction_path_share:
+    contacts_universal: 0.1935
+    generic: 0.371
+    universal: 0.4355
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    product: 50
+    main_page: 2
+    contacts: 2
+    distributor: 6
+schema_version: 2

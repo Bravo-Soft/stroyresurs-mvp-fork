@@ -38,12 +38,13 @@ except Exception:
 from fetch_outcome import (FetchOutcome, fetch_observer, observe_fetch,
                            retry_after_seconds, is_soft_not_found)
 from inline_products import inline_product_links
-from product_interactions import (product_state_key, tilda_product_links, isolate_product_state,
+from product_interactions import (capture_public_product_links_html, product_state_key, tilda_product_links, isolate_product_state,
                                   expand_product_panels)
 from contact_interactions import collect_contact_panels, needs_contact_interaction
 from config import Config
 from product_utils import sanitize_filename
 from temp_storage_manager import TempStorageManager
+from site_profiles.quick_check import emit as quick_check_event
 from domain_equivalency import (DomainEquivalencyManager, hosts_equivalent,
                                 url_in_scope)
 from data_island import (needs_javascript, has_product_island, is_unrendered_store_listing,
@@ -60,6 +61,28 @@ except Exception:
     HostThrottle = None
 
 log = logging.getLogger("crawler")
+
+
+_COMPANY_EXTRA_FILE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.zip', '.rar')
+
+
+def _elconnect_price_link(profile, url: str) -> bool:
+    # Эти опубликованные ссылки из меню возвращают редирект на именованный XLS.
+    return (profile is not None and profile.domain == 'elconnect.ru'
+            and re.fullmatch(r'https://elconnect\.ru/production/price/general/[0-9]+/', url) is not None
+            and url in profile.sections.price_list_urls)
+
+
+def _google_sheet_export_url(url: str) -> Optional[str]:
+    """Прямая загрузка XLSX для опубликованной ссылки на Google Таблицу."""
+    parsed = urlparse(url)
+    if parsed.scheme != 'https' or parsed.netloc != 'docs.google.com' or parsed.params:
+        return None
+    match = re.fullmatch(r'/spreadsheets/d/([\w-]+)/edit/?', parsed.path, re.ASCII)
+    if match:
+        return f'https://docs.google.com/spreadsheets/d/{match[1]}/export?format=xlsx'
+    return None
+
 
 # Память, которую считает лимит контейнера (mem_limit). Внутри контейнера
 # /sys/fs/cgroup примонтирован на его собственный scope, поэтому эти файлы
@@ -495,7 +518,7 @@ class DynamicContentExtractor:
             # ИЗМЕНЕНО: wait_until='domcontentloaded', таймаут 20 сек
             response = await page.goto(url, wait_until='domcontentloaded', timeout=20000)
             state['response'] = response
-            initial = _browser_content(await page.content(), url, page, state, 'dynamic')
+            initial = _browser_content(await capture_public_product_links_html(page), url, page, state, 'dynamic')
             if page_error_reason(initial):
                 return None
             # ДОБАВЛЕНО: короткий networkidle (3 сек) – необязателен
@@ -508,7 +531,7 @@ class DynamicContentExtractor:
                 return None
             # Согласие может перезагрузить документ: готовность проверяем ПОСЛЕ него.
             if (self.accept_cookie_consent and needs_contact_interaction(
-                    await page.content(), self.config.dynamic_tab_selectors + self.config.dynamic_accordion_selectors)):
+                    await capture_public_product_links_html(page), self.config.dynamic_tab_selectors + self.config.dynamic_accordion_selectors)):
                 await self.accept_cookie_consent(page)
             if self.ready_selector:
                 try:
@@ -621,7 +644,7 @@ class DynamicContentExtractor:
                 cleanup_guard = await self.guard_browser_page(page, url, navigation_state=state)
             response = await page.goto(url, wait_until='domcontentloaded', timeout=30000)
             state['response'] = response
-            initial = _browser_content(await page.content(), url, page, state, 'ajax_tabs')
+            initial = _browser_content(await capture_public_product_links_html(page), url, page, state, 'ajax_tabs')
             if page_error_reason(initial):
                 return None
             try:
@@ -631,7 +654,7 @@ class DynamicContentExtractor:
 
             if self.allowed_url and not self.allowed_url(page.url, base_url=url):
                 return None
-            base_html = _browser_content(await page.content(), url, page, state, 'ajax_tabs')
+            base_html = _browser_content(await capture_public_product_links_html(page), url, page, state, 'ajax_tabs')
             if page_error_reason(base_html):
                 return None
 
@@ -648,7 +671,7 @@ class DynamicContentExtractor:
                     observe_fetch(url, 'ajax_tabs', reason='incomplete_render')
                 return None
             if panel_sections:
-                current = _browser_content(await page.content(), url, page, state, 'ajax_tabs')
+                current = _browser_content(await capture_public_product_links_html(page), url, page, state, 'ajax_tabs')
                 if page_error_reason(current):
                     return None
                 block = '\n'.join(panel_sections)
@@ -716,7 +739,7 @@ class DynamicContentExtractor:
                         await page.go_back(wait_until='domcontentloaded', timeout=15000)
                         await page.wait_for_timeout(300)
                         continue
-                    current = _browser_content(await page.content(), url, page, state, 'ajax_tabs')
+                    current = _browser_content(await capture_public_product_links_html(page), url, page, state, 'ajax_tabs')
                     if page_error_reason(current):
                         return None
                     panel = await visible_panel_html(target_id)
@@ -1330,6 +1353,8 @@ class URLCategorizer:
         
     def is_downloadable_file(self, url: str) -> bool:
         """Проверяет, является ли URL ссылкой на файл для скачивания"""
+        if _elconnect_price_link(getattr(self, 'profile', None), url):
+            return True
         try:
             parsed = urlparse(url)
             path = parsed.path.lower()
@@ -1483,8 +1508,10 @@ class URLCategorizer:
         """Профиль сайта (site_profiles.SiteProfile) текущей компании: пер-сайтовая
         карта разделов (sections) и exclude_paths. None = без профиля (как раньше)."""
         self.profile = profile
+        self._external_sections = {}
         self._profile_product_res = []
         self._profile_antipattern_res = []
+        self._profile_exclude_url_res = []
         # Пер-компанийное состояние категоризатора (признак плоского сайта, базовая
         # локаль, счётчики и предохранитель фильтров) — сбрасываем вместе с профилем:
         # set_profile зовётся из _apply_site_profile на каждую компанию.
@@ -1499,6 +1526,13 @@ class URLCategorizer:
         self._deferred_seen = set()
         if profile is None:
             return
+        for pattern in profile.crawl.exclude_url_patterns:
+            self._profile_exclude_url_res.append(re.compile(pattern, re.I))
+        external = set(getattr(profile.crawl, 'external_page_urls', ()))
+        if external:
+            for section in ('contacts', 'distributor', 'price_list', 'certificates', 'documents', 'instructions'):
+                for url in external.intersection(getattr(profile.sections, section + '_urls')):
+                    self._external_sections.setdefault(url, section)
         for pattern in profile.sections.product_url_patterns:
             try:
                 self._profile_product_res.append(re.compile(pattern, re.I))
@@ -1525,6 +1559,19 @@ class URLCategorizer:
                 best = max(best, len(p.rstrip('/')))
         return best
 
+    @staticmethod
+    def _query_section_match(parsed, prefix):
+        rule = urlparse(prefix)
+        return (bool(rule.query)
+                and (not rule.netloc or rule.netloc.lower() == parsed.netloc.lower())
+                and rule.path.lower().rstrip('/') == parsed.path.lower().rstrip('/')
+                and parse_qs(rule.query, keep_blank_values=True) == parse_qs(parsed.query, keep_blank_values=True))
+
+    def _is_file_index(self, path: str) -> bool:
+        profile = getattr(self, 'profile', None)
+        return bool(profile and profile.sections.file_index_paths and
+                    any(path.lower().rstrip('/') == p.lower().rstrip('/') for p in profile.sections.file_index_paths))
+
     def profile_document_section(self, url: str) -> Optional[str]:
         """Блок общих документов компании из профиля для URL:
         'certificates' | 'documents' | 'instructions' | 'price_list' (по самому
@@ -1533,18 +1580,34 @@ class URLCategorizer:
         prof = getattr(self, 'profile', None)
         if prof is None:
             return None
-        path = urlparse(url).path.lower()
-        best_len, best_section = -1, None
+        parsed = urlparse(url)
+        path = parsed.path.lower() or '/'
+        external = getattr(self, '_external_sections', {}).get(url.partition('#')[0])
+        if external:
+            return external if external in ('price_list', 'certificates', 'documents', 'instructions') else None
+        if self._is_file_index(path):
+            return None
+        best, best_section = (-1, -1), None
         for prefixes, section in ((prof.sections.certificates_urls, 'certificates'),
                                   (prof.sections.documents_urls, 'documents'),
                                   (prof.sections.instructions_urls, 'instructions'),
                                   (prof.sections.price_list_urls, 'price_list')):
-            match_len = self._longest_prefix(path, prefixes)
-            if match_len > best_len:
-                best_len, best_section = match_len, section
-        return best_section if best_len >= 0 else None
+            match_len = self._longest_prefix(path, [prefix for prefix in prefixes if '?' not in prefix])
+            if match_len >= 0 and (0, match_len) > best:
+                best, best_section = (0, match_len), section
+            for prefix in prefixes:
+                if '?' not in prefix:
+                    continue
+                if self._query_section_match(parsed, prefix) and (1, len(path)) > best:
+                    best, best_section = (1, len(path)), section
+        return best_section
 
     def categorize_url(self, url: str, link_text: str = "") -> Tuple[str, int]:
+        result = self._categorize_url_impl(url, link_text)
+        quick_check_event('route', url=url, role=result[0])
+        return result
+
+    def _categorize_url_impl(self, url: str, link_text: str = "") -> Tuple[str, int]:
         """Категоризация URL с возвратом категории и приоритета"""
         self._urls_categorized += 1
         # Проверяем на языковые префиксы
@@ -1559,7 +1622,9 @@ class URLCategorizer:
             return 'excluded', 0
         
         # Затем проверяем на изображения
-        if self._is_image_url(url):
+        if self._is_image_url(url) and (
+                any(parsed.path.lower().endswith(ext) for ext in self.image_extensions)
+                or not self.profile_document_section(url)):
             return 'excluded1', 0
         
         url_lower = url.lower()
@@ -1594,10 +1659,20 @@ class URLCategorizer:
         profile_not_product = False
         _prof = getattr(self, 'profile', None)
         if _prof is not None:
+            if any(pattern.search(unquote(url_lower)) for pattern in self._profile_exclude_url_res):
+                log.debug(f"Профиль {_prof.domain}: исключаем URL {url}")
+                return 'excluded', 0
             _p_path = parsed.path.lower()
             if any(p in _p_path for p in (s.lower() for s in _prof.crawl.exclude_paths)):
                 log.debug(f"Профиль {_prof.domain}: исключаем раздел {url}")
                 return 'excluded', 0
+            external = getattr(self, '_external_sections', {}).get(url.partition('#')[0])
+            if external:
+                if external in ('contacts', 'distributor', 'price_list'):
+                    return external, self.priority_levels[external]
+                return 'other', self.priority_levels['contacts']
+            if self._is_file_index(_p_path):
+                return 'other', self.priority_levels['contacts']
             profile_not_product = any(r.search(url_lower) for r in self._profile_antipattern_res)
             if not profile_not_product and any(r.search(url_lower) for r in self._profile_product_res):
                 return 'product', self.priority_levels['product']
@@ -1614,7 +1689,9 @@ class URLCategorizer:
                     (_sec.certificates_urls, 'other', self.priority_levels['contacts']),
                     (_sec.documents_urls, 'other', self.priority_levels['contacts']),
                     (_sec.instructions_urls, 'other', self.priority_levels['contacts'])):
-                _match_len = self._longest_prefix(_p_path, _prefixes)
+                if any(self._query_section_match(parsed, p) for p in _prefixes if '?' in p):
+                    return _sec_cat, _sec_prio
+                _match_len = self._longest_prefix(_p_path, (p for p in _prefixes if '?' not in p))
                 if _match_len > _best_len:
                     _best_len, _best_result = _match_len, (_sec_cat, _sec_prio)
             if _best_len >= 0:
@@ -1622,8 +1699,9 @@ class URLCategorizer:
             # catalog_roots: только сам корень каталога (точный путь) — подстраницы
             # идут обычной классификацией (иначе товарные URL стали бы категориями)
             _roots = [r.rstrip('/') for r in (s.lower() for s in _sec.catalog_roots)]
-            if (not product_state_key(url) and
-                    _p_path.rstrip('/') in [r if r.startswith('/') else '/' + r for r in _roots if r]):
+            exact_root = _p_path.rstrip('/') in [r if r.startswith('/') else '/' + r for r in _roots if r and '?' not in r]
+            query_root = any(self._query_section_match(parsed, p) for p in _sec.catalog_roots if '?' in p)
+            if not product_state_key(url) and (exact_root or query_root):
                 return 'category', self.priority_levels['category']
 
         # Проверка на исключаемые паттерны (P04 U1: посегментно, без хоста и без
@@ -1648,6 +1726,9 @@ class URLCategorizer:
         # Проверка на главную страницу
         parsed_url = urlparse(url)
         path = parsed_url.path.strip('/')
+        if (_prof is not None and _prof.domain == 'egozamos.ru' and not path
+                and parse_qs(parsed_url.query).get('r') == ['pages']):
+            return 'other', self.priority_levels['other']
         if not path or path in self.main_page_indicators:
             return 'main_page', self.priority_levels['main_page']
         
@@ -2094,6 +2175,7 @@ class SiteMapParser:
         ]
         
         self._allowed_url = allowed_url
+        self.discovery_sink = None  # Опциональная карта структуры; не меняет очередь.
         # Кэш для избежания повторной обработки
         self._processed_sitemaps = set()
         self._results = {}
@@ -2360,6 +2442,10 @@ class SiteMapParser:
             log.debug(f'Не удалось найти HTML-карту: {e}')
         return []
 
+    def _discovery_event(self, event, **data):
+        if self.discovery_sink is not None:
+            self.discovery_sink(event, **data)
+
     async def parse_sitemap(self, sitemap_url, depth=0, max_depth=3):
         if self._scope_base is None:
             self._scope_base = sitemap_url
@@ -2367,6 +2453,7 @@ class SiteMapParser:
             log.info(f'Карта вне периметра пропущена: {sitemap_url}')
             return []
         if depth > max_depth:
+            self._discovery_event('limit', source=sitemap_url, reason='sitemap_depth')
             return []
         key = (sitemap_url, max_depth - depth)
         parent = self._current_map.get()
@@ -2673,6 +2760,8 @@ class SiteMapParser:
                     log.info(f"Индекс {sitemap_url}: {len(locs)} карт, разобраны все")
                 # Не создаём неограниченное число задач для большого индекса.
                 chosen = sorted(dict.fromkeys(chosen), key=self._submap_rank)[:getattr(self.config, 'sitemap_max_requests', 128)]
+                if len(chosen) < len(set(locs)):
+                    self._discovery_event('limit', source=sitemap_url, reason='submap_limit', omitted=len(set(locs))-len(chosen))
                 tasks = [self.parse_sitemap(urljoin(sitemap_url, loc), depth + 1, max_depth) for loc in chosen]
 
                 if tasks:
@@ -2706,6 +2795,7 @@ class SiteMapParser:
                     if not url:
                         broken_locs += 1
                         continue
+                    self._discovery_event('url', url=url, source=sitemap_url)
                     normalized_url = self.url_normalizer.normalize_url(url)
 
                     # Пропускаем URL с не-русскими языковыми префиксами
@@ -2726,6 +2816,7 @@ class SiteMapParser:
                 log.warning(f"Карта сайта {sitemap_url}: отброшено {broken_locs} "
                             f"неисправимых <loc> (пустой путь)")
             if len(url_tags) > len(scanned_tags):
+                self._discovery_event('limit', source=sitemap_url, reason='scan_limit', omitted=len(url_tags)-len(scanned_tags))
                 log.warning(f"Карта сайта {sitemap_url}: {len(url_tags)} адресов, "
                             f"просканировано {len(scanned_tags)} (потолок sitemap_max_scan_urls)")
             all_urls.sort(key=self._sitemap_rank_key)
@@ -2746,6 +2837,8 @@ class SiteMapParser:
             all_urls = []
             base_domain = urlparse(sitemap_url).scheme + "://" + urlparse(sitemap_url).netloc
             
+            if len(soup.find_all('a', href=True)) > self.config.sitemap_max_scan_urls:
+                self._discovery_event('limit', source=sitemap_url, reason='scan_limit')
             # Ищем все ссылки в HTML
             for item_number, link in enumerate(soup.find_all('a', href=True)[:self.config.sitemap_max_scan_urls]):
                 if item_number % 128 == 0:
@@ -2753,6 +2846,7 @@ class SiteMapParser:
                 href = sanitize_href(link['href'])  # D257/D233
                 if href and not href.startswith(('#', 'javascript:', 'mailto:')):
                     full_url = urljoin(base_domain, href)
+                    self._discovery_event('url', url=full_url, source=sitemap_url)
 
                     if self.url_categorizer.should_exclude_by_language(full_url):
                         continue
@@ -2778,12 +2872,15 @@ class SiteMapParser:
             all_urls = []
             base_domain = urlparse(sitemap_url).scheme + "://" + urlparse(sitemap_url).netloc
             
+            if len(content.split('\n')) > self.config.sitemap_max_scan_urls:
+                self._discovery_event('limit', source=sitemap_url, reason='scan_limit')
             for item_number, line in enumerate(content.split('\n')[:self.config.sitemap_max_scan_urls]):
                 if item_number % 128 == 0:
                     await asyncio.sleep(0)
                 line = line.strip()
                 if line and not line.startswith('#') and self._is_valid_url(line):
                     full_url = urljoin(base_domain, line) if not line.startswith('http') else line
+                    self._discovery_event('url', url=full_url, source=sitemap_url)
 
                     # Пропускаем URL с не-русскими языковыми префиксами
                     if self.url_categorizer.should_exclude_by_language(full_url):
@@ -2912,15 +3009,36 @@ class FileDownloadManager:
         """Проверяет, принадлежит ли URL тому же домену"""
         return self.crawler._is_allowed_url(url, resource='file', base_url=base_domain)
 
+    def _profile_sheet_id(self, url: str) -> Optional[str]:
+        if not url.startswith('https://docs.google.com/spreadsheets/d/'):
+            return None
+        profile = getattr(self.crawler, 'profile', None)
+        if profile and any(_google_sheet_export_url(entry) == url
+                           for entry in profile.sections.price_list_urls):
+            return urlparse(url).path.split('/')[3]
+        return None
+
     def _file_response(self, session, method: str, url: str, *, resource='file', base_url=None, conditional_url=None, **kwargs):
         """Проверяет каждый HTTP-переход до запроса и отклоняет HTML."""
         from contextlib import asynccontextmanager
+
+        sheet_id = self._profile_sheet_id(url) if resource == 'file' else None
+
+        def allowed(address):
+            if sheet_id is None or address == url:
+                return self.crawler._is_allowed_url(address, resource=resource, base_url=base_url)
+            parsed = urlparse(address)
+            return (parsed.scheme == 'https'
+                    and re.fullmatch(r'doc-[a-z0-9-]+-sheets\.googleusercontent\.com', parsed.netloc)
+                    and parsed.path.startswith('/export/')
+                    and parsed.path.rsplit('/', 1)[-1] == sheet_id
+                    and not parsed.params and not parsed.fragment)
 
         @asynccontextmanager
         async def checked_response():
             current = url
             for _ in range(11):
-                if not self.crawler._is_allowed_url(current, resource=resource, base_url=base_url):
+                if not allowed(current):
                     raise ValueError(f'Файл вне периметра компании: {current}')
                 request_kwargs = dict(kwargs)
                 if conditional_url and current != conditional_url:
@@ -2928,7 +3046,7 @@ class FileDownloadManager:
                                                  if key not in {'If-None-Match', 'If-Modified-Since'}}
                 async with session.request(method, current, allow_redirects=False, **request_kwargs) as response:
                     final_url = str(response.url)
-                    if not self.crawler._is_allowed_url(final_url, resource=resource, base_url=base_url):
+                    if not allowed(final_url):
                         raise ValueError(f'Ответ файла вне периметра компании: {final_url}')
                     if response.status in (301, 302, 303, 307, 308):
                         location = response.headers.get('Location')
@@ -3505,7 +3623,7 @@ class FileDownloadManager:
                 links.append(full_url)
         return links
 
-    async def download_document_files(self, html: str, page_url: str, save_dir: str) -> List[str]:
+    async def download_document_files(self, html: str, page_url: str, save_dir: str, *, excluded=()) -> List[str]:
         """Скачивает файлы документов со страницы в папку компании
         (Certificates/Documents/Instructions/Price_lists). Возвращает пути скачанных."""
         saved = []
@@ -3514,9 +3632,9 @@ class FileDownloadManager:
             return saved
         os.makedirs(save_dir, exist_ok=True)
         for file_url in links:
-            if file_url in self.downloaded_files_cache:
+            if file_url in excluded or file_url in self.downloaded_files_cache:
                 continue
-            file_path = await self._download_aiohttp(file_url, save_dir)
+            file_path = await self._download_aiohttp(file_url, save_dir, 'company_document')
             if file_path:
                 self.downloaded_files_cache.add(file_url)
                 saved.append(file_path)
@@ -3544,7 +3662,10 @@ class FileDownloadManager:
                 elif entry.get('last_modified'):
                     conditional_headers['If-Modified-Since'] = entry['last_modified']
             timeout = aiohttp.ClientTimeout(total=self._file_timeout(30))
-            connector = aiohttp.TCPConnector(limit=5, ssl=False)
+            sheet_id = self._profile_sheet_id(file_url)
+            elconnect_price = _elconnect_price_link(getattr(self.crawler, 'profile', None), file_url)
+            verify_tls = bool(sheet_id) or elconnect_price or urlparse(file_url).netloc == 'static.tildacdn.com'
+            connector = aiohttp.TCPConnector(limit=5, ssl=verify_tls)
             
             async with aiohttp.ClientSession(
                 timeout=timeout, 
@@ -3569,7 +3690,14 @@ class FileDownloadManager:
                         return None
                     if response.status == 200:
                         # Получаем имя файла
-                        file_name = self._extract_filename_from_response(file_url, response.headers)
+                        name_url = str(response.url) if elconnect_price else file_url
+                        file_name = self._extract_filename_from_response(name_url, response.headers)
+                        if elconnect_price and not (file_name and file_name.lower().endswith('.xls')):
+                            return None
+                        if sheet_id:
+                            disposition = response.content_disposition
+                            name = disposition.filename if disposition else None
+                            file_name = name if name and name.lower().endswith('.xlsx') else f'{sheet_id}.xlsx'
                         if not file_name:
                             log.warning(f"Не удалось извлечь имя файла для {file_url}")
                             return None
@@ -3585,13 +3713,25 @@ class FileDownloadManager:
                             return None
                         prefix = content[:2048].decode('utf-8-sig', errors='replace').lower()
                         prefix = re.sub(r'^\s*(?:(?:<!--.*?-->|<\?xml.*?\?>)\s*)*', '', prefix, flags=re.S)
-                        if (re.match(r'<(?:!doctype\s+html|html|head|body)(?:\s|>)', prefix)
-                                or not self.crawler._is_allowed_url(str(response.url), resource='file')):
+                        if re.match(r'<(?:!doctype\s+html|html|head|body)(?:\s|>)', prefix):
+                            return None
+                        if sheet_id and not content.startswith(b'PK\x03\x04'):
+                            return None
+                        extension = os.path.splitext(urlparse(file_url).path.lower())[1]
+                        if extension == '.zip' and not content.startswith((b'PK\x03\x04', b'PK\x05\x06')):
+                            return None
+                        if elconnect_price and not content.startswith(bytes.fromhex('d0 cf 11 e0 a1 b1 1a e1')):
+                            return None
+                        if extension == '.rar' and not content.startswith(b'Rar!\x1a\x07'):
                             return None
 
                         # Проверяем размер файла
+                        profile = getattr(self.crawler, 'profile', None)
+                        file_limit = self.config.max_file_size_mb
+                        if profile and page_category == 'company_document':
+                            file_limit = profile.crawl.load.max_company_file_size_mb or file_limit
                         file_size_mb = len(content) / 1024 / 1024
-                        if file_size_mb > self.config.max_file_size_mb:
+                        if file_size_mb > file_limit:
                             log.warning(f"Файл {file_name} превышает максимальный размер: {file_size_mb:.2f} MB")
                             return None
                         
@@ -4497,7 +4637,8 @@ class WebCrawler:
             suffixes = profile.crawl.subdomain_collapse
             files = getattr(profile.crawl, 'file_hosts', ())
         return url_in_scope(url, base, profile_domains=domains,
-                            profile_suffixes=suffixes, file_hosts=files, resource=resource)
+                            profile_suffixes=suffixes, file_hosts=files, resource=resource,
+                            external_page_urls=getattr(getattr(profile, 'crawl', None), 'external_page_urls', ()))
 
     def _in_crawl_perimeter(self, url: str, base_url: str) -> bool:
         return self._is_allowed_url(url, base_url=base_url)
@@ -4809,6 +4950,10 @@ class WebCrawler:
     def _eligible_sitemap_row(self, row, base_url):
         """Статические фильтры применяются до квоты и повторяются перед очередью."""
         url, normalized_url, category, priority = row
+        if (urlparse(base_url).hostname or '').removeprefix('www.') == 'aksa.com.ru' and category == 'product':
+            # Пользователь исключил скрытые товары: sitemap не подтверждает
+            # публичность. Категории остаются точками обнаружения видимых ссылок.
+            return None
         if urlparse(url).scheme not in ('http', 'https') or category.startswith('excluded'):
             return None
         url = self._canonicalize_to_working_base(url)
@@ -5218,12 +5363,18 @@ class WebCrawler:
             # 2. ИЗВЛЕЧЕНИЕ ССЫЛОК (включая неизменённые и восстановленные страницы)
             await self._process_links_from_parse_result(url, parse_result, depth, queue)
 
+            # Прямые файловые ссылки в карте профиля не являются HTML-страницами.
+            # Загружаем их только после обнаружения точной ссылки на странице.
+            explicit_files = await self._download_explicit_profile_documents(
+                parse_result.url or url, parse_result.html, domain_dirs)
+
             # 2а. ОБЩИЕ ДОКУМЕНТЫ КОМПАНИИ: если страница принадлежит одному из
             # 4 блоков профиля (certificates/documents/instructions/price_list) —
             # скачиваем файлы с неё в соответствующую папку компании
             doc_section = self.url_categorizer.profile_document_section(url)
             if doc_section:
-                await self._download_company_documents(parse_result.url or url, parse_result.html, doc_section, domain_dirs)
+                await self._download_company_documents(parse_result.url or url, parse_result.html, doc_section,
+                                                       domain_dirs, excluded=explicit_files)
 
             # 3. СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ ДОКУМЕНТАЦИИ (скачивание файлов)
             if category == 'documentation':
@@ -5706,11 +5857,16 @@ class WebCrawler:
             start_urls.insert(0, f"{root_url}{site_path}/")
 
         # Доп. стартовые точки из профиля сайта (карта разделов sections) — пути корне-относительные.
+        exact_starts = set()
         if self.profile is not None:
             sec = self.profile.sections
-            for path in (sec.start_urls + sec.catalog_roots + sec.contacts_urls +
-                         sec.distributor_urls + sec.certificates_urls + sec.documents_urls +
-                         sec.instructions_urls + sec.price_list_urls):
+            document_pages = [entry for entry in (sec.certificates_urls + sec.documents_urls +
+                                                  sec.instructions_urls + sec.price_list_urls)
+                              if not self._is_company_file(entry)]
+            exact_starts.update(url for url in sec.start_urls + document_pages
+                                if urlparse(url).scheme in ('http', 'https'))
+            for path in (sec.start_urls + sec.file_index_paths + sec.catalog_roots + sec.contacts_urls +
+                         sec.distributor_urls + document_pages):
                 full = path if path.startswith('http') else urljoin(root_url + '/', path.lstrip('/'))
                 if full not in start_urls:
                     start_urls.append(full)
@@ -5719,10 +5875,12 @@ class WebCrawler:
         # сайтов (Bitrix со строгой маршрутизацией, Egger) отдаёт раздел только со слешем.
         # Даём каждому пути слеш-вариант и ставим его ПЕРЕД бесслешевым: очередь дедупится
         # по нормализованному ключу, где обе формы совпадают, поэтому обойдён будет первый —
-        # и это должна быть каноническая форма со слешем.
+        # и это должна быть каноническая форма со слешем. Абсолютная стартовая ссылка
+        # из профиля указывает опубликованный вариант пути.
         expanded_urls = []
         for url in start_urls:
-            if url != base_url and '?' not in url and '#' not in url and not url.endswith('/'):
+            if (url != base_url and url not in exact_starts and '?' not in url and '#' not in url
+                    and not url.endswith('/')):
                 expanded_urls.append(url + '/')
             expanded_urls.append(url)
 
@@ -5844,6 +6002,12 @@ class WebCrawler:
         return self._host_retry_until.get(urlparse(url).netloc.lower(), 0) > time.monotonic()
 
     async def fetch_page(self, url: str, category=None) -> FetchOutcome:
+        outcome = await self._fetch_page_observed(url, category)
+        quick_check_event('fetch', url=url, role=category, reason=outcome.reason,
+                          status=outcome.status, transport=outcome.transport)
+        return outcome
+
+    async def _fetch_page_observed(self, url: str, category=None) -> FetchOutcome:
         """Одна попытка со всеми транспортами; свидетельства изолированы по asyncio-task."""
         if not self._is_allowed_url(url, base_url=url):
             return FetchOutcome(url, reason='out_of_scope', retryable=False)
@@ -6050,7 +6214,7 @@ class WebCrawler:
 
             if response is not None and response.status != 200:
                 return None, False, None
-            initial = _browser_content(await page.content(), url, page, state, 'playwright')
+            initial = _browser_content(await capture_public_product_links_html(page), url, page, state, 'playwright')
             if page_error_reason(initial):
                 return None, False, None
             await self._accept_cookie_consent(page)
@@ -6251,12 +6415,12 @@ class WebCrawler:
                 log.debug(f"Ошибка при активации параметров: {e}")
             
             # Получаем полный HTML после активации
-            final_html = await page.content()
+            final_html = await capture_public_product_links_html(page)
             
             return final_html
         except Exception as e:
             log.warning(f"Ошибка извлечения динамического контента: {e}")
-            return await page.content()
+            return await capture_public_product_links_html(page)
 
     # ------------------------------------------------------------------ #
     #  HTTP-first слой: curl_cffi с браузерным TLS/HTTP2-отпечатком        #
@@ -6419,8 +6583,70 @@ class WebCrawler:
     _DOC_SECTION_DIRS = {'certificates': 'certificates_dir', 'documents': 'documents_dir',
                          'instructions': 'instructions_dir', 'price_list': 'price_lists_dir'}
 
+    def _is_company_file(self, url: str) -> bool:
+        extensions = tuple(self.file_download_manager.supported_extensions) + _COMPANY_EXTRA_FILE_EXTENSIONS
+        return (urlparse(url).path.lower().endswith(extensions) or bool(_google_sheet_export_url(url))
+                or _elconnect_price_link(getattr(self, 'profile', None), url))
+
+    async def _download_explicit_profile_documents(self, url: str, html: str,
+                                                    domain_dirs: Dict[str, str]) -> set[str]:
+        profile = getattr(self, 'profile', None)
+        claimed = set()
+        if profile is None or not any(getattr(profile.sections, key + '_urls') for key in self._DOC_SECTION_DIRS):
+            return claimed
+        soup = BeautifulSoup(html, 'html.parser')
+        base = document_base_url(soup, url)
+        links = {urljoin(base, node.get('href', node.get('src', '')).strip()).split('#', 1)[0]
+                 for node in soup.select('a[href], iframe[src]')}
+        certificate_links = links
+        if profile.sections.certificates_urls:
+            certificate_links = links | {
+                urljoin(base, image['data-img-zoom-url'].strip()).split('#', 1)[0]
+                for image in soup.select('[data-img-zoom-url]')
+            }
+        # Exact configured originals can also be published inline on a certificate page.
+        if (profile.sections.certificates_urls
+                and self.url_categorizer.profile_document_section(url) == 'certificates'):
+            certificate_links = certificate_links | {
+                urljoin(base, image['src'].strip()).split('#', 1)[0]
+                for image in soup.select('img[src]')
+            }
+        manager = self.file_download_manager
+        for section, directory in self._DOC_SECTION_DIRS.items():
+            target = (domain_dirs or {}).get(directory)
+            if not target:
+                continue
+            published_links = certificate_links if section == 'certificates' else links
+            for entry in getattr(profile.sections, section + '_urls'):
+                file_url = urljoin(url, entry).split('#', 1)[0]
+                if (section == 'price_list' and urlparse(file_url).hostname == 'ivanovo.dipos.ru'
+                        and urlparse(file_url).path.startswith('/upload/prices/ivanovo/')
+                        and not urlparse(file_url).query):
+                    # Header cache-buster for the same dated price list across sections.
+                    aliases = {link for link in published_links if link.partition('?')[0] == file_url
+                               and re.fullmatch(r'a=\d+', urlparse(link).query)}
+                    if aliases:
+                        claimed.update(aliases)
+                        published_links = published_links | {file_url}
+                if file_url not in published_links:
+                    continue
+                export_url = _google_sheet_export_url(file_url) if section == 'price_list' else None
+                if not self._is_company_file(file_url) or (_google_sheet_export_url(file_url) and not export_url):
+                    continue
+                claimed.add(file_url)
+                file_url = export_url or file_url
+                if (file_url in manager.downloaded_files_cache
+                        or not self._is_allowed_url(file_url, resource='file', base_url=url)):
+                    continue
+                saved = await manager._download_aiohttp(file_url, target, 'company_document')
+                if saved:
+                    manager.downloaded_files_cache.add(file_url)
+                    if self.metrics_collector is not None:
+                        self.metrics_collector.record_document_files(section, 1)
+        return claimed
+
     async def _download_company_documents(self, url: str, html: str, doc_section: str,
-                                          domain_dirs: Dict[str, str]) -> None:
+                                          domain_dirs: Dict[str, str], *, excluded=()) -> None:
         """Скачивание общих документов компании со страницы блока профиля в папку
         Certificates/Documents/Instructions/Price_lists. Fail-open: ошибка скачивания
         не прерывает обработку страницы."""
@@ -6428,7 +6654,7 @@ class WebCrawler:
             target_dir = (domain_dirs or {}).get(self._DOC_SECTION_DIRS[doc_section])
             if not target_dir:
                 return
-            saved = await self.file_download_manager.download_document_files(html, url, target_dir)
+            saved = await self.file_download_manager.download_document_files(html, url, target_dir, excluded=excluded)
             if saved:
                 log.info(f"Общие документы компании ({doc_section}): скачано {len(saved)} "
                          f"файлов со страницы {url} -> {target_dir}")
@@ -6551,6 +6777,8 @@ class WebCrawler:
                            and self.profile.crawl.antibot == 'warmup' and res.status != 200)
         _challenged = (getattr(self.config, 'antibot_in_fetch_enabled', True)
                        and self._is_challenge(res))
+        if _challenged:
+            quick_check_event('challenge', url=url)
         if _challenged and self.metrics_collector is not None:
             self.metrics_collector.record_challenge(url)
         if _profile_warmup or _challenged:
@@ -6983,6 +7211,17 @@ class WebCrawler:
             # Удаляем дубликаты. P04 U4: один и тот же адрес приходит и общим сборщиком,
             # и из товарной сетки — оставляем вариант с НАИБОЛЬШИМ приоритетом, иначе
             # set() выбирал между ними случайно и приоритет сетки терялся.
+            if (urlparse(current_url).hostname or '').removeprefix('www.') == 'aksa.com.ru':
+                public_products = {
+                    self.url_normalizer.normalize_url(urljoin(link_base, sanitize_href(raw)))
+                    for element, raw, _anchor in link_sources
+                    if element.get('data-stroy-public-link') == '1'
+                }
+                # Общий сборщик, onclick и сетка не должны возвращать скрытый
+                # товар обходным путём. HTML без браузерного доказательства
+                # не подтверждает ни одной товарной ссылки.
+                links = [(address, kind, priority) for address, kind, priority in links
+                         if kind != 'product' or self.url_normalizer.normalize_url(address) in public_products]
             best = {}
             for link_url, link_category, link_priority in links:
                 current = best.get(link_url)

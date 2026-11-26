@@ -1,0 +1,113 @@
+domain: metalloinvest.com
+profile_version: 1
+profiled_at: '2026-09-01'
+confidence: 0.0
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+sections:
+  catalog_roots:
+  - /catalog/
+  - /catalog/steel-products/bars/
+  - /catalog/steel-products/square-billets/
+  - /catalog/steel-products/concast-billets-and-blooms/
+  - /catalog/hbi-dri/hbi/
+  - /catalog/iron-ore-products/iron-ore/
+  contacts_urls:
+  - /about/contacts/
+  certificates_urls:
+  - /documents/
+  product_url_patterns:
+  - /catalog/steel\-products/bars/127558/?(?:\?|$)
+  - /catalog/steel\-products/square\-billets/26454/?(?:\?|$)
+  - /catalog/steel\-products/concast\-billets\-and\-blooms/127543/?(?:\?|$)
+  - /catalog/hbi\-dri/hbi/28035/?(?:\?|$)
+  - /catalog/iron\-ore\-products/iron\-ore/28074/?(?:\?|$)
+  product_url_antipatterns:
+  - /catalog/?(?:\?|$)
+  - /catalog/steel\-products/bars/?(?:\?|$)
+  - /catalog/steel\-products/square\-billets/?(?:\?|$)
+  - /catalog/steel\-products/concast\-billets\-and\-blooms/?(?:\?|$)
+  - /catalog/hbi\-dri/hbi/?(?:\?|$)
+  - /catalog/iron\-ore\-products/iron\-ore/?(?:\?|$)
+  - /documents/?(?:\?|$)
+  start_urls:
+  - https://products.metalloinvest.com/catalog/
+  - https://products.metalloinvest.com/catalog/steel-products/bars/
+  - https://products.metalloinvest.com/catalog/steel-products/square-billets/
+  - https://products.metalloinvest.com/catalog/steel-products/concast-billets-and-blooms/
+  - https://products.metalloinvest.com/catalog/hbi-dri/hbi/
+  - https://products.metalloinvest.com/catalog/iron-ore-products/iron-ore/
+  - https://www.metalloinvest.com/about/contacts/
+  - https://products.metalloinvest.com/documents/
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: '#catalog-offer-id'
+    min_len: 1
+    remove_selectors:
+    - button
+    - .breadcrumbs
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+    - .d-none
+    - '[style*="visibility: hidden"]'
+    - '[style*="visibility:hidden"]'
+    - .select2-hidden-accessible
+    - .irs-min,.irs-max,.irs-from,.irs-to,.irs-single
+    - .form-title-col
+    - '[href="#form-row-2"], .card-order-link'
+    - .tooltip-mark
+    - .btn-video-text
+    - .nav-link[data-toggle="tab"]
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .menu
+        - '#search-form-holder'
+        - iframe
+  - name: category_heading
+    match:
+      path_regex: ^(?:/catalog/|/catalog/steel\-products/bars/|/catalog/steel\-products/square\-billets/|/catalog/steel\-products/concast\-billets\-and\-blooms/|/catalog/hbi\-dri/hbi/|/catalog/iron\-ore\-products/iron\-ore/)$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: null
+  selector_hit_rate: null
+  pages_crawled: 0
+  product_pages: 0
+  product_cards: 0
+  jsonld_share: null
+  cms_detected: null
+  fetch_fail_rate: 1.0
+  challenge_rate: 0.0
+  empty_markdown_rate: null
+  gate3_pass_rate: null
+  sitemap_url_count: null
+  extraction_path_share: {}
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts: {}
+crawl:
+  exclude_paths: []
+  equivalent_domains:
+  - products.metalloinvest.com
+schema_version: 2

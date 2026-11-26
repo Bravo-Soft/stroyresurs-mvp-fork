@@ -1,0 +1,41 @@
+domain: demo.example
+schema_version: 2
+profile_version: 1
+extends:
+  rules_version: 1
+  group: industrial-products
+  group_version: 1
+crawl:
+  exclude_paths: ['/account/']
+sections:
+  product_url_patterns: ['^https://demo\.example/catalog/[^/]+$']
+  product_url_antipatterns: ['/catalog/archive/']
+extract:
+  tier: llm
+  page_rules:
+    - name: product
+      priority: 10
+      match:
+        page_types: [product]
+        path_regex: '^/catalog/'
+        selector: '.product'
+      extract:
+        markdown:
+          product_container: '.product'
+          content_blocks:
+            - name: specifications
+              selector: '#specifications'
+              required: true
+            - name: notes
+              selector: '.technical-notes'
+              required: false
+    - name: company
+      match:
+        page_types: [company]
+      extract:
+        markdown:
+          company_container: 'main'
+          content_blocks:
+            - name: contacts
+              selector: 'footer .contacts'
+              required: true

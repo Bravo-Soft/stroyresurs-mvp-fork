@@ -1,0 +1,126 @@
+domain: cteed.ru
+profile_version: 1
+profiled_at: '2026-08-29'
+confidence: 0.521
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: html
+  exclude_paths: []
+sections:
+  contacts_urls:
+  - /contacts.htm
+  distributor_urls:
+  - /about/
+  - /dealers/
+  - /distributors/
+  catalog_roots:
+  - /materials.htm
+  certificates_urls:
+  - /docs.htm
+  documents_urls:
+  - /docs.htm
+  instructions_urls:
+  - /docs.htm
+  product_url_patterns:
+  - /s\-ct20\.htm/?(?:\?|$)
+  - /s\-ind\-shangle\.htm/?(?:\?|$)
+  - /s\-grand\-manor\-shangle\.htm/?(?:\?|$)
+  - /ac\-start\-polosa\.htm/?(?:\?|$)
+  - /ac\-naled\.htm/?(?:\?|$)
+  - /ac\-konk\-elem\.htm/?(?:\?|$)
+  product_url_antipatterns:
+  - /materials\.htm/?(?:\?|$)
+  - /docs\.htm/?(?:\?|$)
+  start_urls:
+  - https://www.cteed.ru/materials.htm
+  - https://www.cteed.ru/contacts.htm
+  - https://www.cteed.ru/docs.htm
+  - https://www.cteed.ru/docs.htm#xl_sert
+  - https://www.cteed.ru/docs.htm#xl_mont
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: div[id^="xr_mvp_"]:not(.xr_mvpo)
+    distributor_container: body
+    min_len: 1
+    remove_selectors:
+    - '[id^="xr_nb"]'
+    - .xr_mvpo
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+    - a:has(img[src$="12711.jpg"])
+    - img[src$="12711.jpg"]
+    - img[src$="12341.jpg"]
+    - img[src$="12453.jpg"]
+    - img[src$="12599.jpg"]
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .menu
+        - '[id^="xr_nb"]'
+        - .xr_mvpo
+  - name: category_heading
+    match:
+      path_regex: ^(?:/materials\.htm)$
+    extract:
+      markdown:
+        product_container: div[id^="xr_mvp_"]:not(.xr_mvpo)
+  - name: visible_content_2
+    match:
+      path_regex: ^(?:/ac\-konk\-elem\.htm)$
+    extract:
+      markdown:
+        remove_selectors:
+        - '[id^="xr_nb"]'
+        - .xr_mvpo
+        - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+        - img[alt*="Черт"], img[alt*="черт"]
+        - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+        - a:has(img[src$="12711.jpg"])
+        - img[src$="12711.jpg"]
+        - div.xr_txt[onmousemove]
+        - div.xr_txt:has(a[href="ac-start-elem.htm"])
+        - div.xr_txt.text_2.xr_s7
+baseline:
+  structure_hash: 4ccc0fe1b2e0d75d0e85ad580d765504c5a841a0
+  selector_hit_rate: 0.0
+  pages_crawled: 23
+  product_pages: 13
+  product_cards: 3
+  jsonld_share: 0.0
+  cms_detected: readability
+  fetch_fail_rate: 0.0
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.6
+  sitemap_url_count: 22
+  extraction_path_share:
+    contacts_universal: 0.5
+    universal: 0.5
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    product: 13
+    main_page: 1
+    contacts: 3
+    distributor: 6
+schema_version: 2

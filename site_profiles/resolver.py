@@ -8,6 +8,7 @@
 поведение пайплайна не отличается от «до профилирования».
 """
 import logging
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -61,6 +62,9 @@ class ProfileResolver:
         self._aliases = None        # alias-domain -> SiteProfile
         self._suffixes = None       # list[('.hms.ru', SiteProfile)]
         self.load_errors = {}       # файл -> список ошибок валидации (для диагностики)
+        self._invalid_v2 = {}
+        self._invalid_v2_aliases = {}
+        self._invalid_v2_suffixes = []
         self._fingerprint = None    # (name, mtime_ns, size) для hot-reload из Диспетчерской
 
     def _directory_fingerprint(self):
@@ -69,7 +73,7 @@ class ProfileResolver:
             return ()
         rows = []
         for path in self.profiles_dir.glob("*.yaml"):
-            if path.name.startswith("_"):
+            if path.name.startswith("_") and path.name != '_rules.yaml':
                 continue
             try:
                 stat = path.stat()
@@ -93,17 +97,31 @@ class ProfileResolver:
         for path in sorted(self.profiles_dir.glob('*.yaml')):
             if path.name.startswith('_'):
                 continue  # _schema.yaml, _clusters.yaml — не профили
+            strict = False
+            data = {}
             try:
-                data = yaml.safe_load(path.read_text(encoding='utf-8'))
+                from .format_v2 import load_yaml, compose
+                raw = path.read_text(encoding='utf-8')
+                strict = bool(re.search(r'''^[ \t]*["']?schema_version["']?\s*:''', raw, re.M))
+                data = load_yaml(raw)
+                strict = strict or (isinstance(data, dict) and 'schema_version' in data)
+                data, diagnostics = compose(data, self.profiles_dir)
             except Exception as e:
                 self.load_errors[path.name] = [f'ошибка чтения YAML: {e}']
+                if strict:
+                    self._record_invalid_v2(path, data, self.load_errors[path.name])
                 logger.warning(f'Профиль {path.name} не прочитан ({e}) — пропущен')
                 continue
             profile, errors = profile_from_dict(data)
+            if profile.schema_version == 2 and normalize_domain(profile.domain) != normalize_domain(path.stem):
+                errors.append('domain: не соответствует имени файла')
             if errors:
                 self.load_errors[path.name] = errors
+                if strict:
+                    self._record_invalid_v2(path, data, errors)
                 logger.warning(f'Профиль {path.name} невалиден — пропущен: {"; ".join(errors)}')
                 continue
+            profile.diagnostics = diagnostics
             self._profiles[profile.domain] = profile
             for alias in profile.crawl.equivalent_domains:
                 self._aliases[normalize_domain(alias)] = profile
@@ -115,15 +133,44 @@ class ProfileResolver:
             logger.info(f'Загружено профилей сайтов: {len(self._profiles)} '
                         f'из {self.profiles_dir}')
 
+    def _record_invalid_v2(self, path, data, errors):
+        self._invalid_v2[normalize_domain(path.stem)] = errors
+        crawl = data.get('crawl', {}) if isinstance(data, dict) else {}
+        if not isinstance(crawl, dict):
+            return
+        aliases = crawl.get('equivalent_domains', [])
+        if isinstance(aliases, list):
+            for alias in aliases:
+                if isinstance(alias, str):
+                    self._invalid_v2_aliases[normalize_domain(alias)] = errors
+        suffixes = crawl.get('subdomain_collapse', [])
+        if isinstance(suffixes, list):
+            for suffix in suffixes:
+                if isinstance(suffix, str) and suffix.startswith('*.'):
+                    self._invalid_v2_suffixes.append((suffix[1:], errors))
+
     def resolve(self, url_or_host: str) -> SiteProfile:
         """Профиль для URL/хоста; при отсутствии — SiteProfile.default (generic)."""
         self._ensure_loaded()
         domain = normalize_domain(url_or_host)
+        if domain in self._invalid_v2:
+            from .format_v2 import ProfileRuleError
+            raise ProfileRuleError('; '.join(self._invalid_v2[domain]))
         if not domain:
             return SiteProfile.default('')
-        profile = self._profiles.get(domain) or self._aliases.get(domain)
+        profile = self._profiles.get(domain)
         if profile is not None:
             return profile
+        invalid = self._invalid_v2_aliases.get(domain)
+        if invalid:
+            from .format_v2 import ProfileRuleError
+            raise ProfileRuleError('; '.join(invalid))
+        if domain in self._aliases:
+            return self._aliases[domain]
+        for suffix, errors in self._invalid_v2_suffixes:
+            if domain.endswith(suffix):
+                from .format_v2 import ProfileRuleError
+                raise ProfileRuleError('; '.join(errors))
         for suffix, suffix_profile in self._suffixes:
             if domain.endswith(suffix):
                 return suffix_profile
@@ -133,10 +180,19 @@ class ProfileResolver:
         self._ensure_loaded()
         return sorted(self._profiles)
 
+    def explain(self, url_or_host):
+        """Итоговые настройки, происхождение и зависимости для проверки без записи."""
+        from dataclasses import asdict
+        profile = self.resolve(url_or_host)
+        return {'profile': asdict(profile), 'load_errors': dict(self.load_errors)}
+
     def reload(self):
         """Сбросить кэш (тесты, точечное пере-профилирование)."""
         self._profiles = self._aliases = self._suffixes = None
         self.load_errors = {}
+        self._invalid_v2 = {}
+        self._invalid_v2_aliases = {}
+        self._invalid_v2_suffixes = []
         self._fingerprint = None
 
     def reload_if_changed(self):

@@ -1,0 +1,70 @@
+domain: stabiterm.ru
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.682
+source: mixed
+notes:
+- Карта и контейнеры уточнены по живым HTML 13.11.2026; исторические метрики сохранены.
+  Приёмка только по отдельному контрольному прогону.
+crawl:
+  render: html
+sections:
+  product_url_patterns:
+  - /stabiterm-\d{3}(?:-[^/?#]+)?/?$
+  product_url_antipatterns: []
+  contacts_urls:
+  - /kontakt
+  distributor_urls: []
+  catalog_roots:
+  - /produkciya
+  - /produkciya/ognezashchita-metallokonstrukcij
+  - /ognezashchita-drevesiny-2
+  - /ognezashchita-kabelya-i-kabelnyh-linij
+  - /ehmali-i-grunty
+  - /ognezashchita-vozduhovodov-ventilyacii
+  start_urls:
+  - /kontakt
+extract:
+  tier: llm
+  markdown:
+    product_container: article
+    company_container: article
+    distributor_container: article
+    remove_selectors:
+    - .popup
+    - .et_pb_contact_form_container
+    - .et-pb-icon
+    - .et_pb_tabs_controls
+    - .et_pb_button
+  keep_hidden_tabs: true
+  page_rules:
+  - name: catalog_navigation
+    match:
+      path_regex: ^/produkciya$
+    extract:
+      markdown:
+        product_container: h1
+        content_blocks: []
+baseline:
+  structure_hash: null
+  selector_hit_rate: null
+  pages_crawled: 2
+  product_pages: 0
+  product_cards: 0
+  card_yield: null
+  avg_specs_per_card: null
+  jsonld_share: null
+  cms_detected: null
+  fetch_fail_rate: 0.0
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: null
+  sitemap_url_count: 9
+  extraction_path_share:
+    contacts_universal: 1.0
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    main_page: 2
+schema_version: 2

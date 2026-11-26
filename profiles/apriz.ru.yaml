@@ -1,0 +1,73 @@
+domain: apriz.ru
+profile_version: 1
+profiled_at: '2026-09-05'
+confidence: 0.0
+source: mixed
+notes:
+- 'Партия ТЭ24: проверка 18.11.2026 с обязательной цепочкой цены; исторические метрики
+  сохранены.'
+sections:
+  product_url_patterns:
+  - ^https?://(?:www\.)?apriz\.ru/products/[^/]+/?$
+  catalog_roots:
+  - /products/
+  contacts_urls:
+  - /contact/
+  distributor_urls: []
+  product_url_antipatterns: []
+  start_urls:
+  - /contact/
+  - /products/
+extract:
+  tier: llm
+  keep_hidden_tabs: false
+  markdown:
+    product_container: td.leftbg > div
+    company_container: body
+    distributor_container: body
+    remove_selectors:
+    - button
+    - form
+    - .breadcrumbs
+    - .breadcrumb
+    - '[class*=ymaps]'
+  page_rules:
+  - name: negative_example
+    match:
+      path_regex: ^/products/?$
+    extract:
+      markdown:
+        product_container: h1
+  - name: own_contacts
+    match:
+      page_types:
+      - company
+    extract:
+      markdown:
+        company_container: null
+        content_blocks:
+        - name: own
+          selector: td.leftbg > div
+          required: true
+        - name: footer
+          selector: .bottomtext
+          required: true
+baseline:
+  structure_hash: null
+  selector_hit_rate: null
+  pages_crawled: 0
+  product_pages: 0
+  product_cards: 0
+  jsonld_share: null
+  cms_detected: null
+  fetch_fail_rate: 1.0
+  challenge_rate: 0.0
+  empty_markdown_rate: null
+  gate3_pass_rate: null
+  sitemap_url_count: null
+  extraction_path_share: {}
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts: {}
+schema_version: 2

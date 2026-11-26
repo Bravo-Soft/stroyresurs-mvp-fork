@@ -1,0 +1,78 @@
+domain: bksm.net
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.403
+source: mixed
+notes:
+- 'Партия 104: проверка 13.11.2026 с обязательной цепочкой цены; исторические метрики
+  сохранены.'
+crawl:
+  render: html
+sections:
+  price_list_urls:
+  - /price-list/
+  product_url_patterns:
+  - ^/produktsiya/[^/]+/[^/]+/?$
+  product_url_antipatterns: []
+  catalog_roots:
+  - /produktsiya/
+  contacts_urls:
+  - /kontakty/
+  distributor_urls: []
+  start_urls:
+  - /produktsiya/
+  - /kontakty/
+extract:
+  tier: llm
+  markdown:
+    product_container: section.content
+    company_container: section.content
+    remove_selectors:
+    - .breadcrumbs
+    - form
+    - iframe
+    content_blocks:
+    - name: brand
+      selector: .h-logo__text
+      required: true
+  page_rules:
+  - name: category
+    match:
+      path_regex: ^/produktsiya/$
+    extract:
+      markdown:
+        product_container: null
+        content_blocks:
+        - name: part0
+          selector: h1
+          required: true
+        - name: brand
+          selector: .h-logo__text
+          required: true
+baseline:
+  structure_hash: 82e42392ae0f228f5a23030642557bca9d989177
+  selector_hit_rate: 1.0
+  pages_crawled: 18
+  product_pages: 16
+  product_cards: 3
+  card_yield: 0.1875
+  avg_specs_per_card: 9.0
+  jsonld_share: 0.0
+  cms_detected: generic-content
+  fetch_fail_rate: 0.0811
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0345
+  gate3_pass_rate: 1.0
+  sitemap_url_count: null
+  extraction_path_share:
+    generic: 0.0345
+    universal: 0.5172
+    contacts_universal: 0.4483
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    main_page: 1
+    price_list: 1
+    product: 16
+schema_version: 2

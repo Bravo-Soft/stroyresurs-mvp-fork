@@ -1,0 +1,92 @@
+domain: neva-tranzit.ru
+schema_version: 2
+profile_version: 1
+profiled_at: '2026-08-23'
+confidence: 0.618
+source: mixed
+notes:
+- 'Партия 24: проверка 13.11.2026 с обязательной цепочкой цены; исторические метрики
+  сохранены.'
+crawl:
+  render: html
+sections:
+  contacts_urls:
+  - /contact
+  distributor_urls:
+  - /for_dealers
+  product_url_patterns:
+  - /catalog/detail\.php\?ID=\d+(?:&|$)
+  catalog_roots:
+  - /catalog/list.php
+  start_urls:
+  - /contact
+  - /for_dealers
+  - /catalog/list.php?SECTION_ID=20
+  - /catalog/list.php?SECTION_ID=26
+  product_url_antipatterns:
+  - /catalog/list\.php
+  - /advertising/
+  - /my_product
+  - /registration
+extract:
+  tier: llm
+  markdown:
+    product_container: td.content
+    company_container: td.content
+    distributor_container: td.content
+    remove_selectors:
+    - a.back
+  page_rules:
+  - name: category_title
+    match:
+      path_regex: ^/catalog/list\.php$
+    extract:
+      markdown:
+        product_container: td.content > .title
+        content_blocks: []
+  - name: product_parts
+    match:
+      page_types:
+      - product
+      path_regex: ^/catalog/detail\.php$
+    extract:
+      markdown:
+        product_container: null
+        content_blocks:
+        - name: title
+          selector: td.content > .title
+          required: true
+        - name: article
+          selector: td.content > table
+          required: false
+        - name: body
+          selector: td.content > .detail
+          required: true
+        - name: image
+          selector: td.content > .detailImg
+          required: false
+baseline:
+  structure_hash: 7f6738e0c0efb02536387c44f826b0e7fd255d4f
+  selector_hit_rate: 1.0
+  pages_crawled: 53
+  product_pages: 50
+  product_cards: 1
+  jsonld_share: 0.0
+  cms_detected: generic-content
+  fetch_fail_rate: 0.0067
+  challenge_rate: 0.0067
+  empty_markdown_rate: 0.1111
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 0
+  extraction_path_share:
+    contacts_universal: 0.0741
+    universal: 0.8148
+    generic: 0.1111
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    main_page: 1
+    product: 50
+    contacts: 1
+    distributor: 1

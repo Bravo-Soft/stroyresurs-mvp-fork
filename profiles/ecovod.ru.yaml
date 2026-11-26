@@ -1,0 +1,59 @@
+domain: ecovod.ru
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.925
+source: mixed
+notes:
+- Карта и контейнеры уточнены по живым HTML 13.11.2026; исторические метрики сохранены.
+  Приёмка только по отдельному контрольному прогону.
+crawl:
+  render: html
+sections:
+  contacts_urls:
+  - /contacts/
+  distributor_urls: []
+  product_url_patterns:
+  - /(?:gidroelevator-ge|barabannye-filtry)/?$
+  product_url_antipatterns:
+  - /news/
+  - /(?:contact|contacts|kontakty)(?:/|$)
+  catalog_roots:
+  - /
+  start_urls:
+  - /contacts/
+extract:
+  tier: llm
+  markdown:
+    product_container: main
+    company_container: main
+    distributor_container: main
+    remove_selectors:
+    - .carousel-control-prev
+    - .carousel-control-next
+  keep_hidden_tabs: false
+baseline:
+  structure_hash: 9e9b32e1067178d0d38db59ef3a2aa24d8202eff
+  selector_hit_rate: 1.0
+  pages_crawled: 74
+  product_pages: 68
+  product_cards: 63
+  card_yield: 0.9265
+  avg_specs_per_card: 49.95
+  jsonld_share: 0.0
+  cms_detected: generic-main
+  fetch_fail_rate: 0.1194
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.9844
+  sitemap_url_count: 26
+  extraction_path_share:
+    universal: 0.8625
+    contacts_universal: 0.1375
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    product: 68
+    main_page: 1
+    contacts: 4
+    distributor: 1

@@ -1,0 +1,72 @@
+domain: ufapolimer.ru
+profile_version: 1
+profiled_at: '2026-08-22'
+confidence: 0.815
+source: mixed
+notes:
+- Карта и контейнеры уточнены по живым HTML 13.11.2026; исторические метрики сохранены.
+  Приёмка только по отдельному контрольному прогону.
+crawl:
+  render: html
+  antibot: impersonate
+sections:
+  product_url_patterns:
+  - /plastikovye-emkosti/[^/]+/[^/]+/?$
+  - /29-2/?$
+  product_url_antipatterns:
+  - /71-2/
+  - /gosti3/
+  - /ufap\d+
+  - -\d+x\d+(?:-\d+)?/?$
+  - /category/
+  contacts_urls:
+  - /sezy-htm/
+  distributor_urls: []
+  catalog_roots:
+  - /te-htm/
+  - /plastikovye-emkosti/
+  - /te-htm/pi-htm/
+  start_urls:
+  - /sezy-htm/
+extract:
+  tier: llm
+  markdown:
+    product_container: '#primary'
+    company_container: '#primary'
+    distributor_container: '#primary'
+    remove_selectors:
+    - .breadcrumbs
+  keep_hidden_tabs: false
+  page_rules:
+  - name: catalog_tiles
+    match:
+      path_regex: ^/te-htm/pi-htm/?$
+    extract:
+      markdown:
+        remove_selectors:
+        - .breadcrumbs
+        - table
+baseline:
+  structure_hash: 43ad7aadbe6f24ee5206feaa29a6f631f9ba4101
+  selector_hit_rate: 1.0
+  pages_crawled: 51
+  product_pages: 50
+  product_cards: 35
+  jsonld_share: 0.0
+  cms_detected: generic-id-content
+  fetch_fail_rate: 0.5197
+  challenge_rate: 0.2756
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 242
+  extraction_path_share:
+    contacts_universal: 0.0196
+    generic: 0.1569
+    universal: 0.8235
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    main_page: 1
+    product: 50
+schema_version: 2

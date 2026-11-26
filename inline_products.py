@@ -17,7 +17,7 @@ def inline_profile(url):
 def inline_product_key(url):
     parsed = urlparse(url)
     if ((parsed.hostname or '').lower().removeprefix('www.') in
-            {'bsdbel.ru', 'ventexpress.ru', 'nzmk22.ru', 'npo-stekloplastic.ru'}
+            {'bsdbel.ru', 'ventexpress.ru', 'nzmk22.ru', 'npo-stekloplastic.ru', 'demidovo.ru', 'omskblok.ru', 'istra-vniieto.ru'}
             and re.fullmatch(r'source-family=.+', parsed.fragment)):
         return 'source-family=' + quote(unquote(parsed.fragment.partition('=')[2]), safe='')
     profile = inline_profile(url)

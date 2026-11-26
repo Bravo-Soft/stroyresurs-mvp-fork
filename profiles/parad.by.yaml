@@ -1,0 +1,71 @@
+domain: parad.by
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.794
+source: mixed
+notes:
+- Карта и контейнеры уточнены по живым HTML 13.11.2026; исторические метрики сохранены.
+  Приёмка только по отдельному контрольному прогону.
+crawl:
+  render: html
+sections:
+  contacts_urls:
+  - /contacts
+  product_url_patterns:
+  - /(?:rs[t]?[-\d][^/?#]*|gu\d[^/?#]*|g\d[^/?#]*|g-elast|sh\d+|ak\d+|[cс]\d+|2kb|betoncontact|aquastoppronitrat|elastpronitrat|f\d+|frostt)/?$
+  product_url_antipatterns:
+  - /products/?$
+  distributor_urls: []
+  catalog_roots:
+  - /products
+  start_urls:
+  - /contacts
+extract:
+  tier: llm
+  markdown:
+    product_container: .user_card_of_goods
+    company_container: .user_contacts_container > .row > .col-xl-8
+    distributor_container: .user_contacts_container
+    remove_selectors:
+    - '[id^=user_calc_special_hidden]'
+    - button
+    - '.user_product_information [style*="visibility: hidden"]'
+    - .user_card_of_goods > .container-fluid
+    - .dropdown-menu
+    - a[role="button"]
+  keep_hidden_tabs: false
+  page_rules:
+  - name: catalog_navigation
+    match:
+      path_regex: ^/products/?$
+    extract:
+      markdown:
+        product_container: h1
+        content_blocks: []
+baseline:
+  structure_hash: ba920bb74cef53bc50c8fbf28f9fb7f71d3eff5b
+  selector_hit_rate: 0.6644
+  pages_crawled: 149
+  product_pages: 146
+  product_cards: 85
+  card_yield: 0.5822
+  avg_specs_per_card: 6.93
+  jsonld_share: 1.0
+  cms_detected: microdata-product
+  fetch_fail_rate: 0.0251
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.9551
+  sitemap_url_count: 27
+  extraction_path_share:
+    generic: 0.2756
+    universal: 0.6603
+    contacts_universal: 0.0641
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    product: 146
+    main_page: 2
+    contacts: 1
+schema_version: 2

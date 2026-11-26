@@ -105,8 +105,8 @@ class Config:
     exclude_product_cards_rtf = True
         
     # Настройки краулера
-    max_pages_per_site: int = 1000  # общий лимит страниц/сайт для диагностического прогона (Анализ системы/Краулер.md §7)
-    max_product_pages_per_site: int = 900  # верхняя граница продуктовых страниц/сайт; лимит учитывается при постановке URL в очередь (Краулер.md §4,§7)
+    max_pages_per_site: int = 2500  # общий лимит страниц/сайт для диагностического прогона (Анализ системы/Краулер.md §7)
+    max_product_pages_per_site: int = 1500  # верхняя граница продуктовых страниц/сайт; лимит учитывается при постановке URL в очередь (Краулер.md §4,§7)
     max_depth: int = 6  
     request_delay: float = 0.3  
     max_pagination_depth: int = 40  
@@ -173,13 +173,13 @@ class Config:
     # Настройки карты сайта
     sitemap_discovery_enabled = True
     sitemap_timeout_seconds = 10
-    sitemap_max_urls = 1000
+    sitemap_max_urls = 2500
     sitemap_max_depth = 6
     sitemap_retry_attempts = 1
     sitemap_retry_delay = 2
     # Размеры порций очереди; остаток сохраняется для пополнения до общей квоты.
-    sitemap_initial_batch_size: int = 1000
-    sitemap_processing_batch_size: int = 1000
+    sitemap_initial_batch_size: int = 2500
+    sitemap_processing_batch_size: int = 2500
     # Технический потолок чтения записей одной карты (XML/HTML/text).
     # Товарная квота применяется после объединения и категоризации всех карт;
     # этот предел защищает время и память при обработке огромного документа.
@@ -344,6 +344,11 @@ class Config:
     profiles_dir: str = '/home/user/stroy-resurs/mvp/profiles'
     profiles_drafts_dir: str = '/home/user/stroy-resurs/mvp/profiles_drafts'
     profile_metrics_dir: str = '/home/user/stroy-resurs/mvp/Base/profile_metrics'
+    # Passive quick check: opt-in until runtime/load pilot is measured.
+    profile_quick_check_enabled: bool = False
+    profile_quick_check_reference_dir: str = ''
+    profile_quick_check_max_pages: int = 24
+    profile_quick_check_budget_seconds: float = 5.0
     census_enabled: bool = False          # режим переписи: писать черновики профилей
     profile_accept_confidence: float = 0.8  # порог автопринятия черновика (пост-обработка)
 
@@ -397,6 +402,7 @@ class Config:
             ('profiles_dir', 'PROFILES_DIR'),
             ('profiles_drafts_dir', 'PROFILES_DRAFTS_DIR'),
             ('profile_metrics_dir', 'PROFILE_METRICS_DIR'),
+            ('profile_quick_check_reference_dir', 'PROFILE_QUICK_CHECK_REFERENCE_DIR'),
         ):
             setattr(config, attr, os.getenv(env_name, getattr(config, attr)))
         if os.getenv('DOCUMENTS_DIR') and not os.getenv('PRODUCT_CARDS_DIR'):
@@ -451,5 +457,8 @@ class Config:
 
         # Профилирование сайтов
         config.census_enabled = os.getenv('CENSUS_ENABLED', str(config.census_enabled)).lower() == 'true'
+        config.profile_quick_check_enabled = os.getenv('PROFILE_QUICK_CHECK_ENABLED', str(config.profile_quick_check_enabled)).lower() == 'true'
+        config.profile_quick_check_max_pages = os.getenv('PROFILE_QUICK_CHECK_MAX_PAGES', config.profile_quick_check_max_pages)
+        config.profile_quick_check_budget_seconds = os.getenv('PROFILE_QUICK_CHECK_BUDGET_SECONDS', config.profile_quick_check_budget_seconds)
 
         return config

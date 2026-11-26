@@ -1,0 +1,94 @@
+domain: ekoprom.com.ru
+profile_version: 1
+profiled_at: '2026-08-25'
+confidence: 0.856
+source: mixed
+notes:
+- 'Партия 24: проверка 13.11.2026 с обязательной цепочкой цены; исторические метрики
+  сохранены.'
+crawl:
+  render: html
+sections:
+  contacts_urls:
+  - /contacts
+  product_url_patterns:
+  - /product/[^/?#]+/?$
+  distributor_urls: []
+  catalog_roots:
+  - /catalog
+  - /catalog/izolyatory
+  - /catalog/kontakty-osnovaniya
+  - /catalog/ogranichiteli-perenapryazheniya
+  - /catalog/prochee
+  - /catalog/razediniteli-vysokovoltnye
+  - /catalog/traversy
+  - /catalog/vysokovoltnye-patrony-ptpn
+  - /catalog/vysokovoltnye-predokhraniteli-pktpkn
+  start_urls:
+  - /contacts
+  - /catalog
+  product_url_antipatterns:
+  - /doc(?:/|$)
+  - /catalog(?:/|$)
+  - /products(?:\?|/|$)
+extract:
+  tier: llm
+  markdown:
+    product_container: '#block-adaptive-content'
+    company_container: main
+    remove_selectors:
+    - .nav-tabs
+    - .product-description-more
+    - button
+    - form
+    - '#block-adaptive-form-contact'
+    - .breadcrumb
+    - a.btn--back
+    - nav[aria-label]
+  keep_hidden_tabs: true
+  page_rules:
+  - name: category_title
+    match:
+      path_regex: ^/catalog(?:/[^/]+)?/?$
+    extract:
+      markdown:
+        product_container: h1
+  - name: company_name_and_contacts
+    match:
+      path_regex: ^/contacts/?$
+      page_types:
+      - company
+    extract:
+      markdown:
+        content_blocks:
+        - name: company_name
+          selector: .header-logo-title
+          required: true
+        - name: contacts
+          selector: main
+          required: true
+baseline:
+  structure_hash: 16fbbd5b6e353cbe8adfb56c3258517f0d4c5ae2
+  selector_hit_rate: 1.0
+  pages_crawled: 55
+  product_pages: 52
+  product_cards: 37
+  jsonld_share: 0.0
+  cms_detected: generic-main
+  fetch_fail_rate: 0.0926
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0175
+  gate3_pass_rate: 0.9737
+  sitemap_url_count: 145
+  extraction_path_share:
+    contacts_universal: 0.0877
+    universal: 0.8596
+    generic: 0.0526
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    product: 52
+    contacts: 2
+    main_page: 1
+schema_version: 2

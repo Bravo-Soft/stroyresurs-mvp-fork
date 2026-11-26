@@ -7,6 +7,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from text_extractor import MarkdownConverter
+from profnastil_configurator import preserve_configurator_markdown
 
 
 def clean(soup: BeautifulSoup):
@@ -19,6 +20,7 @@ def clean(soup: BeautifulSoup):
 
     ВАЖНО: не удаляем `#jbVariationsObj` — из него extract() достаёт варианты и цвета.
     """
+    preserve_configurator_markdown(soup)
     selectors = [
         # Шапка, меню, навигация
         'header', '.jb-header', '.jb-menu', '.site-navigation',

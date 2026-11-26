@@ -1,0 +1,91 @@
+domain: izolentapvh.ru
+profile_version: 1
+profiled_at: '2026-08-22'
+confidence: 0.625
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: browser
+  antibot: impersonate
+  exclude_paths: []
+sections:
+  contacts_urls:
+  - /kontaktyi.html
+  distributor_urls:
+  - /about/
+  - /dealers/
+  - /distributors/
+  catalog_roots:
+  - /produkcziya.html
+  documents_urls:
+  - /texnicheskie-usloviya.html
+  product_url_patterns:
+  - /produkcziya/kopiya\-izolenta\-pvh\-lenta\-izolyacionnaya\-s\-lipkim\-sloem\-gost\-16214\-86\.html/?(?:\?|$)
+  - /produkcziya/shlangi\-pvx\.html/?(?:\?|$)
+  product_url_antipatterns:
+  - /produkcziya\.html/?(?:\?|$)
+  - /texnicheskie\-usloviya\.html/?(?:\?|$)
+  start_urls:
+  - https://izolentapvh.ru/produkcziya.html
+  - https://izolentapvh.ru/kontaktyi.html
+  - https://izolentapvh.ru/texnicheskie-usloviya.html
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: '#center .text'
+    min_len: 1
+    remove_selectors:
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+    - a:has(img[src*="serf_"])
+    - img[src*="serf_"]
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - '#news'
+        - '#mail'
+  - name: category_heading
+    match:
+      path_regex: ^(?:/produkcziya\.html)$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: null
+  selector_hit_rate: null
+  pages_crawled: 8
+  product_pages: 0
+  product_cards: 0
+  jsonld_share: null
+  cms_detected: null
+  fetch_fail_rate: 0.3333
+  challenge_rate: 0.25
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: null
+  sitemap_url_count: null
+  extraction_path_share:
+    contacts_universal: 1.0
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    distributor: 6
+    contacts: 2
+schema_version: 2

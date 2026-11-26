@@ -1,0 +1,123 @@
+domain: polikor.net
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.783
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: html
+  exclude_paths: []
+sections:
+  product_url_patterns:
+  - /katalog/gorelochnye\-kamni/gorelochnye\-kamni\-gmg\.html/?(?:\?|$)
+  - /katalog/vtulka\-ferulla\.html/?(?:\?|$)
+  - /katalog/korundovye\-poroshki\.html/?(?:\?|$)
+  - /katalog/vakuumplotnaya\-keramika\.html/?(?:\?|$)
+  - /katalog/[^/]+\.html/?$
+  - /dlya\-pokupatelej/[^/]+/[^/]+\.html/?$
+  catalog_roots:
+  - /katalog.html
+  - /tekhnich-keramika.html
+  - /katalog/gorelochnye-kamni.html
+  certificates_urls:
+  - /dokumentatsiya/sertifikaty.html
+  documents_urls:
+  - /dokumentatsiya/dokumenty.html
+  product_url_antipatterns:
+  - /katalog\.html/?(?:\?|$)
+  - /tekhnich\-keramika\.html/?(?:\?|$)
+  - /katalog/gorelochnye\-kamni\.html/?(?:\?|$)
+  - /dokumentatsiya/dokumenty\.html/?(?:\?|$)
+  - /dokumentatsiya/sertifikaty\.html/?(?:\?|$)
+  start_urls:
+  - https://www.polikor.net/katalog.html
+  - https://www.polikor.net/tekhnich-keramika.html
+  - https://www.polikor.net/katalog/gorelochnye-kamni.html
+  - https://www.polikor.net/dokumentatsiya/dokumenty.html
+  - https://www.polikor.net/dokumentatsiya/sertifikaty.html
+  - https://www.polikor.net/kontakty.html
+  contacts_urls:
+  - /kontakty.html
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: '#sp-component'
+    distributor_container: body
+    min_len: 1
+    remove_selectors:
+    - a:has(img[alt*='Черт'])
+    - a[href$='.pdf']
+    - .gk-card-btn
+    - .gk-hero-actions
+    - a[data-gk-lb]
+    - nav
+    - form
+    - .itemSocialSharing
+    - .itemToolbar
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+    - a:has(img[src$="ferula.png"])
+    - img[src$="ferula.png"]
+    - a[href$="/ferula.png"]
+    - img[src$="/ferula.png"]
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .sp-megamenu-wrapper
+        - .cat-menu
+        - .offcanvas-menu
+        - .menu
+        - '#sp-fos'
+        - .search-on-site
+        - article.item-page .col-sm-12.col-lg-3
+        - .meneger-po-pr
+        - .mobile-footer-cont
+  - name: category_heading
+    match:
+      path_regex: ^(?:/katalog\.html|/tekhnich\-keramika\.html|/katalog/gorelochnye\-kamni\.html)$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: 710f6a2de0e240778415d0a25515f3fb741c47f1
+  selector_hit_rate: 0.08
+  pages_crawled: 26
+  product_pages: 25
+  product_cards: 12
+  card_yield: 0.48
+  avg_specs_per_card: 17.0
+  jsonld_share: 1.0
+  cms_detected: readability
+  fetch_fail_rate: 0.021
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 200
+  extraction_path_share:
+    universal: 0.5263
+    generic: 0.1316
+    contacts_universal: 0.3421
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    product: 25
+    main_page: 1
+schema_version: 2

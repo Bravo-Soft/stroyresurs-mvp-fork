@@ -1,0 +1,108 @@
+domain: bkmz.ru
+profile_version: 1
+profiled_at: '2026-11-07'
+confidence: 0.899
+source: mixed
+notes:
+- 'Партия ТЭ24: проверка 18.11.2026 с обязательной цепочкой цены; исторические метрики
+  сохранены.'
+- 'Родительские категории уточнены по видимым хлебным крошкам и обследованным страницам;
+  информационные разделы исключены только из товарной роли. Полный каталог не заявляется.
+  Доказательства: profile_te24_20261118/category_plan22.json и coverage_revision6.'
+- Исключены только изображения и ссылки чертежей shema/chertezh/razrez по поручению
+  пользователя. Обычные опубликованные таблицы ТХ сохраняются.
+crawl:
+  render: html
+sections:
+  contacts_urls:
+  - /kontakty
+  product_url_patterns:
+  - ^https?://(?:www\.)?bkmz\.ru/catalog/(?!uslugi/)[^/]+/[^/]+/?$
+  catalog_roots:
+  - /catalog
+  - /catalog/avtomatika
+  - /catalog/gorelki-promyshlennye-gazovye
+  - /catalog/kotly-promyshlennye-parovye
+  - /catalog/kotly-promyshlennye-vodogrejnye
+  - /catalog/modulnye-kotelnye-teplovye-punkty
+  - /catalog/teploobmenniki
+  - /catalog/zapchasti
+  distributor_urls: []
+  product_url_antipatterns:
+  - /nashi-proekty/
+  - /catalog/uslugi/
+  - /(?:blog|fotogalereya|vacancies)/
+  start_urls:
+  - /kontakty
+  - /catalog
+  - /catalog/avtomatika
+  - /catalog/gorelki-promyshlennye-gazovye
+  - /catalog/kotly-promyshlennye-parovye
+  - /catalog/kotly-promyshlennye-vodogrejnye
+  - /catalog/modulnye-kotelnye-teplovye-punkty
+  - /catalog/teploobmenniki
+  - /catalog/zapchasti
+extract:
+  tier: llm
+  keep_hidden_tabs: true
+  markdown:
+    product_container: .card
+    company_container: body
+    distributor_container: body
+    remove_selectors:
+    - button
+    - form
+    - .breadcrumbs
+    - .breadcrumb
+    - .card-tabs-nav
+    - .card-tabs-content > .card-desc:nth-child(n+3)
+    - .card-btn
+    - .popup
+    - .request
+    - '[class*=ymaps]'
+    - nav
+    - .mnu-wrapper
+    - .menu
+    - .header-mnu
+    - .footer-mnu
+    - .pop-call
+    - img[src*="shema"]
+    - a[href*="shema"]
+    - img[src*="chertezh"]
+    - a[href*="chertezh"]
+    - img[src*="/razrez."]
+    - a[href*="/razrez."]
+  page_rules:
+  - name: negative_example
+    match:
+      path_regex: ^/nashi-proekty/blochnaya-kotelnaya-175-mvt/?$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: c22490750adb28c3d747064abbf1c3eb800dfb23
+  selector_hit_rate: 0.0
+  pages_crawled: 69
+  product_pages: 65
+  product_cards: 19
+  card_yield: 0.2923
+  avg_specs_per_card: 12.58
+  jsonld_share: 1.0
+  cms_detected: readability
+  fetch_fail_rate: 0.1414
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 66
+  extraction_path_share:
+    universal: 0.2087
+    generic: 0.7565
+    contacts_universal: 0.0348
+  limits_used:
+    pages: 1000
+    product_pages: 900
+  section_counts:
+    product: 65
+    main_page: 2
+    contacts: 2
+schema_version: 2

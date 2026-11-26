@@ -1,0 +1,151 @@
+domain: rvul.ru
+profile_version: 1
+profiled_at: '2026-10-23'
+confidence: 0.864
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: html
+  exclude_paths: []
+  exclude_url_patterns:
+  - /dokumentatsiya/\?(?:[^#]*&)?document_types\[\]=22(?:&|$)
+  - /dokumentatsiya/\?(?:[^#]*&)?search=bim(?:&|$)
+sections:
+  catalog_roots:
+  - /vse-produkty/nashi-produkty/diy/
+  - /vse-produkty/nashi-produkty/soundproofing/
+  - /vse-produkty/nashi-produkty/facades/
+  - /vse-produkty/nashi-produkty/industrial-isolation/
+  - /vse-produkty/nashi-produkty/sandwich-panel/
+  product_url_patterns:
+  - /vse\-produkty/beton\-element\-batts\-optima/?(?:\?|$)
+  - /vse\-produkty/paroizolyatsiya\-rwl\-ekstra/?(?:\?|$)
+  - /vse\-produkty/ruf\-batts\-d\-ekstra/?(?:\?|$)
+  - /vse\-produkty/lenta\-samokleyuschayasya\-las\-las\-a/?(?:\?|$)
+  - /vse\-produkty/vayred\-mat\-80/?(?:\?|$)
+  - /vse\-produkty/[^/]+/?$
+  - /all\-products/[^/]+/[^/]+/?$
+  - /konstruktsii/[^/]+/[^/]+/?$
+  contacts_urls:
+  - /kontakty/
+  - /zavody-i-ofisy/
+  distributor_urls:
+  - /gde-kupit/
+  certificates_urls:
+  - /dokumentatsiya/?document_types%5B%5D=1&document_types%5B%5D=2&document_types%5B%5D=4&document_types%5B%5D=5&document_types%5B%5D=6&document_types%5B%5D=7&document_types%5B%5D=9&document_types%5B%5D=10&document_types%5B%5D=49&document_types%5B%5D=55
+  documents_urls:
+  - /dokumentatsiya/?document_types%5B%5D=11&document_types%5B%5D=12&document_types%5B%5D=13&document_types%5B%5D=17
+  product_url_antipatterns:
+  - /vse\-produkty/nashi\-produkty/diy/?(?:\?|$)
+  - /vse\-produkty/nashi\-produkty/soundproofing/?(?:\?|$)
+  - /vse\-produkty/nashi\-produkty/facades/?(?:\?|$)
+  - /vse\-produkty/nashi\-produkty/industrial\-isolation/?(?:\?|$)
+  - /vse\-produkty/nashi\-produkty/sandwich\-panel/?(?:\?|$)
+  - /dokumentatsiya/\?document_types\[\]=11\&document_types\[\]=12\&document_types\[\]=13\&document_types\[\]=17/?(?:\?|$)
+  - /dokumentatsiya/\?document_types\[\]=1\&document_types\[\]=2\&document_types\[\]=4\&document_types\[\]=5\&document_types\[\]=6\&document_types\[\]=7\&document_types\[\]=9\&document_types\[\]=10\&document_types\[\]=49\&document_types\[\]=55/?(?:\?|$)
+  start_urls:
+  - https://rvul.ru/vse-produkty/nashi-produkty/diy/
+  - https://rvul.ru/vse-produkty/nashi-produkty/soundproofing/
+  - https://rvul.ru/vse-produkty/nashi-produkty/facades/
+  - https://rvul.ru/vse-produkty/nashi-produkty/industrial-isolation/
+  - https://rvul.ru/vse-produkty/nashi-produkty/sandwich-panel/
+  - https://rvul.ru/kontakty/
+  - https://rvul.ru/zavody-i-ofisy/
+  - https://rvul.ru/gde-kupit/
+  - https://rvul.ru/dokumentatsiya/?document_types%5B%5D=11&document_types%5B%5D=12&document_types%5B%5D=13&document_types%5B%5D=17
+  - https://rvul.ru/dokumentatsiya/?document_types%5B%5D=1&document_types%5B%5D=2&document_types%5B%5D=4&document_types%5B%5D=5&document_types%5B%5D=6&document_types%5B%5D=7&document_types%5B%5D=9&document_types%5B%5D=10&document_types%5B%5D=49&document_types%5B%5D=55
+  - https://rvul.ru/gde-kupit/?dealers-map-filter-234=Y
+  - https://rvul.ru/gde-kupit/?dealers-map-filter-1583=Y
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: main
+    min_len: 1
+    remove_selectors:
+    - .sticky-nav
+    - .breadcrumbs
+    - .breadcrumb
+    - form
+    - button
+    - '#documentation'
+    - '#learning'
+    - '#constructions'
+    - '#dealers'
+    - '#reviews'
+    - '#video'
+    - .product-overview__share
+    - .popup
+    - .modal
+    - img[alt*=Черт]
+    - img[alt*=черт]
+    - '#faq'
+    - .product-sizes__filter
+    - '#supplies .product-card__description'
+    - .no-results-box
+    distributor_container: h1, .dynamic-map-list
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .header
+        - .sticky-nav
+        - .breadcrumbs
+        - .popup
+        - .modal
+        - .dynamic-map__wrapper
+  - name: category_heading
+    match:
+      path_regex: ^(?:/vse\-produkty/nashi\-produkty/diy/|/vse\-produkty/nashi\-produkty/soundproofing/|/vse\-produkty/nashi\-produkty/facades/|/vse\-produkty/nashi\-produkty/industrial\-isolation/|/vse\-produkty/nashi\-produkty/sandwich\-panel/)$
+    extract:
+      markdown:
+        product_container: h1
+  - name: public_dealer_list
+    match:
+      page_types:
+      - distributor
+    extract:
+      markdown:
+        content_blocks:
+        - name: title
+          selector: h1
+          required: true
+        - name: public_dealers
+          selector: .dynamic-map-list
+          required: true
+baseline:
+  structure_hash: f319664b7708342bddedfdc8ebc017b77919c5be
+  selector_hit_rate: 0.948
+  pages_crawled: 547
+  product_pages: 538
+  product_cards: 144
+  card_yield: 0.2677
+  avg_specs_per_card: 51.55
+  jsonld_share: 0.8439
+  cms_detected: generic-main
+  fetch_fail_rate: 0.0068
+  challenge_rate: 0.0017
+  empty_markdown_rate: 0.0977
+  gate3_pass_rate: 0.9796
+  sitemap_url_count: 322
+  extraction_path_share:
+    universal: 0.8579
+    generic: 0.0995
+    contacts_universal: 0.0426
+  limits_used:
+    pages: 600
+    product_pages: 500
+  section_counts:
+    product: 538
+    main_page: 4
+    category: 5
+schema_version: 2

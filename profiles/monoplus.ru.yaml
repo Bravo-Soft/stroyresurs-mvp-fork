@@ -1,0 +1,111 @@
+domain: monoplus.ru
+profile_version: 1
+profiled_at: '2026-09-03'
+confidence: 0.487
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: html
+  exclude_paths:
+  - /produkciya/hudozhestvennaya-rezka/
+sections:
+  contacts_urls:
+  - /contacts/
+  distributor_urls:
+  - /about/
+  - /dealers/
+  - /distributors/
+  product_url_patterns:
+  - /produkciya/penoplast/plita\-iz\-penopolistirola\-pps23\-r\-a/?(?:\?|$)
+  - /produkciya/vspenennyj\-polistirol/vspenennyj\-polistirol\-pps10/?(?:\?|$)
+  - /produkciya/uteplitel\-dlya\-trub/uteplitel\-trub\-d\-25\-mm/?(?:\?|$)
+  - /produkciya/nesemnaya\-opalubka/blok\-stenovoj\-stykovochnyj\-bss/?(?:\?|$)
+  - /produkciya/[^/]+/[^/]+/[^/]+/[^/]+/?$
+  - /produkciya/[^/]+/[^/]+/?$
+  catalog_roots:
+  - /produkciya/
+  - /produkciya/vspenennyj-polistirol/
+  - /produkciya/penoplast/
+  - /produkciya/uteplitel-dlya-trub/
+  - /produkciya/nesemnaya-opalubka/
+  certificates_urls:
+  - /sertifikaty/
+  product_url_antipatterns:
+  - /produkciya/?(?:\?|$)
+  - /produkciya/vspenennyj\-polistirol/?(?:\?|$)
+  - /produkciya/penoplast/?(?:\?|$)
+  - /produkciya/uteplitel\-dlya\-trub/?(?:\?|$)
+  - /produkciya/nesemnaya\-opalubka/?(?:\?|$)
+  - /sertifikaty/?(?:\?|$)
+  start_urls:
+  - http://www.monoplus.ru/produkciya/
+  - http://www.monoplus.ru/produkciya/vspenennyj-polistirol/
+  - http://www.monoplus.ru/produkciya/penoplast/
+  - http://www.monoplus.ru/produkciya/uteplitel-dlya-trub/
+  - http://www.monoplus.ru/produkciya/nesemnaya-opalubka/
+  - http://www.monoplus.ru/contacts/
+  - http://www.monoplus.ru/sertifikaty/
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: .column__center-indent
+    min_len: 1
+    remove_selectors:
+    - .b-path
+    - .b-pager
+    - .catalogbox__back
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .b-editor > table:first-of-type tr:nth-child(n+3)
+        - .b-editor > table:first-of-type td[rowspan]:has(img)
+  - name: category_heading
+    match:
+      path_regex: ^(?:/produkciya/|/produkciya/vspenennyj\-polistirol/|/produkciya/penoplast/|/produkciya/uteplitel\-dlya\-trub/|/produkciya/nesemnaya\-opalubka/)$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: b7d2bc0d2406d94f91aa1f96d07a6373a28294f2
+  selector_hit_rate: 0.0
+  pages_crawled: 59
+  product_pages: 50
+  product_cards: 1
+  jsonld_share: 0.0
+  cms_detected: readability
+  fetch_fail_rate: 0.0449
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.0213
+  sitemap_url_count: 193
+  extraction_path_share:
+    contacts_universal: 0.1803
+    generic: 0.8197
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    main_page: 1
+    product: 50
+    contacts: 2
+    distributor: 6
+schema_version: 2

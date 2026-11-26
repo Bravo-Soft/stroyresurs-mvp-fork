@@ -1,0 +1,127 @@
+domain: ecodin.ru
+profile_version: 1
+profiled_at: '2026-08-23'
+confidence: 0.878
+source: mixed
+notes:
+- '16.11.2026: карта URL пользователя; чертежи исключены из требований извлечения;
+  приёмка требует свежего контроля. Исторические метрики сохранены.'
+crawl:
+  render: html
+  exclude_paths: []
+sections:
+  contacts_urls:
+  - /kontakty/
+  product_url_patterns:
+  - /septik\-ekodin\-10\-long\-us/?(?:\?|$)
+  - /kompressor\-secoh\-jdk\-60/?(?:\?|$)
+  - /septik\-ekodin\-15\-long\-pr/?(?:\?|$)
+  - /ochitsnaya\-stantsiya/?(?:\?|$)
+  - /nasos\-pogruzhnoy\-drenazhnyy\-dlya\-gryaznoy\-vody\-8000\-l\-chas/?(?:\?|$)
+  - /septik\-ekodin\-100/[^/]+/?$
+  - /septik\-ekodin\-100\-pr/[^/]+/?$
+  - /septik\-ekodin\-150/[^/]+/?$
+  catalog_roots:
+  - /category/septikecodin/dacha/
+  - /category/kompressornoe-oborudovanie/
+  - /category/septikecodin/
+  - /category/konteynernye-ochistnye-sooruzheniya/
+  - /category/nasosnoe-oborudovanie/
+  certificates_urls:
+  - /sertifikaty/
+  documents_urls:
+  - /tekhnicheskaya-dokumentatsiya/
+  product_url_antipatterns:
+  - /category/septikecodin/dacha/?(?:\?|$)
+  - /category/kompressornoe\-oborudovanie/?(?:\?|$)
+  - /category/septikecodin/?(?:\?|$)
+  - /category/konteynernye\-ochistnye\-sooruzheniya/?(?:\?|$)
+  - /category/nasosnoe\-oborudovanie/?(?:\?|$)
+  - /tekhnicheskaya\-dokumentatsiya/?(?:\?|$)
+  - /sertifikaty/?(?:\?|$)
+  start_urls:
+  - https://www.ecodin.ru/category/septikecodin/dacha/
+  - https://www.ecodin.ru/category/kompressornoe-oborudovanie/
+  - https://www.ecodin.ru/category/septikecodin/
+  - https://www.ecodin.ru/category/konteynernye-ochistnye-sooruzheniya/
+  - https://www.ecodin.ru/category/nasosnoe-oborudovanie/
+  - https://www.ecodin.ru/kontakty/
+  - https://www.ecodin.ru/tekhnicheskaya-dokumentatsiya/
+  - https://www.ecodin.ru/sertifikaty/
+extract:
+  tier: llm
+  markdown:
+    company_container: body
+    product_container: '#page-content'
+    min_len: 1
+    remove_selectors:
+    - button
+    - .breadcrumbs
+    - '#pills-reviews'
+    - '#tab-pill-product-46'
+    - a[href="#tab-pill-product-46"]
+    - .reviews-container
+    - .products-related
+    - a:has(img[alt*="Черт"]), a:has(img[alt*="черт"])
+    - img[alt*="Черт"], img[alt*="черт"]
+    - a[href$=".dwg"], a[href$=".dxf"], a[href$=".cdw"]
+    - form:not(#cart-form)
+    - .col-12.mt-5:has(.product-list)
+    - '#tab-pill-product-17'
+    - '#tab-pill-product-51'
+    - a[href="#tab-pill-product-17"]
+    - a[href="#tab-pill-product-51"]
+    - .static-rating
+  page_rules:
+  - name: contacts_keep_footer
+    match:
+      page_types:
+      - company
+      - distributor
+    extract:
+      markdown:
+        remove_selectors:
+        - nav
+        - form
+        - button
+        - .navbar
+        - '[role="navigation"]'
+        - .breadcrumbs
+        - .breadcrumb
+        - .menu
+        - '#search-form-holder'
+        - .dropdown-menu
+        - .bellLight
+        - .categories-scroll-wrapp
+        - .action-header-two-block
+        - .header-cart
+  - name: category_heading
+    match:
+      path_regex: ^(?:/category/septikecodin/dacha/|/category/kompressornoe\-oborudovanie/|/category/septikecodin/|/category/konteynernye\-ochistnye\-sooruzheniya/|/category/nasosnoe\-oborudovanie/)$
+    extract:
+      markdown:
+        product_container: h1
+baseline:
+  structure_hash: 9903bb7581a53c967797fefb80c9a609ace6d4e5
+  selector_hit_rate: 1.0
+  pages_crawled: 53
+  product_pages: 50
+  product_cards: 29
+  jsonld_share: 0.64
+  cms_detected: microdata-product
+  fetch_fail_rate: 0.0473
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 1.0
+  sitemap_url_count: 197
+  extraction_path_share:
+    contacts_universal: 0.2424
+    universal: 0.7576
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    product: 50
+    main_page: 2
+    contacts: 1
+schema_version: 2

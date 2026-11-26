@@ -1,0 +1,69 @@
+domain: pergamin.ru
+profile_version: 1
+profiled_at: '2026-08-19'
+confidence: 0.751
+source: mixed
+notes:
+- Карта и контейнеры уточнены по живым HTML 13.11.2026; исторические метрики сохранены.
+  Приёмка только по отдельному контрольному прогону.
+crawl:
+  render: html
+  exclude_paths:
+  - /rss-
+  - /turbopages
+  - /yml.xml
+sections:
+  product_url_patterns:
+  - /(?:mastika-|bitum-stroitelnyij-|teplonositel-|germabutil|pergamin-p|prajmer-)[^?#]+\.html$
+  product_url_antipatterns:
+  - /kontaktyi\.html$
+  - /(?:k-2035|u-vas-|v-2018|dmitrij-|bitum-70-30-teper)
+  - /mastika-bitumno-rezinovaya-65-rasxod-
+  - /bitum-70/30-teper-
+  contacts_urls:
+  - /kontaktyi.html
+  distributor_urls: []
+  catalog_roots:
+  - /mastiki-bitumnyie.html
+  start_urls:
+  - /kontaktyi.html
+extract:
+  tier: llm
+  markdown:
+    product_container: .main
+    company_container: .main
+    distributor_container: .main
+    remove_selectors:
+    - '#reviews'
+    - .nav-tabs
+    - .breadcrumbs
+    - .main > .title-border
+    - .main > .wrap-item
+    - form
+    - button
+    - .product-summ
+    - '[itemprop="priceCurrency"][style*="display: none"]'
+  keep_hidden_tabs: true
+baseline:
+  structure_hash: d280addabcb6a7bbddab44c463ee5fd917e267dd
+  selector_hit_rate: 1.0
+  pages_crawled: 25
+  product_pages: 24
+  product_cards: 16
+  jsonld_share: 0.6667
+  cms_detected: microdata-product
+  fetch_fail_rate: 0.0
+  challenge_rate: 0.0
+  empty_markdown_rate: 0.0
+  gate3_pass_rate: 0.9412
+  sitemap_url_count: 24
+  extraction_path_share:
+    universal: 0.5116
+    generic: 0.0465
+    contacts_universal: 0.4419
+  limits_used:
+    pages: 250
+    product_pages: 50
+  section_counts:
+    product: 24
+    main_page: 1

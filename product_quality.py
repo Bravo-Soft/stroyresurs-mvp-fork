@@ -43,6 +43,8 @@ def _profile_field(label):
     if re.match(r'^(?:(?:гарантийный|средний|расчетный|минимальный|максимальный) )?'
                 r'срок (?:службы|эксплуатации)\b|^температура окружающ\w* среды\b', label):
         return 'exploitation'
+    if re.match(r'^(?:длина|ширина|высота|глубина|объем|вес|масса) (?:в )?упаковк[ие]\b', label):
+        return 'complectation'
     return None
 
 
@@ -83,9 +85,18 @@ def _route_explicit_fields(product):
     additional = product.get('additional_info')
     if isinstance(additional, dict) and isinstance(additional.get('text'), str):
         keep = []
+        lines = []
         for line in additional['text'].splitlines():
+            parts = [part.strip() for part in line.split(';')]
+            # Делим только перечень однозначно подписанных параметров упаковки.
+            # Свободные условия/нормативы с точкой с запятой сохраняют прежний контекст.
+            packaging = all(':' in part and part.partition(':')[2].strip()
+                            and _profile_field(part.partition(':')[0]) == 'complectation'
+                            for part in parts)
+            lines.extend(parts if packaging else [line])
+        for line in lines:
             label, sep, value = line.partition(':')
-            field = _profile_field(label) if sep else None
+            field = _profile_field(label) if sep and value.strip() else None
             if field and _append_line(product, field, line):
                 pass
             else:
